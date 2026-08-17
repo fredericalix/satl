@@ -1,0 +1,32 @@
+[package]
+name = "satl-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+ciborium = "0.2.2"
+satl-core = { version = "0.1.0", path = "../satl-core" }
+satl-metrics = { version = "0.1.0", path = "../satl-metrics" }
+satl-image = { version = "0.1.0", path = "../satl-image" }
+satl-net = { version = "0.1.0", path = "../satl-net" }
+satl-runtime = { version = "0.1.0", path = "../satl-runtime" }
+satl-storage = { version = "0.1.0", path = "../satl-storage" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt", "sync", "time", "fs", "process", "io-util"] }
+tracing = "0.1.44"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }

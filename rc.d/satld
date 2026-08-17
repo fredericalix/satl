@@ -1,0 +1,64 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+
+# PROVIDE: satld
+# REQUIRE: LOGIN FILESYSTEMS zfs
+# KEYWORD: shutdown
+
+# satld -- SatL container engine daemon.
+#
+# Add the following lines to /etc/rc.conf to enable satld:
+#
+# satld_enable="YES"
+#
+# Optional knobs (defaults shown):
+#
+# satld_config="/usr/local/etc/satl/satld.toml"
+#	Daemon configuration file, passed to satld as --config.
+#	A missing file is fine: satld runs with built-in defaults.
+# satld_flags=""
+#	Extra satld flags, e.g. "--log-format json". The service already
+#	passes --log-target syslog; see the note above command_args.
+# satld_env=""
+#	Environment for satld, e.g. "RUST_LOG=satld=debug" (rc.subr(8)
+#	exports this before starting the command).
+
+. /etc/rc.subr
+
+name="satld"
+rcvar="satld_enable"
+
+load_rc_config $name
+
+: ${satld_enable:="NO"}
+: ${satld_config:="/usr/local/etc/satl/satld.toml"}
+: ${satld_flags:=""}
+
+pidfile="/var/run/${name}.pid"
+procname="/usr/local/sbin/satld"
+
+# satld does not daemonize itself: run it under daemon(8), which detaches
+# (-f), writes the child pidfile (-p), and forwards stdout/stderr to syslog
+# (-S) under the tag "satld" (-T).
+#
+# --log-target syslog is a correctness requirement, not a preference: do not
+# remove it. It makes satld hand each log event to syslogd itself, as its own
+# datagram. Letting daemon(8) -S forward the log instead corrupts it — daemon(8)
+# reads the pipe in chunks and passes a whole chunk to syslog(3) as one message,
+# and syslogd rewrites the embedded newlines as spaces, so events written
+# microseconds apart by different threads arrive joined onto one line of
+# /var/log/messages. Measured on FreeBSD 15.1: ~4% of lines merged, up to 19
+# events on one line, and more than half of a burst lost outright. See
+# "One event, one line" in docs/operations.md.
+#
+# -S stays anyway: satld's own log no longer travels that way, but a panic
+# message does, and it should still reach the log.
+command="/usr/sbin/daemon"
+command_args="-f -S -T ${name} -p ${pidfile} ${procname} --config ${satld_config} --log-target syslog ${satld_flags}"
+
+# ${satld_flags} is baked into command_args above so it reaches satld, not
+# daemon(8). Clear it: run_rc_command would otherwise also insert it between
+# ${command} and ${command_args}, handing satld's flags to daemon(8).
+satld_flags=""
+
+run_rc_command "$1"

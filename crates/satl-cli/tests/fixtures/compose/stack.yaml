@@ -1,0 +1,130 @@
+# The whole subset `satl compose` accepts, in one file: what the unit tests
+# assert the plan for, and what docs/api-compat.md 110-119 describes.
+#
+# It is deliberately close to the M5 definition-of-done stack (web + redis +
+# worker, one secret) so that the same shape is exercised on the cluster.
+name: shop
+
+x-defaults: &defaults
+  restart: always
+  stop_grace_period: 15s
+
+services:
+  web:
+    <<: *defaults
+    image: 127.0.0.1:5000/satl-test/freebsd-nginx:latest
+    ports:
+      - "18088:80"
+      - target: 8443
+        published: 18443
+        protocol: tcp
+        mode: host
+    environment:
+      REDIS_HOST: redis
+      REPLICAS: 3
+      FROM_ENV:
+    env_file: web.env
+    labels:
+      - tier=front
+    healthcheck:
+      test: ["CMD", "/rescue/test", "-f", "/usr/local/www/satl-test/index.html"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      - redis
+    networks:
+      - default
+      - internal
+    deploy:
+      replicas: 3
+      labels:
+        owner: sre
+      placement:
+        constraints:
+          - node.role == worker
+        max_replicas_per_node: 2
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 64M
+      update_config:
+        parallelism: 1
+        monitor: 8s
+        failure_action: rollback
+        order: stop-first
+      rollback_config:
+        parallelism: 2
+        failure_action: pause
+
+  redis:
+    image: 127.0.0.1:5000/satl-test/freebsd-redis:latest
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - >-
+        printf 'include /usr/local/etc/redis.conf\n' > /tmp/redis.conf &&
+        cat /run/secrets/redis.conf >> /tmp/redis.conf &&
+        exec /usr/local/bin/redis-server /tmp/redis.conf
+    user: "0"
+    working_dir: /var/db/redis
+    hostname: redis
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
+    secrets:
+      - source: redis_auth
+        target: redis.conf
+        uid: "0"
+        gid: "0"
+        mode: 0400
+    volumes:
+      - redis-data:/var/db/redis
+    networks:
+      internal:
+        aliases:
+          - cache
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 3
+        window: 1m
+
+  worker:
+    image: 127.0.0.1:5000/satl-test/freebsd-redis:latest
+    command: /bin/sh -c 'while :; do redis-cli -h redis INCR ticks; sleep 1; done'
+    secrets:
+      - redis_auth
+    configs:
+      - source: worker_conf
+        target: /usr/local/etc/worker.conf
+    depends_on:
+      redis:
+        condition: service_started
+    networks:
+      - internal
+    deploy:
+      mode: global
+
+networks:
+  default: {}
+  internal:
+    ipam:
+      config:
+        - subnet: 10.99.7.0/24
+
+volumes:
+  redis-data: {}
+
+secrets:
+  redis_auth:
+    external: true
+
+configs:
+  worker_conf:
+    external: true
+    name: shop_worker_conf_v2

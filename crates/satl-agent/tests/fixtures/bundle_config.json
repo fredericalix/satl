@@ -1,0 +1,52 @@
+{
+  "ociVersion": "1.0.2",
+  "process": {
+    "terminal": false,
+    "user": {
+      "uid": 80,
+      "gid": 80,
+      "additionalGids": [
+        0
+      ]
+    },
+    "args": [
+      "/usr/local/sbin/nginx",
+      "-g",
+      "daemon off;"
+    ],
+    "env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ],
+    "cwd": "/srv"
+  },
+  "root": {
+    "path": "/var/db/satl/containers/2qw3gxb4uklpaowonekzukj02"
+  },
+  "hostname": "2qw3gxb4uklp",
+  "mounts": [
+    {
+      "destination": "/dev",
+      "type": "devfs",
+      "source": "devfs",
+      "options": [
+        "ruleset=5000"
+      ]
+    },
+    {
+      "destination": "/dev/fd",
+      "type": "fdescfs",
+      "source": "fdescfs"
+    },
+    {
+      "destination": "/tmp",
+      "type": "tmpfs",
+      "source": "tmpfs",
+      "options": [
+        "mode=1777"
+      ]
+    }
+  ],
+  "annotations": {
+    "org.freebsd.jail.vnet": "new"
+  }
+}

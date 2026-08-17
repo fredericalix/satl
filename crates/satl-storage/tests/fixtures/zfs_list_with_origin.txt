@@ -1,0 +1,3 @@
+zroot/satl-agenttest	-	/tmp/satl-agenttest
+zroot/satl-agenttest/base	-	/tmp/satl-agenttest/base
+zroot/satl-agenttest/child	zroot/satl-agenttest/base@final	/tmp/satl-agenttest/child

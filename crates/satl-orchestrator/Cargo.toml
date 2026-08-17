@@ -1,0 +1,33 @@
+[package]
+name = "satl-orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[dependencies]
+satl-cluster = { version = "0.1.0", path = "../satl-cluster" }
+satl-core = { version = "0.1.0", path = "../satl-core" }
+# For the node-only half of the placement decision (`PlacementRequirements`,
+# `accepts_new_tasks`): the global orchestrator must pick exactly the nodes the
+# scheduler would accept, and a second reading of "schedulable" would drift.
+# See docs/architecture.md §2.
+satl-sched = { version = "0.1.0", path = "../satl-sched" }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["sync", "rt", "time", "macros"] }
+tokio-util = "0.7.19"
+tracing = "0.1.44"
+# Key material for the encrypted-overlay keyring comes from the same CSPRNG
+# as the store's DEK (satl-cluster) and object IDs (satl-core).
+rand = "0.10.2"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }

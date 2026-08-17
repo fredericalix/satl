@@ -1,0 +1,23 @@
+[package]
+name = "satl-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[dependencies]
+prost = "0.14.4"
+prost-types = "0.14.4"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+protox = "0.9.1"
+tonic-prost-build = "0.14.6"

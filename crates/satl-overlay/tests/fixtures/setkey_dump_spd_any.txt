@@ -1,0 +1,10 @@
+10.2.1.50[any] 10.2.2.47[4790] udp
+	in ipsec
+	esp/transport/10.2.1.50-10.2.2.47/require
+	spid=30 seq=1 pid=6859 scope=global
+	refcnt=1
+10.2.2.47[any] 10.2.1.50[4790] udp
+	out ipsec
+	esp/transport/10.2.2.47-10.2.1.50/require
+	spid=29 seq=0 pid=6859 scope=global
+	refcnt=1

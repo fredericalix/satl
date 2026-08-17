@@ -1,0 +1,12 @@
+ntx-br0: flags=8802<BROADCAST,SIMPLEX,MULTICAST> metric 0 mtu 1450
+	description: satl:overlay:ntxnet
+	options=10<VLAN_HWTAGGING>
+	ether 58:9c:fc:10:cd:b0
+	id 00:00:00:00:00:00 priority 32768 hellotime 2 fwddelay 15
+	maxage 20 holdcnt 6 proto rstp maxaddr 2000 timeout 1200
+	root id 00:00:00:00:00:00 priority 0 ifcost 0 port 0
+	bridge flags=0<>
+	member: ntx-vx0 flags=143<LEARNING,DISCOVER,AUTOEDGE,AUTOPTP>
+	        port 19 priority 128 path cost 55 vlan protocol 802.1q
+	groups: bridge ntxg
+	nd6 options=9<PERFORMNUD,IFDISABLED>

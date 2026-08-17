@@ -1,0 +1,9 @@
+satl-vx4096: flags=1008843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST,LOWER_UP> metric 0 mtu 1450
+	description: satl:vxlan:ovtestnet
+	options=80020<JUMBO_MTU,LINKSTATE>
+	ether 58:9c:fc:10:28:ce
+	groups: vxlan
+	vxlan vni 4096 local 127.0.0.1:4789 remote 127.0.0.254:4789
+	media: Ethernet autoselect (autoselect <full-duplex>)
+	status: active
+	nd6 options=29<PERFORMNUD,IFDISABLED,AUTO_LINKLOCAL>

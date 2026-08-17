@@ -1,0 +1,1 @@
+add net default: gateway 10.77.77.1 fib 0: route already in table

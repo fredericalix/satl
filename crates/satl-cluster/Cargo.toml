@@ -1,0 +1,43 @@
+[package]
+name = "satl-cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = { version = "0.8", default-features = false }
+base64 = "0.22.1"
+chacha20poly1305 = "0.11.0"
+ciborium = "0.2.2"
+http = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+openraft = { version = "0.9.25", features = ["serde", "storage-v2"] }
+parking_lot = "0.12.5"
+prost-types = "0.14"
+rand = "0.10.2"
+redb = "4.1.0"
+rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs", "std", "logging", "tls12"] }
+rustls-pki-types = "1"
+satl-ca = { version = "0.1.0", path = "../satl-ca" }
+satl-core = { version = "0.1.0", path = "../satl-core" }
+satl-proto = { version = "0.1.0", path = "../satl-proto" }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["sync", "rt", "rt-multi-thread", "macros", "fs", "io-util", "time", "net"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
+tokio-stream = "0.1"
+tonic = { version = "0.14.6", features = ["tls-aws-lc"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1.44"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+serde_json = "1.0.151"
+tempfile = "3.27.0"

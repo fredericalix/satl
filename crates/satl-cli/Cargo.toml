@@ -1,0 +1,47 @@
+[package]
+name = "satl-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+publish.workspace = true
+
+# The library holds the whole CLI (commands, formatting, REST client) so it can
+# be unit-tested against the in-process stub daemon; the binary is a thin shell.
+[lib]
+name = "satl_cli"
+path = "src/lib.rs"
+
+# The installed binary is `satl` (docker-compatible CLI), not `satl-cli`.
+[[bin]]
+name = "satl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+# Same version satl-api already uses: secret/config payloads travel base64.
+base64 = "0.22.1"
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+http-body-util = "0.1.4"
+hyper = { version = "1.11.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+satl-build = { version = "0.1.0", path = "../satl-build" }
+satl-image = { version = "0.1.0", path = "../satl-image" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = { version = "1.0.1", default-features = false, features = ["deserialize"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "signal", "time"] }
+
+[lints]
+workspace = true
+
+# The stub daemon the flow tests drive: a real axum server on a unix socket in
+# a tempdir (no network, no fixtures of our own HTTP layer).
+[dev-dependencies]
+axum = "0.8.9"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["test-util"] }

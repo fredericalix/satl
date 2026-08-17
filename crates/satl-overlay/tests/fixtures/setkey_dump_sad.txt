@@ -1,0 +1,20 @@
+10.2.1.50 10.2.2.47
+	esp mode=transport spi=244944898(0x0e999002) reqid=0(0x00000000)
+	E: aes-gcm-16  10112233 44556677 8899aabb ccddeeff 00010203
+	seq=0x00000000 replay=0 flags=0x00000040 state=mature
+	created: Aug 15 21:55:53 2026	current: Aug 15 21:55:53 2026
+	diff: 0(s)	hard: 0(s)	soft: 0(s)
+	last:                     	hard: 0(s)	soft: 0(s)
+	current: 0(bytes)	hard: 0(bytes)	soft: 0(bytes)
+	allocated: 0	hard: 0	soft: 0
+	sadb_seq=1 pid=6662 refcnt=1
+10.2.2.47 10.2.1.50
+	esp mode=transport spi=244944897(0x0e999001) reqid=0(0x00000000)
+	E: aes-gcm-16  00112233 44556677 8899aabb ccddeeff 00010203
+	seq=0x00000000 replay=0 flags=0x00000040 state=mature
+	created: Aug 15 21:55:53 2026	current: Aug 15 21:55:53 2026
+	diff: 0(s)	hard: 0(s)	soft: 0(s)
+	last:                     	hard: 0(s)	soft: 0(s)
+	current: 0(bytes)	hard: 0(bytes)	soft: 0(bytes)
+	allocated: 0	hard: 0	soft: 0
+	sadb_seq=0 pid=6662 refcnt=1

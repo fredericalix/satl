@@ -1,0 +1,9 @@
+satl-vx-dup: flags=1008803<UP,BROADCAST,SIMPLEX,MULTICAST,LOWER_UP> metric 0 mtu 1450
+	description: satl:vxlan:dupnet
+	options=80020<JUMBO_MTU,LINKSTATE>
+	ether 58:9c:fc:10:08:1c
+	groups: vxlan
+	vxlan vni 4096 local 127.0.0.1:4789 remote 127.0.0.253:4789
+	media: Ethernet autoselect (autoselect <full-duplex>)
+	status: active
+	nd6 options=29<PERFORMNUD,IFDISABLED,AUTO_LINKLOCAL>

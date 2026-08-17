@@ -1,0 +1,30 @@
+[package]
+name = "satl-ca"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[dependencies]
+rand = "0.10"
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "aws_lc_rs", "x509-parser"] }
+rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs", "std", "logging", "tls12"] }
+rustls-pemfile = "2.2.0"
+rustls-pki-types = "1.15.1"
+satl-core = { version = "0.1.0", path = "../satl-core" }
+sha2 = "0.11"
+subtle = "2.6.1"
+thiserror = "2"
+time = { version = "0.3.55", default-features = false, features = ["std"] }
+tracing = "0.1.44"
+x509-parser = { version = "0.18", features = ["verify-aws"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"

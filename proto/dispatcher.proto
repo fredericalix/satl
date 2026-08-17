@@ -1,0 +1,302 @@
+// SPDX-License-Identifier: BSD-2-Clause
+// Dispatcher: the manager -> worker control channel.
+//
+// Mirrors SWK §13 and docs/architecture.md §7.1. Served by the LEADER manager
+// only; followers answer `FAILED_PRECONDITION` and put the leader's address in
+// the `satl-leader-addr` response metadata so the agent can redial.
+//
+// Direction rule (CLAUDE.md invariant #3): MANAGERS NEVER DIAL WORKERS. Every
+// RPC here is opened by the worker and kept open by the worker. That is what
+// makes the protocol firewall-friendly and why `Session` and `Assignments` are
+// server-streaming rather than manager-initiated pushes.
+//
+// Authorization (architecture §12.5): a valid cluster certificate with OU
+// `satl-worker` or `satl-manager` (managers run an agent too, and schedule work
+// to themselves through their own dispatcher). Every RPC additionally validates
+// the pair (node ID from the client certificate CN, session_id): an unknown
+// node is `NOT_FOUND` ("node not registered"), a stale session is
+// `FAILED_PRECONDITION` ("session invalid"), and the agent's only correct
+// reaction is to open a fresh `Session`.
+//
+// Constants (architecture §15): heartbeat 5 s ±500 ms, TTL = 3x period; status
+// flush 100 ms / 10 000 updates; assignment batching 100 changes / 100 ms;
+// node down -> ORPHANED after 24 h; gRPC max message 4 MiB.
+
+syntax = "proto3";
+
+package satl.internal.v1;
+
+import "common.proto";
+import "google/protobuf/duration.proto";
+
+service Dispatcher {
+  // Opens (or resumes) an agent session. Server-streaming: the manager pushes
+  // an updated `SessionMessage` whenever anything in it changes.
+  //
+  // The stream ends when the manager loses leadership, when the session is
+  // superseded by a re-registration, or when the node is removed. The agent
+  // treats any end-of-stream as "re-register from scratch" with the backoff of
+  // architecture §7.2 (min(100 ms + 2x backoff, 8 s), jittered).
+  rpc Session(SessionRequest) returns (stream SessionMessage);
+
+  // Liveness beat. The SERVER dictates the next period in the response; the
+  // agent must not pick its own. Missing the TTL (3x period) marks the node
+  // DOWN and invalidates the session.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Batched observed-status reporting. Called by the agent's status reporter;
+  // never by a manager on behalf of a node.
+  rpc UpdateTaskStatus(UpdateTaskStatusRequest) returns (UpdateTaskStatusResponse);
+
+  // The assignment stream: what this node should be running, and the secrets,
+  // configs and networks those tasks reference.
+  rpc Assignments(AssignmentsRequest) returns (stream AssignmentsMessage);
+}
+
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
+
+message SessionRequest {
+  // CBOR of `satl_core::NodeDescription` — hostname, platform, capacity,
+  // engine version/labels, `linux_emulation`, `racct_enabled`
+  // (architecture §8.3). Refreshed every 20 s by re-opening the session only
+  // when it actually changed.
+  //
+  // MAY be empty when resuming a known session.
+  bytes description = 1;
+
+  // The session the agent believes it holds. EMPTY on first connect, and after
+  // any restart: session IDs are never persisted and never reused (SWK §13.1).
+  // An unknown value triggers registration.
+  string session_id = 2;
+}
+
+// Pushed initially and on every change. `session_id` is set on EVERY message;
+// the other fields use protobuf presence — absent means "unchanged since the
+// last message on this stream", not "empty".
+message SessionMessage {
+  // The session ID the agent must quote in every other RPC. A value different
+  // from the one the agent holds means it has been re-registered and must
+  // restart its other streams.
+  string session_id = 1;
+
+  // The node's own object. Present on the first message and whenever the node
+  // object changes (role, availability, labels, status).
+  //
+  // The node object must already exist: it is born at certificate issuance
+  // (`NodeCA.IssueNodeCertificate`, architecture §12.2) and NEVER by the
+  // dispatcher. A session for an unknown node is a bug on the CA side.
+  optional Node node = 2;
+
+  // The manager list the agent should use for its next connection choice.
+  // Present on the first message and on any membership/leadership change.
+  // Replaces the previous list wholesale — it is not a delta.
+  repeated WeightedPeer managers = 3;
+
+  // The current root CA bundle, PEM. Present on the first message and whenever
+  // it changes; this is how root rotation reaches workers (architecture §12.3,
+  // SWK §16.5). The agent adds it to its trust roots before the old root goes
+  // away.
+  optional bytes root_ca_bundle = 4;
+
+  // Reserved: network bootstrap keys (SWK §16.8) — deferred to M6 with overlay
+  // data-plane encryption (architecture §14).
+  reserved 5;
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat
+// ---------------------------------------------------------------------------
+
+message HeartbeatRequest {
+  // The session being kept alive.
+  string session_id = 1;
+}
+
+message HeartbeatResponse {
+  // How long the agent should wait before the next `Heartbeat`. Server-chosen,
+  // already jittered (5 s ±500 ms by default, cluster-tunable via
+  // `ClusterSpec.dispatcher.heartbeat_period`). The agent obeys this value; the
+  // manager arms a TTL of 3x it (doubled for nodes in an unknown state after a
+  // leadership change, so agents get time to find the new leader).
+  google.protobuf.Duration period = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Task status reporting
+// ---------------------------------------------------------------------------
+
+message UpdateTaskStatusRequest {
+  // The session the updates are reported under.
+  string session_id = 1;
+  // Coalesced per task (last wins) by the agent before sending, and again by
+  // the dispatcher before the store write. Keep a batch under the 4 MiB gRPC
+  // limit (architecture §15).
+  repeated TaskStatusUpdate updates = 2;
+}
+
+message TaskStatusUpdate {
+  // Task the status belongs to.
+  //
+  // A status for a task assigned to a DIFFERENT node is `PERMISSION_DENIED`
+  // (anti-spoofing, SWK §13.3). A status for an unknown task is silently
+  // skipped — the manager may have deleted it.
+  string task_id = 1;
+
+  // Mirror of `status.state`, so the manager can apply the monotonicity guard
+  // and log the transition without decoding the payload.
+  TaskState state = 2;
+
+  // CBOR of `satl_core::TaskStatus` — authoritative.
+  //
+  // The store write refuses backward transitions (architecture §4 rule 1) and
+  // stamps `applied_by` / `applied_at` from the MANAGER's clock, which is what
+  // restart windows and history ordering use — agent clocks are not trusted.
+  bytes status = 3;
+}
+
+// Empty: acceptance is per-batch, and per-update outcomes are deliberately not
+// reported (SwarmKit does the same — the agent re-reports on re-registration,
+// which is the real recovery path).
+message UpdateTaskStatusResponse {}
+
+// ---------------------------------------------------------------------------
+// Assignments
+// ---------------------------------------------------------------------------
+
+message AssignmentsRequest {
+  // The session the stream belongs to.
+  string session_id = 1;
+}
+
+// One batch of assignment changes.
+//
+// SEQUENCE CHAIN — the part implementers get wrong: every message carries
+// `applies_to` (the state the sender assumed the receiver was in) and
+// `results_in` (the state after applying this message). The agent remembers the
+// last `results_in` it applied. If an incoming `applies_to` does not equal it,
+// the agent MUST drop the stream and re-open it to get a fresh COMPLETE
+// snapshot. It must not try to patch the gap.
+message AssignmentsMessage {
+  enum Type {
+    // Never sent deliberately; receiving it is a protocol error.
+    TYPE_UNSPECIFIED = 0;
+    // A full snapshot: every task assigned to this node with observed state
+    // >= ASSIGNED, plus every secret, config and network those tasks
+    // reference. `applies_to` is empty. Applying it RESETS local state:
+    // secrets and configs are replaced wholesale, and tasks and networks
+    // absent from the snapshot are removed locally.
+    TYPE_COMPLETE = 1;
+    // A delta against `applies_to`.
+    TYPE_INCREMENTAL = 2;
+  }
+
+  // COMPLETE or INCREMENTAL. The first message on a stream is always COMPLETE.
+  Type type = 1;
+
+  // The `results_in` value this message assumes the receiver already applied.
+  // Empty for COMPLETE.
+  string applies_to = 2;
+
+  // The receiver's state identifier after applying this message. Opaque to the
+  // agent — compare for equality only, never parse or order.
+  string results_in = 3;
+
+  // Batched over a 100 ms quiescence window, max 100 changes per message
+  // (architecture §15). Empty for a COMPLETE snapshot of an empty node.
+  //
+  // APPLICATION ORDER IS PART OF THE CONTRACT (architecture §7.2): apply
+  // secrets first, then configs, then networks, then tasks — dependencies
+  // before dependents. REMOVALS go the other way, dependents first: tasks,
+  // then networks, then configs, then secrets. Tearing a network down while a
+  // task is still attached to it black-holes that task (docs/vxlan.md §8), so
+  // the two directions are not interchangeable. Within one kind and one
+  // action, apply in the order given.
+  repeated AssignmentChange changes = 4;
+}
+
+// One thing the node should (or should no longer) have.
+message Assignment {
+  oneof item {
+    // A task to run.
+    Task task = 1;
+    // A secret one of this node's tasks references.
+    Secret secret = 2;
+    // A config one of this node's tasks references.
+    Config config = 3;
+    // A network one of this node's tasks attaches to, with the endpoint table
+    // the node needs in order to program it.
+    NetworkAssignment network = 4;
+  }
+}
+
+// A network this node must program, plus the endpoint table it needs to do it
+// (architecture §11.2, docs/vxlan.md §7).
+//
+// WHY THE TABLE TRAVELS WITH THE NETWORK. The VXLAN data plane runs in unicast
+// mode with no multicast and no flooding, so a node cannot *learn* where a
+// remote endpoint lives: it must program a static FDB entry and a static ARP
+// entry for every remote endpoint from control-plane state alone. A worker
+// holds no replicated store (CLAUDE.md invariant #3), so this message is the
+// only place those triples come from. MACs are not distributed: both ends
+// derive them from the overlay address (`satl_core::MacAddr::from_ipv4`), which
+// makes the derivation a wire format, not an implementation detail.
+message NetworkAssignment {
+  // Network ID.
+  string id = 1;
+
+  // Version/timestamps of the NETWORK OBJECT.
+  //
+  // NOT a change indicator for this message: the endpoint table moves whenever
+  // a task on this network is scheduled, rescheduled or stops, and none of that
+  // touches the network object or bumps its version. A receiver that suppresses
+  // "unchanged" updates must compare the payload, not this mirror.
+  Meta meta = 2;
+
+  // CBOR of `satl_dispatcher::assignment::NetworkAssignment` —
+  // authoritative. It carries the `satl_core::Network` object AND the endpoint
+  // table: per endpoint the task ID, the node running it, the task's overlay
+  // address, and that node's underlay VTEP address.
+  //
+  // This is the one payload in the package whose Rust type is not a `satl-core`
+  // store object: the endpoint table is a protocol construct, owned by the
+  // crate that implements both ends (`proto/README.md`, "opaque CBOR
+  // payloads").
+  //
+  // MAY be empty when this network appears in an `AssignmentChange` with action
+  // REMOVE: removal only needs the ID. Always populated for UPDATE.
+  bytes payload = 3;
+}
+
+message AssignmentChange {
+  enum Action {
+    // Never sent deliberately; receiving it is a protocol error.
+    ACTION_UNSPECIFIED = 0;
+    // Create the assignment locally, or replace the existing one.
+    ACTION_UPDATE = 1;
+    // Drop the assignment locally. Only the ID inside `assignment` is
+    // guaranteed populated; `payload` may be empty.
+    ACTION_REMOVE = 2;
+  }
+
+  // What changed.
+  Assignment assignment = 1;
+  // How it changed.
+  Action action = 2;
+}
+
+// Dependency reference counting (SWK §13.4), stated here because it is a
+// dispatcher-side obligation the agent depends on: a secret, config or network
+// is sent with the FIRST task that references it and REMOVEd when the LAST
+// referencing task goes away — including when a task merely moves past RUNNING
+// to a terminal state, which releases its dependencies even though the task
+// object itself did not change. An agent must therefore never assume a secret
+// stays valid because "the task is still there".
+//
+// Networks carry one extra obligation on top of the count: their payload also
+// changes when nothing about the *network* changed, because the endpoint table
+// tracks every task on that network cluster-wide. A node that hosts one task on
+// an overlay receives an UPDATE for that network every time a peer's task on it
+// is scheduled or stops — that is the FDB distribution channel
+// (architecture §11.2), not redundant traffic.

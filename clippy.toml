@@ -1,0 +1,3 @@
+# Words clippy::doc_markdown must not demand backticks for (product/tech names).
+# ".." appends to clippy's built-in default list.
+doc-valid-idents = ["SatL", "FreeBSD", "SwarmKit", "OpenRaft", ".."]

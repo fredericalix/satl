@@ -1,0 +1,1 @@
+add net default: gateway 10.77.77.1

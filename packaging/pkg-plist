@@ -1,0 +1,4 @@
+bin/satl
+sbin/satld
+etc/rc.d/satld
+etc/satl/satld.toml.sample

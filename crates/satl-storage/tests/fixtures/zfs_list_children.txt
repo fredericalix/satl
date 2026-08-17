@@ -1,0 +1,4 @@
+zroot/usr	/usr
+zroot/usr/obj	/usr/obj
+zroot/usr/ports	/usr/ports
+zroot/usr/src	/usr/src

@@ -1,0 +1,14 @@
+zroot/satl/containers	/var/db/satl/containers	zfs	rw,nfsv4acls 	0 0
+zroot/satl/containers/1q8c4zamgo7wdgxj13tcoepua /var/db/satl/containers/1q8c4zamgo7wdgxj13tcoepua zfs	rw,nfsv4acls 	0 0
+linprocfs		/var/db/satl/containers/1q8c4zamgo7wdgxj13tcoepua/proc linprocfs	rw		0 0
+linsysfs		/var/db/satl/containers/1q8c4zamgo7wdgxj13tcoepua/sys linsysfs	rw		0 0
+devfs			/var/db/satl/containers/1q8c4zamgo7wdgxj13tcoepua/dev devfs	rw		0 0
+fdescfs			/var/db/satl/containers/1q8c4zamgo7wdgxj13tcoepua/dev/fd fdescfs	rw		0 0
+tmpfs			/var/db/satl/containers/1q8c4zamgo7wdgxj13tcoepua/dev/shm tmpfs	rw		0 0
+tmpfs			/var/db/satl/containers/1q8c4zamgo7wdgxj13tcoepua/tmp tmpfs	rw		0 0
+zroot/satl/containers/1jwtggzjzcfp20d23s2rwv72f /var/db/satl/containers/1jwtggzjzcfp20d23s2rwv72f zfs	rw,nfsv4acls 	0 0
+zroot/satl/containers/2blf7rzo7agylb7ixbkafhaff /var/db/satl/containers/2blf7rzo7agylb7ixbkafhaff zfs	rw,nfsv4acls 	0 0
+zroot/satl/containers/2qw3gxb4uklpaowonekzukj02 /var/db/satl/containers/2qw3gxb4uklpaowonekzukj02 zfs	rw,nfsv4acls 	0 0
+devfs			/var/db/satl/containers/2qw3gxb4uklpaowonekzukj02/dev devfs	rw		0 0
+fdescfs			/var/db/satl/containers/2qw3gxb4uklpaowonekzukj02/dev/fd fdescfs	rw		0 0
+tmpfs			/var/db/satl/containers/2qw3gxb4uklpaowonekzukj02/tmp tmpfs	rw		0 0

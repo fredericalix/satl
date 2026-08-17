@@ -1,0 +1,19 @@
+[package]
+name = "satl-metrics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = "0.8"
+prometheus-client = "0.25"
+tokio = { version = "1", features = ["macros", "net", "rt", "io-util"] }
+tracing = "0.1"
+
+[lints]
+workspace = true

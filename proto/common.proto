@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: BSD-2-Clause
+// SatL internal node-to-node protocol — shared scalars and object envelopes.
+//
+// See docs/architecture.md §7 (internal protocols), §3 (data model), §4 (task
+// model). This protocol is INTERNAL ONLY: the Docker Engine REST API is the
+// external surface (CLAUDE.md, architecture §13). Nothing here is a public API.
+//
+// ---------------------------------------------------------------------------
+// DESIGN DECISION: opaque CBOR payloads for store objects
+// ---------------------------------------------------------------------------
+//
+// Store objects (Task, Node, Secret, Config, Cluster, …) are NOT re-modelled
+// field-by-field in protobuf. Each envelope message carries:
+//
+//   * a `bytes payload` holding the CBOR (`ciborium`) serialization of the
+//     corresponding `satl-core` Rust type — this is the AUTHORITATIVE value;
+//   * the handful of scalars the protocol itself needs in order to route,
+//     filter, log, and diff without decoding the payload (id, meta.version,
+//     task state / desired state, node role / availability).
+//
+// Why:
+//
+//   * ONE SOURCE OF TRUTH. `satl-core` already owns the domain model, its
+//     invariants, its validation and its serde encoding (the same CBOR is used
+//     for the Raft log, snapshots, and the agent's on-disk task database —
+//     architecture §6.3, §7.2). A parallel protobuf model of ContainerSpec,
+//     Mount, HealthConfig, NetworkAttachment … would be a second definition of
+//     the same data, and every added field would have to be mirrored in two
+//     places with hand-written conversions. That divergence is a correctness
+//     bug generator, not a hypothetical: it is exactly how a task spec silently
+//     loses a field between manager and agent.
+//   * CHEAPER CONSISTENCY. Encoding a Task once (CBOR) and shipping the same
+//     bytes to the log, to disk, and over the wire means the agent's persisted
+//     copy is byte-identical to what the dispatcher sent.
+//   * SMALLER SURFACE. The protocol only has to be stable in what it routes on.
+//
+// The tradeoff, accepted deliberately:
+//
+//   * NO CROSS-LANGUAGE CLIENTS. A Go or Python client could parse the frames
+//     but not the payloads. This is fine — gRPC here is node-to-node only,
+//     both ends are SatL binaries built from the same workspace, and the
+//     externally consumable surface is the Docker REST API.
+//   * NO `protoc --decode` READABILITY of payloads. Debug tooling must decode
+//     CBOR; keep the mirrored scalars populated so `tcpdump`/logs stay useful.
+//   * VERSION SKEW IS SERDE SKEW. Payload compatibility is governed by serde
+//     rules (add fields with `#[serde(default)]`, never repurpose a name), not
+//     by protobuf field numbers. Mixed-version clusters are only supported
+//     within one `satl.internal.v1` package version.
+//
+// Rule for the whole package: EVERY `bytes payload` / `bytes …` field in
+// `satl.internal.v1` is `ciborium` CBOR of the Rust type named in its comment.
+// Changing that codec is a breaking change and requires `satl.internal.v2`.
+
+syntax = "proto3";
+
+package satl.internal.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Scalars mirroring satl-core
+// ---------------------------------------------------------------------------
+
+// A node's cluster role — mirrors `satl_core::NodeRole`.
+//
+// The role is carried by the node certificate's OU (architecture §12.1) and is
+// decided by the join token used (§12.2); this enum is a readable copy for
+// routing and logging, never an authorization input.
+enum NodeRole {
+  // Never sent deliberately; receiving it is a protocol error.
+  NODE_ROLE_UNSPECIFIED = 0;
+  // Runs tasks only (`satl-worker`).
+  NODE_ROLE_WORKER = 1;
+  // Participates in Raft and may lead the control plane (`satl-manager`).
+  NODE_ROLE_MANAGER = 2;
+}
+
+// Whether a node accepts new tasks — mirrors `satl_core::Availability`
+// (SWK §3.3).
+enum Availability {
+  // Never sent deliberately; receiving it is a protocol error.
+  AVAILABILITY_UNSPECIFIED = 0;
+  // Schedulable.
+  AVAILABILITY_ACTIVE = 1;
+  // No new tasks; existing tasks untouched.
+  AVAILABILITY_PAUSE = 2;
+  // No new tasks; existing tasks evicted and rescheduled.
+  AVAILABILITY_DRAIN = 3;
+}
+
+// Observed task state — mirrors `satl_core::TaskState` (architecture §4,
+// SWK §4.2).
+//
+// The numeric values are SwarmKit's SPARSE values and are reproduced here
+// EXACTLY so that the wire, the store, and the on-disk task database all agree
+// on one total order. The order is load-bearing: task state is a Lamport clock
+// and observed state never decreases (architecture §4 rule 1), so comparisons
+// are numeric comparisons. Gaps exist so that new intermediate states can be
+// inserted without renumbering.
+//
+// Do not add, renumber, or reuse values without changing
+// `satl_core::state::TaskState` in the same change.
+enum TaskState {
+  // Task object created (orchestrator).
+  TASK_STATE_NEW = 0;
+  // Resources allocated, awaiting scheduling (allocator).
+  TASK_STATE_PENDING = 64;
+  // Node chosen, or preassigned node validated (scheduler).
+  TASK_STATE_ASSIGNED = 192;
+  // Agent accepted the task (controller resolved).
+  TASK_STATE_ACCEPTED = 256;
+  // Pulling image, cloning layers, creating the jail.
+  TASK_STATE_PREPARING = 320;
+  // Prepared; a start would execute immediately.
+  TASK_STATE_READY = 384;
+  // Start in progress.
+  TASK_STATE_STARTING = 448;
+  // Started — and healthy, if a healthcheck is configured.
+  TASK_STATE_RUNNING = 512;
+  // Exited with code 0.
+  TASK_STATE_COMPLETE = 576;
+  // Requested shutdown completed.
+  TASK_STATE_SHUTDOWN = 640;
+  // Non-zero exit or execution error.
+  TASK_STATE_FAILED = 704;
+  // Never ran — environment problem (agent or constraint enforcer).
+  TASK_STATE_REJECTED = 768;
+  // Desired-state-only marker: shut down, then delete. Never a legal OBSERVED
+  // state; a manager receiving it in `UpdateTaskStatus` must reject the update.
+  TASK_STATE_REMOVE = 800;
+  // Node down too long; frees resources without deleting the task (manager).
+  TASK_STATE_ORPHANED = 832;
+}
+
+// Target state for a task — mirrors `satl_core::DesiredState` (architecture §4
+// rule 3, SWK §4.3). Written only by manager components, never decreases.
+//
+// Values deliberately reuse the `TaskState` numbering so observed and desired
+// state compare on one scale; `DESIRED_STATE_UNSPECIFIED` exists only because
+// proto3 requires a zero value and is never sent deliberately.
+enum DesiredState {
+  // Never sent deliberately; receiving it is a protocol error.
+  DESIRED_STATE_UNSPECIFIED = 0;
+  // Prepare but do not start (replacement tasks awaiting promotion).
+  DESIRED_STATE_READY = 384;
+  // Normal target for service tasks.
+  DESIRED_STATE_RUNNING = 512;
+  // Run to successful completion (reserved for jobs — deferred, §14).
+  DESIRED_STATE_COMPLETE = 576;
+  // Graceful stop requested.
+  DESIRED_STATE_SHUTDOWN = 640;
+  // Shut down, then delete via the task reaper.
+  DESIRED_STATE_REMOVE = 800;
+}
+
+// The seven store object kinds — mirrors `satl_core::ObjectKind`
+// (architecture §3).
+enum ObjectKind {
+  // Never sent deliberately; receiving it is a protocol error.
+  OBJECT_KIND_UNSPECIFIED = 0;
+  // The singleton cluster object.
+  OBJECT_KIND_CLUSTER = 1;
+  // A node.
+  OBJECT_KIND_NODE = 2;
+  // A service.
+  OBJECT_KIND_SERVICE = 3;
+  // A task.
+  OBJECT_KIND_TASK = 4;
+  // A network.
+  OBJECT_KIND_NETWORK = 5;
+  // A secret.
+  OBJECT_KIND_SECRET = 6;
+  // A config.
+  OBJECT_KIND_CONFIG = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Metadata envelope
+// ---------------------------------------------------------------------------
+
+// Object version: the Raft log index of the mutation that last wrote the
+// object — mirrors `satl_core::Version` (architecture §3).
+//
+// Powers optimistic concurrency: a mutation carries the caller's copy and is
+// rejected with a sequence conflict on mismatch.
+message Version {
+  // Raft log index of the last write.
+  uint64 index = 1;
+}
+
+// Common object metadata — mirrors `satl_core::Meta` (architecture §3).
+//
+// Carried in every envelope so a receiver can answer "is this newer than what
+// I hold?" and suppress no-op updates (SWK §13.4) without decoding `payload`.
+// Timestamps are the manager's clock.
+message Meta {
+  // Version of the object at the time this envelope was produced.
+  Version version = 1;
+  // Wall-clock creation time (manager clock).
+  google.protobuf.Timestamp created_at = 2;
+  // Wall-clock time of the last update (manager clock).
+  google.protobuf.Timestamp updated_at = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Object envelopes
+//
+// In every message below, `payload` is authoritative and the sibling scalars
+// are MIRRORS extracted from it for routing/filtering/logging. A receiver that
+// finds them inconsistent must trust `payload` and log the discrepancy — the
+// mirrors exist so hot paths can avoid a CBOR decode, not to be believed.
+// ---------------------------------------------------------------------------
+
+// Any store object, kind-tagged. Used where the protocol is generic over object
+// kinds (`Control.ClusterInfo`); the dispatcher uses the typed envelopes below.
+message Object {
+  // Which kind `payload` decodes to.
+  ObjectKind kind = 1;
+  // Object ID (25-char base36 — `satl_core::Id`).
+  string id = 2;
+  // Version/timestamps mirror.
+  Meta meta = 3;
+  // CBOR of `satl_core::StoreObject` (the kind-tagged enum, so a decoder needs
+  // no out-of-band type information).
+  bytes payload = 4;
+}
+
+// A task, as shipped by the dispatcher's assignment stream.
+message Task {
+  // Task ID — also the jail name (architecture §3).
+  string id = 1;
+  // Version/timestamps mirror.
+  Meta meta = 2;
+  // Mirror of `status.state`; lets the dispatcher and the agent filter without
+  // decoding (assignments carry tasks with state >= ASSIGNED, SWK §13.4).
+  TaskState state = 3;
+  // Mirror of `desired_state`; the agent drives its controller from this.
+  DesiredState desired_state = 4;
+  // CBOR of `satl_core::Task` — authoritative.
+  //
+  // MAY be empty when this task appears in an `AssignmentChange` with action
+  // REMOVE: removal only needs the ID. It is always populated for UPDATE.
+  bytes payload = 5;
+}
+
+// A secret, as shipped by the dispatcher's assignment stream.
+//
+// The payload contains the sensitive bytes. It travels only over mTLS, is held
+// in agent memory, and is materialized exclusively into a per-task tmpfs mount
+// inside the jail — never written to a worker's disk (invariant #7,
+// architecture §12.4). Never log this message.
+message Secret {
+  // Secret ID.
+  string id = 1;
+  // Version/timestamps mirror.
+  Meta meta = 2;
+  // CBOR of `satl_core::Secret` — authoritative. MAY be empty for REMOVE.
+  bytes payload = 3;
+}
+
+// A config, as shipped by the dispatcher's assignment stream. Same shape as
+// `Secret`, but the payload is not sensitive and may be persisted by the agent.
+message Config {
+  // Config ID.
+  string id = 1;
+  // Version/timestamps mirror.
+  Meta meta = 2;
+  // CBOR of `satl_core::Config` — authoritative. MAY be empty for REMOVE.
+  bytes payload = 3;
+}
+
+// A node object, as pushed to its own agent on the session stream (SWK §13.1).
+message Node {
+  // Node ID — also the certificate CN (architecture §12.1).
+  string id = 1;
+  // Version/timestamps mirror.
+  Meta meta = 2;
+  // Mirror of `spec.role`. Authorization still comes from the certificate OU,
+  // never from this field.
+  NodeRole role = 3;
+  // Mirror of `spec.availability`; the agent surfaces it, the scheduler
+  // enforces it.
+  Availability availability = 4;
+  // CBOR of `satl_core::Node` — authoritative.
+  bytes payload = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Peers
+// ---------------------------------------------------------------------------
+
+// A manager endpoint offered to an agent, with a selection weight
+// (SWK §13.1, §20.2).
+//
+// Agents pick a manager by weighted-random choice, preferring the local socket
+// when the node is itself a manager (architecture §7.2). SwarmKit weights every
+// manager equally at 10; SatL does the same until there is a reason not to.
+message WeightedPeer {
+  // Node ID of the manager (matches its certificate CN).
+  string node_id = 1;
+  // `host:port` of that manager's internal gRPC listener.
+  string addr = 2;
+  // Selection weight; higher is more likely. 0 means "do not dial".
+  int64 weight = 3;
+}

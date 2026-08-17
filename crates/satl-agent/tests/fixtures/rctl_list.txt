@@ -1,0 +1,5 @@
+user:freebsd:maxproc:deny=100
+jail:ghosttest:memoryuse:sigkill=268435456
+jail:1hvy0lj3x0b883f8e30fyp217:memoryuse:sigkill=134217728
+jail:24ceq6bf9xx2dzm0e4bcccwe6:pcpu:deny=50
+jail:24ceq6bf9xx2dzm0e4bcccwe6:memoryuse:sigkill=268435456

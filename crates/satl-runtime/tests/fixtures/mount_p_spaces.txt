@@ -1,0 +1,2 @@
+tmpfs			/tmp/rtest mount dir/inner tmpfs	rw		0 0
+/tmp/rtest src dir	/tmp/rtest-plainmnt	nullfs	ro		0 0

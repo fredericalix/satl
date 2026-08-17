@@ -1,0 +1,6 @@
+zroot	none
+zroot/ROOT	none
+zroot/home	/home
+zroot/tmp	/tmp
+zroot/usr	/usr
+zroot/var	/var

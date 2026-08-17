@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# Template for the pkg(8) +MANIFEST; `make package` substitutes @VERSION@,
+# @ABI@ and @OCIJAIL_VERSION@. Format: UCL, documented in pkg-create(8).
+name: satl
+version: "@VERSION@"
+origin: sysutils/satl
+comment: "A cluster-first container engine for FreeBSD"
+maintainer: frederic@fredalix.ovh
+www: https://github.com/fredericalix/satl
+abi: "@ABI@"
+prefix: /usr/local
+licenses: [BSD2CLAUSE]
+desc: <<EOD
+SatL runs OCI containers as FreeBSD jails, with swarm-style orchestration
+built in: a Docker-compatible REST API and CLI, overlay networking (VXLAN),
+an ingress routing mesh, secrets and configs, rolling updates, and a
+Prometheus endpoint.
+EOD
+deps: {
+  ocijail: { origin: "sysutils/ocijail", version: "@OCIJAIL_VERSION@" }
+}
+messages: [
+  { message: <<EOM
+SatL needs a few host settings before `service satld start`:
+
+1. a ZFS dataset for its state:  zfs create zroot/satl
+2. pf enabled with SatL's anchors declared in /etc/pf.conf:
+     nat-anchor "satl/*"
+     rdr-anchor "satl/*"
+     anchor "satl/*"
+   (translation anchors BEFORE any filter rule), and pf_mode = "enforce"
+   in /usr/local/etc/satl/satld.toml for published ports;
+3. kern.racct.enable=1 in /boot/loader.conf (a reboot) for resource
+   limits and per-container metrics;
+4. satld runs as root: sysrc satld_enable=YES && service satld start.
+
+The sample config is /usr/local/etc/satl/satld.toml.sample; copy it to
+/usr/local/etc/satl/satld.toml. Docs: https://github.com/fredericalix/satl
+EOM
+  }
+]

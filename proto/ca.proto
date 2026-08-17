@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: BSD-2-Clause
+// NodeCA: certificate bootstrap and issuance for joining nodes.
+//
+// Mirrors SWK §16.2/§16.3 and docs/architecture.md §12.1–§12.3. Served by every
+// manager; the signing work happens on the leader (followers forward).
+// Managers present the TLS server name `satl-ca` on this path in addition to
+// `satl-manager` (architecture §12.1).
+//
+// ---------------------------------------------------------------------------
+// AUTHENTICATION — read before implementing the server
+// ---------------------------------------------------------------------------
+//
+// `GetRootCACertificate` and `IssueNodeCertificate` are UNAUTHENTICATED at the
+// TLS layer: they accept connections WITHOUT a client certificate. They have
+// to — a node that has never joined has no certificate to present, and this is
+// the RPC that gets it one. This is the single chicken-and-egg exemption in
+// SatL's mTLS model, and it is why:
+//
+//   * `GetRootCACertificate` returns only public material (the root CA bundle),
+//     and the joiner authenticates it OUT OF BAND by checking the digest baked
+//     into its join token (`SATL-1-<digest>-<secret>`, architecture §12.2).
+//     The digest covers the WHOLE bundle, which is what blocks a MITM from
+//     appending an extra root.
+//   * `IssueNodeCertificate` is authenticated by the JOIN TOKEN in the request,
+//     compared in CONSTANT TIME against the cluster's current worker/manager
+//     token. THE TOKEN THAT MATCHES DETERMINES THE ROLE — never a field of the
+//     request.
+//   * The server takes ONLY the public key and signature algorithm from the
+//     CSR. Subject (CN = node ID, OU = role, O = cluster ID) and SANs are
+//     server-controlled (SWK §16.3 CSR whitelist). A CSR asking for OU
+//     `satl-manager` gets whatever the token grants and nothing more.
+//
+// `NodeCertificateStatus` is likewise reachable without a client certificate —
+// the caller is still waiting for the certificate it is polling for. It
+// discloses only the issuance state and the (public) signed certificate for one
+// node ID, so leaking it to an unauthenticated caller is acceptable; it must
+// not be extended to carry anything else.
+//
+// RENEWAL uses the same `IssueNodeCertificate` RPC but authenticated by the
+// EXISTING certificate instead of a token (architecture §12.3): the server
+// accepts an empty token when a valid, non-blacklisted cluster certificate is
+// presented, and issues for that certificate's CN with the role currently
+// recorded on the node object — this is how promotion and demotion take effect.
+
+syntax = "proto3";
+
+package satl.internal.v1;
+
+import "common.proto";
+
+service NodeCA {
+  // Fetch the cluster root CA bundle. UNAUTHENTICATED (no client certificate).
+  // The caller MUST verify the returned bundle against the digest in its join
+  // token before trusting it.
+  rpc GetRootCACertificate(GetRootCACertificateRequest) returns (GetRootCACertificateResponse);
+
+  // Submit a CSR and a join token; creates the Node object and queues signing.
+  // UNAUTHENTICATED at the TLS layer, authenticated by the token in the body
+  // (or, for renewals, by the caller's existing cluster certificate).
+  rpc IssueNodeCertificate(IssueNodeCertificateRequest) returns (IssueNodeCertificateResponse);
+
+  // Long-poll until the certificate for `node_id` is issued (or the deadline
+  // expires). The server blocks on the node-object watch rather than spinning;
+  // clients set a deadline and simply call again on `DEADLINE_EXCEEDED`.
+  rpc NodeCertificateStatus(NodeCertificateStatusRequest) returns (NodeCertificateStatusResponse);
+}
+
+// Issuance state of a node's certificate — mirrors
+// `satl_core::CertificateStatus`.
+enum CertificateStatus {
+  // No issuance information yet.
+  CERTIFICATE_STATUS_UNKNOWN = 0;
+  // A signing request is queued; keep polling.
+  CERTIFICATE_STATUS_PENDING = 1;
+  // A certificate has been issued and is in the response.
+  CERTIFICATE_STATUS_ISSUED = 2;
+  // The certificate must be re-issued (root CA rotation, architecture §12.3).
+  CERTIFICATE_STATUS_ROTATE = 3;
+}
+
+message GetRootCACertificateRequest {}
+
+message GetRootCACertificateResponse {
+  // The root CA bundle, PEM, concatenated. During a root rotation this holds
+  // both the old and the new root so joiners trust either signer.
+  bytes root_ca_bundle = 1;
+}
+
+message IssueNodeCertificateRequest {
+  // PKCS#10 certificate signing request, PEM. Only its public key and
+  // signature algorithm are honoured; subject and SANs are server-controlled.
+  bytes csr = 1;
+
+  // The join token, `SATL-1-<digest>-<secret>`. Compared in constant time; the
+  // token that matches selects the role. EMPTY for a renewal, which must then
+  // be made over a connection presenting a valid cluster certificate.
+  string token = 2;
+
+  // Requested initial scheduling availability, so an operator can join a node
+  // already paused or drained. Purely advisory intent — it is not authorization
+  // and it never affects the role.
+  Availability availability = 3;
+
+  // Reserved: external CA selection (SWK §16.3) — dropped for v1
+  // (architecture §14).
+  reserved 4;
+}
+
+message IssueNodeCertificateResponse {
+  // The node ID the CA assigned. It becomes the certificate CN and the Node
+  // object's ID; the caller polls `NodeCertificateStatus` with it.
+  string node_id = 1;
+
+  // The role the presented token granted. The caller should verify this
+  // matches what it intended to join as and abort loudly if not — a worker
+  // token silently producing a worker cert when the operator asked for a
+  // manager is a support call waiting to happen.
+  NodeRole role = 2;
+}
+
+message NodeCertificateStatusRequest {
+  // The node ID returned by `IssueNodeCertificate`.
+  string node_id = 1;
+}
+
+message NodeCertificateStatusResponse {
+  // Where issuance stands. Only ISSUED guarantees `certificate` is populated.
+  CertificateStatus status = 1;
+
+  // The signed certificate chain, PEM (leaf first, then any cross-signed
+  // intermediate during a root rotation).
+  //
+  // The client MUST verify this chain against the root bundle it pinned via the
+  // token digest, and MUST check that the public key matches the CSR it sent,
+  // before writing cert + key to disk (key mode 0600, atomic write-rename).
+  bytes certificate = 2;
+}

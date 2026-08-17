@@ -1,0 +1,205 @@
+// SPDX-License-Identifier: BSD-2-Clause
+// Control: the manager <-> manager control channel.
+//
+// Three jobs, all of them manager-internal (docs/architecture.md §6.5, §6.6,
+// §7 service table):
+//
+//   1. RAFT MEMBERSHIP — `JoinRaft` / `LeaveRaft` (SWK §11.3, §11.5).
+//   2. LEADER-FORWARDED STORE MUTATIONS — `ProposeActions`. A follower that
+//      receives a REST mutation forwards it here in ONE hop; the leader
+//      re-validates and proposes (architecture §6.5). Workers do not call this:
+//      they return the Docker "this node is not a swarm manager" error.
+//   3. CLUSTER INFO — `ClusterInfo`, so a follower's REST backend can answer
+//      `/swarm`, `/info` and node listings without its own raft view.
+//
+// Authorization (architecture §12.5): OU `satl-manager` only, same cluster ID
+// (O), not blacklisted — with ONE deliberate exception, `JoinRaft`, noted on
+// the RPC.
+//
+// LEADERSHIP: `ProposeActions`, `JoinRaft` and `LeaveRaft` are leader-only.
+// A non-leader answers `FAILED_PRECONDITION` and sets the response metadata key
+// `satl-leader-addr` to the current leader's internal gRPC address (empty when
+// there is no leader). The caller retries against that address ONCE — one
+// redirect, no chains, matching SwarmKit's one-hop loop protection (SWK §11.7).
+// `ClusterInfo` is answered locally by any manager from its applied store.
+
+syntax = "proto3";
+
+package satl.internal.v1;
+
+import "common.proto";
+
+service Control {
+  // Admit a manager into the raft group.
+  //
+  // AUTHORIZATION EXCEPTION: the caller presents a valid cluster certificate,
+  // but its OU may still be `satl-worker` at this point — a promoted node calls
+  // `JoinRaft` before its manager certificate has been renewed. Accept a
+  // valid, non-blacklisted certificate of EITHER role here, and check the role
+  // recorded on the node OBJECT (which the role manager already flipped) rather
+  // than the OU.
+  //
+  // Leader-side sequence (SWK §11.3, architecture §6.6), in order:
+  //   1. resolve the joiner's address (`addr`, or the gRPC peer address when
+  //      the caller sent an unspecified IP);
+  //   2. HEALTH-CHECK THE JOINER BACK — `grpc.health.v1.Health/Check` with
+  //      service name `raft`, 5 s budget, over mTLS. A joiner the leader cannot
+  //      reach must NOT be admitted: it would count towards quorum without
+  //      being able to vote. This is the step most reimplementations skip.
+  //   3. dedupe by node ID — a re-join only updates the address;
+  //   4. pick an unused, non-blacklisted random u64 raft ID (never reused);
+  //   5. propose the membership change and wait for it to commit.
+  // The joiner then catches up by normal replication (snapshot + entries).
+  rpc JoinRaft(JoinRaftRequest) returns (JoinRaftResponse);
+
+  // Remove a member from the raft group (demotion, node removal, graceful
+  // shutdown).
+  //
+  // QUORUM SAFETY (SWK §11.5): the leader counts the members that would remain
+  // REACHABLE after the removal and refuses with `FAILED_PRECONDITION` if that
+  // count would drop below `(n-1)/2 + 1`. A leader removing ITSELF transfers
+  // leadership first (to the longest-active peer) and lets the new leader do
+  // the removal — a departing leader cannot reliably observe its own removal
+  // commit. Demotion is raft-first: leave consensus, then flip the role so
+  // certificate renewal issues a worker certificate (architecture §6.6).
+  rpc LeaveRaft(LeaveRaftRequest) returns (LeaveRaftResponse);
+
+  // Forward a store transaction to the leader (architecture §6.5).
+  //
+  // The actions are exactly the `satl_core::StoreAction` list the local store
+  // would have applied, so a follower does not need a second serialization
+  // path. The leader RE-VALIDATES: same limits (200 actions / 1.5 MiB,
+  // architecture §15), same optimistic-concurrency checks. Rejections come back
+  // as DATA in the response, not as gRPC errors — a sequence conflict is a
+  // normal outcome the caller retries from a fresh read.
+  //
+  // There is NO PROPOSAL TIMEOUT by design (SWK §11.6, architecture §6.2): a
+  // timeout cannot retract an appended entry and would desync store from log.
+  // Set a generous gRPC deadline if you must, and treat expiry as "unknown
+  // outcome, re-read before retrying" — never as "did not apply".
+  rpc ProposeActions(ProposeActionsRequest) returns (ProposeActionsResponse);
+
+  // Cluster identity, membership and leadership, for a follower's REST backend.
+  // Answered locally from the applied store, so it may be slightly stale
+  // (architecture §6.4) — which is exactly what Docker's read endpoints allow.
+  rpc ClusterInfo(ClusterInfoRequest) returns (ClusterInfoResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Membership
+// ---------------------------------------------------------------------------
+
+// One member of the raft group.
+message RaftMember {
+  // Raft member ID: a random u64, never reused; removed IDs are blacklisted in
+  // snapshots (architecture §6.6).
+  uint64 raft_id = 1;
+  // The member's node ID (certificate CN).
+  string node_id = 2;
+  // `host:port` the raft transport dials.
+  string addr = 3;
+  // Whether this member currently leads, as seen by the responder.
+  bool leader = 4;
+}
+
+message JoinRaftRequest {
+  // The joiner's node ID. The leader cross-checks it against the CN of the
+  // caller's certificate and refuses a mismatch (`PERMISSION_DENIED`).
+  string node_id = 1;
+  // `host:port` the joiner wants peers to dial. MAY be empty or carry an
+  // unspecified IP (`0.0.0.0:port`), in which case the leader substitutes the
+  // gRPC peer address and keeps the port.
+  string addr = 2;
+}
+
+message JoinRaftResponse {
+  // The raft ID assigned to the joiner. It must persist this before starting
+  // its raft node.
+  uint64 raft_id = 1;
+  // The membership as of the committed configuration change, including the
+  // joiner.
+  repeated RaftMember members = 2;
+  // Raft IDs that have been removed and must never be re-admitted or reused.
+  // The joiner stores this blacklist and refuses messages from these IDs.
+  repeated uint64 removed_members = 3;
+}
+
+message LeaveRaftRequest {
+  // The raft ID to remove.
+  uint64 raft_id = 1;
+  // The node ID that raft ID belongs to; the leader refuses a mismatch, which
+  // is what stops a stale caller from evicting whoever inherited the slot.
+  string node_id = 2;
+}
+
+message LeaveRaftResponse {
+  // Membership after the removal committed.
+  repeated RaftMember members = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Leader-forwarded store mutations
+// ---------------------------------------------------------------------------
+
+// Identity of the ORIGINAL caller, forwarded with the request
+// (architecture §6.5, SWK §11.7).
+//
+// The leader authorizes the FORWARDING MANAGER's certificate and additionally
+// LOGS the original caller. Keeping the two distinguishable is a
+// privilege-escalation guard: a manager forwarding its own request must not be
+// confusable with a manager forwarding a worker's request. The REST surface has
+// no per-user authorization in v1, so this is an audit and diagnostics
+// mechanism, not an access-control one — do not start making decisions on it
+// without revisiting §12.5.
+message ForwardedIdentity {
+  // Certificate CN of the original caller (its node ID), empty for a local
+  // unix-socket caller.
+  string cn = 1;
+  // Certificate OU (its role).
+  string ou = 2;
+  // Certificate O (the cluster ID).
+  string org = 3;
+}
+
+message ProposeActionsRequest {
+  // CBOR of `Vec<satl_core::StoreAction>` — one atomic transaction.
+  bytes actions = 1;
+  // Who originally asked. Set by the forwarding manager, never by the origin.
+  ForwardedIdentity forwarded = 2;
+}
+
+message ProposeActionsResponse {
+  // CBOR of `satl_cluster::types::ProposalResponse` — either `Applied{version}`
+  // or `Rejected(ProposalRejection)`.
+  //
+  // A `Rejected` outcome is a SUCCESSFUL RPC: the transaction was evaluated
+  // deterministically and did not apply. Only transport and leadership
+  // failures are gRPC errors.
+  bytes response = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Cluster info
+// ---------------------------------------------------------------------------
+
+message ClusterInfoRequest {}
+
+message ClusterInfoResponse {
+  // The cluster object's ID — also the O field of every node certificate.
+  string cluster_id = 1;
+  // Raft ID of the current leader; 0 when there is none right now.
+  uint64 leader_raft_id = 2;
+  // Current membership as the responder sees it.
+  repeated RaftMember members = 3;
+  // The singleton cluster object (`kind = OBJECT_KIND_CLUSTER`).
+  //
+  // The responder MUST strip `encrypted_root_ca_key` from the payload before
+  // sending. Join tokens ARE included: every caller of this RPC is an
+  // authenticated manager, and the REST `/swarm` endpoint has to return them.
+  Object cluster = 4;
+  // Whether the responder has caught up enough to answer reads meaningfully
+  // (`applied_index >= last_index` at the time of the call). A false here is
+  // the REST backend's cue to say "cluster is not ready" rather than to serve
+  // an empty list as if it were the truth.
+  bool applied = 5;
+}

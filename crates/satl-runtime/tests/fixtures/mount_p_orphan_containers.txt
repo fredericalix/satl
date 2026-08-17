@@ -1,0 +1,7 @@
+devfs			/var/db/satl/containers/2e28tf8nt2nx35gh9ziodpgo1/dev devfs	rw		0 0
+fdescfs			/var/db/satl/containers/2e28tf8nt2nx35gh9ziodpgo1/dev/fd fdescfs	rw		0 0
+tmpfs			/var/db/satl/containers/2e28tf8nt2nx35gh9ziodpgo1/tmp tmpfs	rw		0 0
+devfs			/var/db/satl/containers/1tfwsaiswewqfrbp4d7pg3efh/dev devfs	rw		0 0
+fdescfs			/var/db/satl/containers/1tfwsaiswewqfrbp4d7pg3efh/dev/fd fdescfs	rw		0 0
+tmpfs			/var/db/satl/containers/1tfwsaiswewqfrbp4d7pg3efh/tmp tmpfs	rw		0 0
+zroot/satl/containers	/var/db/satl/containers	zfs	rw,nfsv4acls 	0 0

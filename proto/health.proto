@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: BSD-2-Clause
+// The standard gRPC health checking protocol.
+//
+// Package and message shapes are byte-compatible with upstream
+// `grpc.health.v1` (grpc/grpc-proto/grpc/health/v1/health.proto) so that
+// `grpc_health_probe`, `grpcurl` and tonic's own health client all work against
+// a SatL manager unchanged. Kept in-tree rather than pulled from `tonic-health`
+// because it is part of the contract this repository owns: architecture §7
+// lists `Health` in the internal service table, and `Control.JoinRaft`
+// health-checks a joining manager through it (SWK §11.3).
+//
+// If a later wave adds the `tonic-health` crate, use ITS generated types and
+// delete this file — two copies of `grpc.health.v1` in one binary is a
+// duplicate-symbol problem waiting to happen, not a redundancy.
+//
+// ---------------------------------------------------------------------------
+// SATL SERVICE NAMES
+// ---------------------------------------------------------------------------
+//
+// `HealthCheckRequest.service` is a SHORT NAME here, not a fully qualified
+// protobuf service name — matching SwarmKit, whose join flow checks `"Raft"`:
+//
+//   ""         the whole server: SERVING once the internal gRPC listener is up
+//              and TLS credentials are loaded.
+//   "raft"     the raft transport: SERVING once this manager's raft node is
+//              started and able to accept messages. THIS IS THE NAME
+//              `Control.JoinRaft` PROBES on the joiner before admitting it —
+//              a joiner that is not SERVING here is refused, because admitting
+//              it would add a member to the quorum count that cannot vote.
+//   "control"  the control plane: SERVING once the store has caught up
+//              (`applied_index >= last_index`) so reads and forwarded
+//              proposals are meaningful.
+//
+// Any other name is SERVICE_UNKNOWN. Authorization: unauthenticated within the
+// cluster's mTLS listener — a caller must still present a valid cluster
+// certificate to reach the listener at all, but no role is required, since
+// `JoinRaft` probes nodes whose role is in flux.
+
+syntax = "proto3";
+
+package grpc.health.v1;
+
+message HealthCheckRequest {
+  // Short service name; empty means the whole server. See the table above.
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    // The server did not report a status.
+    UNKNOWN = 0;
+    // The named service is up and accepting work.
+    SERVING = 1;
+    // The named service exists but is not currently accepting work.
+    NOT_SERVING = 2;
+    // Only ever set by `Watch`, when the requested service disappears.
+    SERVICE_UNKNOWN = 3;
+  }
+
+  // Current status of the requested service.
+  ServingStatus status = 1;
+}
+
+service Health {
+  // One-shot check. An unknown service name is answered with the gRPC status
+  // `NOT_FOUND`, per the upstream specification — not with SERVICE_UNKNOWN.
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Watch for status changes: the current status is sent immediately, then
+  // again on every change. An unknown service name yields SERVICE_UNKNOWN on
+  // the stream (not `NOT_FOUND`), and the status is updated if it later
+  // appears.
+  rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse);
+}

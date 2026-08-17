@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: BSD-2-Clause
+// Raft: the manager <-> manager consensus transport.
+//
+// Mirrors SWK §11.7 and docs/architecture.md §7 (service table) and §6
+// (cluster state store and Raft). It replaces the M0 `NoPeersNetwork` stub in
+// `crates/satl-cluster/src/network.rs` — the implementing wave writes an
+// `openraft::RaftNetwork<TypeConfig>` on top of this service.
+//
+// Authorization (architecture §12.5): OU `satl-manager` only, same cluster ID
+// (O), not blacklisted. Two extra admission rules from SWK §11.7 that are
+// policy, not transport, and must live in the server implementation:
+//
+//   * reject messages from blacklisted node IDs outright;
+//   * reject VOTE requests from senders that are unknown or that fail the
+//     health check — a partitioned node must not be able to disrupt a stable
+//     leader by campaigning.
+//
+// This service is NEVER leader-proxied. Every manager serves it for itself;
+// forwarding a raft message to the leader would corrupt the protocol.
+//
+// ---------------------------------------------------------------------------
+// OPAQUE PAYLOADS — same decision as common.proto, applied to openraft
+// ---------------------------------------------------------------------------
+//
+// The openraft request/response types are NOT re-modelled here. Each message
+// carries `bytes payload` holding the CBOR (`ciborium`) serialization of the
+// corresponding openraft type parameterized by
+// `satl_cluster::types::TypeConfig` (NodeId = u64, Node = BasicNode,
+// D = Proposal, R = ProposalResponse).
+//
+// Re-modelling raft internals in protobuf would mean maintaining a second
+// definition of log entries, vote records, snapshot metadata and membership
+// configs, and keeping it bit-compatible with whatever openraft's own types do
+// across upgrades. openraft owns those shapes; we own the transport. The
+// tradeoff is the same as in common.proto and is accepted for the same reasons.
+//
+// RESPONSE ENCODING: a response `payload` is the CBOR of the FULL
+// `Result<Resp, RaftError<...>>` that the local `openraft::Raft` handler
+// returned — raft-level errors are DATA, carried to the caller intact so it can
+// feed them back to its `RaftNetwork`. gRPC status codes are reserved for
+// TRANSPORT failures (unreachable peer, TLS rejection, decode failure) and map
+// to `RPCError::Unreachable` / `RPCError::Network` on the client side. Do not
+// flatten raft errors into gRPC statuses: openraft's retry and backoff logic
+// depends on telling the two apart.
+
+syntax = "proto3";
+
+package satl.internal.v1;
+
+service Raft {
+  // `openraft::Raft::append_entries` — log replication and heartbeats.
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+
+  // `openraft::Raft::vote` — leader election.
+  rpc Vote(VoteRequest) returns (VoteResponse);
+
+  // `openraft::Raft::install_snapshot` — unary form.
+  //
+  // openraft already splits a snapshot into chunks itself
+  // (`Config::snapshot_max_chunk_size`, with `offset` / `done` inside the
+  // payload), so this unary RPC carries ONE chunk per call. Keep
+  // `snapshot_max_chunk_size` comfortably below the 4 MiB gRPC message limit
+  // (architecture §15) — the payload also carries vote and snapshot metadata,
+  // and CBOR framing adds a little on top.
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+
+  // Chunked snapshot transfer, client-streaming (SWK §11.7's
+  // `StreamRaftMessage`).
+  //
+  // NOT USED BY THE FIRST IMPLEMENTATION: M2 ships the unary `InstallSnapshot`
+  // above and relies on openraft's own chunking, which is simpler and already
+  // resumable at the raft level. This RPC is defined now so that adding it
+  // later is not a wire-compatibility event: a server that implements it can be
+  // introduced ahead of any client that uses it, and clients can probe with a
+  // fallback to `InstallSnapshot` on `UNIMPLEMENTED` exactly as SwarmKit falls
+  // back to `ProcessRaftMessage`.
+  //
+  // Semantics when it is implemented: one call transfers one whole snapshot as
+  // an ordered sequence of `SnapshotChunk`s; the per-chunk send deadline resets
+  // after every successfully sent chunk, so a large snapshot cannot time out as
+  // a whole. The server answers once, after the final chunk.
+  rpc StreamInstallSnapshot(stream SnapshotChunk) returns (InstallSnapshotResponse);
+}
+
+message AppendEntriesRequest {
+  // Raft ID of the sender. Redundant with the certificate CN -> node ID
+  // mapping; carried for logging and for the blacklist check before the
+  // payload is decoded.
+  uint64 from = 1;
+  // CBOR of `openraft::raft::AppendEntriesRequest<TypeConfig>`.
+  bytes payload = 2;
+}
+
+message AppendEntriesResponse {
+  // CBOR of
+  // `Result<openraft::raft::AppendEntriesResponse<u64>, openraft::error::RaftError<u64>>`.
+  bytes payload = 1;
+}
+
+message VoteRequest {
+  // Raft ID of the candidate. See the admission rule above: an unknown or
+  // unhealthy sender is refused here, before the payload reaches openraft.
+  uint64 from = 1;
+  // CBOR of `openraft::raft::VoteRequest<u64>`.
+  bytes payload = 2;
+}
+
+message VoteResponse {
+  // CBOR of
+  // `Result<openraft::raft::VoteResponse<u64>, openraft::error::RaftError<u64>>`.
+  bytes payload = 1;
+}
+
+message InstallSnapshotRequest {
+  // Raft ID of the sender (the leader).
+  uint64 from = 1;
+  // CBOR of `openraft::raft::InstallSnapshotRequest<TypeConfig>` — carries the
+  // vote, the snapshot metadata, this chunk's `offset`, its `data`, and `done`.
+  bytes payload = 2;
+}
+
+message InstallSnapshotResponse {
+  // CBOR of
+  // `Result<openraft::raft::InstallSnapshotResponse<u64>,
+  //         openraft::error::RaftError<u64, openraft::error::InstallSnapshotError>>`.
+  bytes payload = 1;
+}
+
+// One frame of a streamed snapshot (see `StreamInstallSnapshot`).
+message SnapshotChunk {
+  // Raft ID of the sender. Set on the FIRST chunk; ignored afterwards.
+  uint64 from = 1;
+
+  // FIRST CHUNK ONLY: CBOR of `openraft::raft::InstallSnapshotRequest<TypeConfig>`
+  // with the `data` field emptied — vote, snapshot metadata and offsets, minus
+  // the bytes. The receiver reassembles `data` from the `data` fields of this
+  // and the following chunks, in order, then hands the whole thing to openraft.
+  bytes header = 2;
+
+  // Snapshot bytes for this frame, in order. Size each frame so the encoded
+  // message stays under 4 MiB (architecture §15).
+  bytes data = 3;
+
+  // True on the last frame. The server must not apply a partially received
+  // snapshot; an aborted stream is discarded and the leader retries.
+  bool last = 4;
+}

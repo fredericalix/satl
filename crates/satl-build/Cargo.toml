@@ -1,0 +1,28 @@
+[package]
+name = "satl-build"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[dependencies]
+flate2 = "1.1.9"
+satl-core = { version = "0.1.0", path = "../satl-core" }
+satl-image = { version = "0.1.0", path = "../satl-image" }
+satl-metrics = { version = "0.1.0", path = "../satl-metrics" }
+satl-storage = { version = "0.1.0", path = "../satl-storage" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
+tar = "0.4.46"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread"] }
+tracing = "0.1"
+
+[lints]
+workspace = true

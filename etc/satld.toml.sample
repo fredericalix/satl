@@ -1,0 +1,116 @@
+# satld.toml.sample -- SatL daemon configuration.
+#
+# Install as /usr/local/etc/satl/satld.toml (or point satld at another path
+# with --config). Every key is optional; a missing file means all defaults.
+# The values below are the built-in defaults (docs/architecture.md §15).
+# Unknown keys are rejected at startup so typos fail loudly.
+
+# Unix socket the Docker-compatible REST API is served on.
+#socket_path = "/var/run/satl.sock"
+
+# Node state directory. Normally the mountpoint of the ZFS root dataset
+# configured in `zfs_root`; satld warns at startup when they differ.
+#state_dir = "/var/db/satl"
+
+# ZFS root dataset holding all SatL datasets (raft, images, layers,
+# containers, volumes). ZFS is mandatory: satld refuses to start when this
+# dataset does not exist. Create it with:
+#
+#   zfs create -o mountpoint=/var/db/satl zroot/satl
+#
+# The child datasets are created automatically at startup.
+#zfs_root = "zroot/satl"
+
+# Name this node reports in cluster and API output.
+# Defaults to the system hostname.
+#node_name = ""
+
+# Group owning the REST API unix socket (mode 0660). Defaults to "wheel";
+# a dedicated "satl" group will replace this default once packaging creates
+# the group.
+#socket_group = "wheel"
+
+# How the node-local network manager applies its pf(4) rules. SatL only ever
+# writes its own `satl/nat` and `satl/rdr` anchors and never touches rules
+# outside them (docs/networking.md).
+#
+#   "enforce"   syntax-check and load the anchors. Required for published
+#               ports (`-p`) and outbound NAT to work; needs pf enabled
+#               (`pf_enable="YES"` in rc.conf) and a `nat-anchor "satl/*"` /
+#               `rdr-anchor "satl/*"` pair in /etc/pf.conf.
+#   "check"     generate the rules and syntax-check them (`pfctl -nf -`),
+#               never load them. The default: safe on hosts whose pf ruleset
+#               is managed elsewhere. Containers are reachable on their
+#               bridge address, published host ports are not.
+#   "disabled"  generate and log the rules, never invoke pfctl at all.
+#               Use on hosts without pf.
+#pf_mode = "check"
+
+# Name of the node-local bridge network containers attach to
+# (docs/networking.md). It also names the bridge interface, suffixed with a
+# "0" ("satl" -> "satl0"), and the ifconfig(8) interface group SatL marks
+# everything it owns with -- so two satld instances on one host MUST use
+# different names, or each one's startup reconciliation will destroy the
+# other's epairs. At most 14 characters.
+#network_name = "satl"
+
+# Address pool the node-local network subnets are carved from; each network
+# gets a /24 out of it. Change it when 10.88/16 collides with your underlay.
+#network_pool = "10.88.0.0/16"
+
+# Address the internal node-to-node gRPC server binds (Raft, Control,
+# Dispatcher, NodeCA — docs/architecture.md §7). Every node listens: a manager
+# needs it for its peers, and a single-node cluster needs it for the nodes that
+# will join it later.
+#
+# satld ALSO binds the next port up (2378 by default) for the unauthenticated
+# NodeCA bootstrap endpoint. That second listener is what a joining node — which
+# has no certificate yet, and so cannot complete an mTLS handshake — fetches the
+# root CA from and submits its CSR to (proto/ca.proto explains why this
+# exemption exists and what makes it safe: the joiner pins the CA it receives
+# against the digest inside its join token). Both ports must be reachable from
+# every other node in the cluster.
+#
+# `satl swarm join <host>:2377` derives the CA endpoint as <host>:2378, so an
+# operator only ever types the first one.
+#listen_addr = "0.0.0.0:2377"
+
+# The `host:port` this node tells its peers to dial. When unset, satld uses the
+# IPv4 address of the interface carrying the host's default route, with
+# listen_addr's port — right on an ordinary host, and the same interface
+# container traffic is NAT-ed out of.
+#
+# Set it explicitly on a multi-homed node, or whenever the address other nodes
+# must use is not the one the default route leaves by (a private cluster
+# network, for example). A bare address is accepted and gets listen_addr's
+# port: `advertise_addr = "10.2.0.4"` means 10.2.0.4:2377.
+#
+# With no advertise address at all the node still starts: the leader then
+# substitutes the address it sees this node connect from.
+#advertise_addr = "10.2.0.4:2377"
+
+# Interface container traffic is NAT-ed out of (the pf `satl/nat` anchor
+# generates `nat on <if> inet from <subnet> to any -> (<if>)`). When unset,
+# satld takes the interface of the host's default route, which is right on an
+# ordinary host. Set it explicitly on a multi-homed node — for example when
+# containers must leave through a private interface rather than the public
+# one. Without an egress interface no NAT rule exists and containers have no
+# outbound connectivity (satld warns loudly at startup).
+#egress_if = "vtnet0"
+
+# Address the Prometheus /metrics endpoint binds, mirroring dockerd's
+# --metrics-addr (the CLI flag of the same name wins over this key). OFF when
+# unset — the endpoint is unauthenticated, exactly like dockerd's, and the
+# scrape reveals cluster shape, task ids and per-task resource usage, so bind
+# it to a private address reachable by the Prometheus server and nothing else
+# (docs/operations.md).
+#metrics_addr = "10.2.0.4:9323"
+
+# TESTING knobs (docs/operations.md): the encrypted-overlay keyring's cadence,
+# in plain seconds. The defaults below are production (Docker's 12h rotation,
+# 60s between phases); shortening them lets a test watch a full rotation in
+# minutes. A non-default value draws a loud startup warning. Never set these
+# on a real cluster. Refused at load: a zero rotation interval, and a settle
+# time that does not fit below the rotation interval.
+#keyring_rotate_after_secs = 43200
+#keyring_phase_settle_secs = 60

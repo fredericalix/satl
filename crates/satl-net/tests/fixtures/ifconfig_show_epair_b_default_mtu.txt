@@ -1,0 +1,7 @@
+epair4b: flags=1008842<BROADCAST,RUNNING,SIMPLEX,MULTICAST,LOWER_UP> metric 0 mtu 1500
+	options=60001b<RXCSUM,TXCSUM,VLAN_MTU,VLAN_HWTAGGING,RXCSUM_IPV6,TXCSUM_IPV6>
+	ether 58:9c:fc:10:d3:fa
+	groups: epair
+	media: Ethernet 10Gbase-T (10Gbase-T <full-duplex>)
+	status: active
+	nd6 options=29<PERFORMNUD,IFDISABLED,AUTO_LINKLOCAL>

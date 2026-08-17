@@ -1,0 +1,10 @@
+epair4b: flags=1008843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST,LOWER_UP> metric 0 mtu 1450
+	description: satl:overlay:ntxnet:ntxtask00000000000001x
+	options=200019<RXCSUM,VLAN_MTU,VLAN_HWTAGGING,RXCSUM_IPV6>
+	ether 02:42:0a:4f:00:0b
+	hwaddr 58:9c:fc:10:d3:fa
+	inet 10.79.0.11 netmask 0xffffff00 broadcast 10.79.0.255
+	groups: epair
+	media: Ethernet 10Gbase-T (10Gbase-T <full-duplex>)
+	status: active
+	nd6 options=29<PERFORMNUD,IFDISABLED,AUTO_LINKLOCAL>
