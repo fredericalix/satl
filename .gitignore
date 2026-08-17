@@ -1,0 +1,21 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Core dumps
+*.core
+
+# Editor / tooling
+.vscode/
+.idea/
+*.swp
+
+# Local scratch experiments output
+hack/experiments/**/out/
+
+# Root-owned build products from `sudo make integration`.
+/target/integration/
+dist/
+
+# Divers
+inprogess/
