@@ -1,0 +1,60 @@
+# SatL test cluster inventory — THE single source of truth for node addresses.
+#
+# CLAUDE.md forbids hardcoding the VM addresses anywhere else in the tree.
+# Every script in tests/cluster/ reads this file (through lib.sh) instead of
+# embedding a hostname or an IP, so re-creating the VMs means editing this one
+# file and nothing else. Roles are data too: no script may assume "node1 is the
+# bootstrap manager" — it asks the inventory which node has role = "bootstrap".
+#
+# Topology (OVH Public Cloud, 3x FreeBSD 15.1-p2, 4 vCPU / 8 GiB, ZFS zroot):
+#
+#   vtnet0  public IP     — SSH from the dev host, container egress (NAT)
+#   vtnet1  10.2.0.0/16   — the cluster underlay: Raft + dispatcher (M2),
+#                           VXLAN overlay (M3). Never routed to the internet.
+#
+# The dev host (alpha) is NOT on 10.2.0.0/16 — it reaches the VMs over their
+# public addresses only. See tests/cluster/README.md, "Images on the VMs".
+#
+# Values verified 2026-08-10. Re-verify with:
+#   sh tests/cluster/run.sh        (checks private_ip against the live vtnet1)
+
+[cluster]
+ssh_user = "freebsd"
+# Underlay interface and prefix that carry cluster traffic between nodes.
+underlay_if = "vtnet1"
+underlay_cidr = "10.2.0.0/16"
+# Manager port: what `swarm init/join` advertise and listen on. satld's own
+# default (satl-cluster::DEFAULT_PORT, docker's 2377); the CA listener is one
+# above it. Here so no script has to spell an address, port included.
+manager_port = "2377"
+# Loopback-only test registry on each node (docs/image-sources.md).
+registry_port = "5000"
+registry_namespace = "satl-test"
+registry_root = "/var/db/satl-test-registry"
+# satld storage, mirroring docs/operations.md.
+zfs_root = "zroot/satl"
+state_dir = "/var/db/satl"
+prefix = "/usr/local"
+
+# Exactly one node must have role = "bootstrap" (it runs `satl swarm init`);
+# every node with role = "joiner" joins it with the manager token.
+[[node]]
+name = "node1"
+ssh_host = "fbsd-dev---1.fredalix.ovh"
+public_ip = "152.228.230.132"
+private_ip = "10.2.2.47"
+role = "bootstrap"
+
+[[node]]
+name = "node2"
+ssh_host = "fbsd-dev---2.fredalix.ovh"
+public_ip = "152.228.231.20"
+private_ip = "10.2.1.50"
+role = "joiner"
+
+[[node]]
+name = "node3"
+ssh_host = "fbsd-dev---3.fredalix.ovh"
+public_ip = "152.228.242.228"
+private_ip = "10.2.3.124"
+role = "joiner"
