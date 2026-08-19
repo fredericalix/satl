@@ -35,7 +35,7 @@ never speaks gRPC). There is no standalone mode — a single node is a cluster o
 make check              # SPDX headers, fmt --check, clippy -D warnings, cargo test --workspace
 make build / release    # debug / release build of satl + satld
 sudo make install       # binaries + rc.d + sample config (builds into target/install)
-make package            # dist/satl-<version>.pkg
+make package            # dist/satl-<version>.pkg + dist/CHECKSUM.SHA512
 sudo make integration   # root-only #[ignore]-gated tests (target/integration, --test-threads=1)
 make cluster-test       # tests/cluster/run.sh — the 3-VM scenario suite
 ```

@@ -60,7 +60,10 @@ install:
 # installable anywhere with `pkg add` — no repository needed. The staging
 # layout mirrors `install` exactly, so the package and a source install put
 # the same files in the same places. The ocijail dependency version is read
-# from the package repo at build time.
+# from the package repo at build time. CHECKSUM.SHA512 is written next to the
+# package in sha512sum(1) format, so a consumer verifies it with
+# `sha512sum -c CHECKSUM.SHA512` from inside dist/. It names only the package
+# this run built, and is rewritten on every `make package`.
 PKG_VERSION!=	awk -F'"' '/^version = / { print $$2; exit }' Cargo.toml
 PKG_STAGE=	target/package
 DISTDIR?=	${.CURDIR}/dist
@@ -81,7 +84,9 @@ package: release
 	    packaging/+MANIFEST.in > ${PKG_STAGE}/+MANIFEST
 	pkg create -M ${PKG_STAGE}/+MANIFEST -r ${PKG_STAGE}/root \
 	    -p packaging/pkg-plist -o ${DISTDIR}
+	cd ${DISTDIR} && sha512sum satl-${PKG_VERSION}.pkg > CHECKSUM.SHA512
 	@echo "wrote ${DISTDIR}/satl-${PKG_VERSION}.pkg"
+	@echo "wrote ${DISTDIR}/CHECKSUM.SHA512"
 
 # Root + FreeBSD required; tests are #[ignore]-gated. Run as root:
 #     sudo make integration

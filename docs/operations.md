@@ -38,9 +38,12 @@ service satld start
 
 `make package` writes `dist/satl-<version>.pkg`, built with `pkg create`
 from a staging tree that mirrors `make install` — no ports tree needed.
+Alongside it goes `dist/CHECKSUM.SHA512`, in sha512sum(1) format and naming
+only the package that run built (it is rewritten on every `make package`).
 Install it on any FreeBSD 15 amd64 host with:
 
 ```sh
+sha512sum -c CHECKSUM.SHA512    # both files in the same directory
 pkg add ./satl-0.1.0.pkg
 ```
 

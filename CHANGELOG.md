@@ -10,6 +10,12 @@ name/version separator.
 
 ## [Unreleased]
 
+### Added
+
+- `make package` writes `dist/CHECKSUM.SHA512` next to the package, in
+  sha512sum(1) format: `sha512sum -c CHECKSUM.SHA512` from inside `dist/`
+  verifies a `.pkg` distributed out of band.
+
 ## [0.1.0-beta] - 2026-08-17
 
 First public pre-release. SatL runs OCI containers as FreeBSD VNET jails through

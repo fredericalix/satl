@@ -67,8 +67,9 @@ storage, and their workarounds) lives in
 make build            # debug build of satl + satld
 make release          # release build into target/release
 sudo make install     # binaries + rc.d script + sample config
-make package          # dist/satl-<version>.pkg — installable anywhere with
-                      # `pkg add ./satl-0.1.0.pkg` (no repository needed)
+make package          # dist/satl-<version>.pkg + dist/CHECKSUM.SHA512 —
+                      # installable anywhere with `pkg add ./satl-0.1.0.pkg`
+                      # (no repository needed)
 ```
 
 Then, on the host (details in [docs/operations.md](docs/operations.md)):
