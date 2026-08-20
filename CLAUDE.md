@@ -48,6 +48,32 @@ make cluster-test       # tests/cluster/run.sh — the 3-VM scenario suite
 Root builds go to their own target dir on purpose (a root-owned `target/` breaks every
 later unprivileged build); keep it that way.
 
+## Keeping the running daemons current
+
+**Always upgrade `satl`/`satld` from the package, never with `sudo make install`** — on
+alpha and on the test VMs alike. `make install` writes files no package manager knows
+about, so `pkg info satl` reports nothing and the next `pkg add` has to be forced; the
+package is also the only path an operator will ever use, so it is the one worth exercising.
+
+```sh
+make package
+sudo pkg add -f dist/satl-$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml).pkg
+sudo service satld restart
+```
+
+Two things this relies on and one to check after:
+
+- **`satld.toml` survives.** `packaging/pkg-plist` ships `satld.toml.sample`, never the
+  real config; a `.pkgsave` of the old sample is normal.
+- **Running containers are re-adopted, not restarted.** Startup reconciliation re-attaches
+  live jails (architecture §7.2), so a `satl ps` uptime that resets to seconds means the
+  adoption failed — which is a bug, not an upgrade cost. Verify with the jail id and the
+  workload's pid, not just with `satl ps`:
+  `sudo jls -h jid name` before and after must show the same jid for the same task.
+- After a daemon-side change, re-run the verb that changed against the upgraded daemon.
+  A CLI built from the branch talking to a stale `satld` answers `page not found`, which
+  reads like a missing route rather than a stale daemon.
+
 Narrower runs:
 
 ```sh

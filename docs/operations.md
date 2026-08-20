@@ -69,6 +69,40 @@ docker -H unix:///var/run/satl.sock version    # any Docker CLI works
 service satld status
 ```
 
+### Upgrading a running node
+
+Use the package for upgrades too, not `make install`: files written outside a
+package manager are invisible to `pkg info`, and the next `pkg add` has to be
+forced past them.
+
+```sh
+sha512sum -c CHECKSUM.SHA512
+sudo pkg add -f ./satl-0.1.0.pkg    # -f: same version, newer build
+sudo service satld restart
+```
+
+**Your configuration survives.** The package ships `satld.toml.sample` and
+never `satld.toml`, so an upgrade cannot overwrite what you configured; the
+old sample is kept beside the new one as `satld.toml.sample.pkgsave`, which is
+`pkg`'s doing and safe to delete.
+
+**Running containers are re-adopted, not restarted.** Startup reconciliation
+re-attaches the live jails it finds (architecture §7.2), so an upgrade is not a
+workload restart — which also means an uptime that resets to seconds is a
+*failure to adopt*, not the price of upgrading. Check the jail, not just the
+container list, because `satl ps` would report a fresh container as running
+just as happily:
+
+```sh
+sudo jls -h jid name          # before
+sudo service satld restart
+sudo jls -h jid name          # after: same jid for the same task id
+satl ps                       # and the uptime carries on
+```
+
+Measured on the dev host at 0.1.0: same jid, same workload pid, `StartedAt`
+unchanged, `Up 9 days` across the restart.
+
 ## Configuration
 
 `/usr/local/etc/satl/satld.toml` — every key optional; defaults shown in the
