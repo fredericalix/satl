@@ -14,6 +14,7 @@ use anyhow::Context as _;
 use http_body_util::BodyExt as _;
 use http_body_util::Full;
 use hyper::body::Bytes;
+use hyper::header::HeaderMap;
 use hyper::{Method, StatusCode};
 use hyper_util::rt::TokioIo;
 
@@ -87,10 +88,15 @@ pub fn daemon_error(status: StatusCode, body: &[u8]) -> anyhow::Error {
     anyhow::Error::new(DaemonError { status, message })
 }
 
-/// A completed HTTP response: status code and raw body bytes.
+/// A completed HTTP response: status code, headers and raw body bytes.
+///
+/// The headers are here for the one thing Docker's response shapes have no
+/// room for: `DELETE /images/{name}` answers a bare JSON array, so SatL's
+/// deferred-layer count (api-compat 156) rides on `X-Satl-Deferred-Layers`.
 #[derive(Debug)]
 pub struct HttpResponse {
     pub status: StatusCode,
+    pub headers: HeaderMap,
     pub body: Bytes,
 }
 
@@ -171,6 +177,7 @@ pub async fn request(
         .await
         .with_context(|| format!("request {method} {path} to the daemon failed"))?;
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response
         .into_body()
         .collect()
@@ -181,7 +188,11 @@ pub async fn request(
     drop(sender);
     connection_task.abort();
 
-    Ok(HttpResponse { status, body })
+    Ok(HttpResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 fn decode_json<T: serde::de::DeserializeOwned>(body: &[u8], path: &str) -> anyhow::Result<T> {
@@ -250,6 +261,21 @@ pub async fn delete_ok(host: &Host, path: &str) -> anyhow::Result<()> {
         .await?
         .ensure_success()?;
     Ok(())
+}
+
+/// `DELETE <path>`; decode the JSON body and keep the response headers.
+///
+/// The headers matter for `DELETE /images/{name}`, whose body is Docker's bare
+/// array with nowhere to carry SatL's deferred-layer count (api-compat 156).
+pub async fn delete_json<T: serde::de::DeserializeOwned>(
+    host: &Host,
+    path: &str,
+) -> anyhow::Result<(T, HeaderMap)> {
+    let response = request(host, &Method::DELETE, path, None)
+        .await?
+        .ensure_success()?;
+    let decoded = decode_json(&response.body, path)?;
+    Ok((decoded, response.headers))
 }
 
 /// A streaming response body. Holds the connection task alive for the

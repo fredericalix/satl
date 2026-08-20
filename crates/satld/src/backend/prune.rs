@@ -37,7 +37,7 @@
 //! destroy only what both passes agree on. A single `satl system prune` therefore
 //! does two passes itself, [`SETTLE`] apart, and reports what it deferred.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use satl_api::model::{
@@ -46,7 +46,7 @@ use satl_api::model::{
 };
 use satl_core::{DesiredState, Id, ObjectKind, StoreAction, StoreObject};
 
-use super::{DaemonBackend, names};
+use super::{DaemonBackend, events, names};
 
 /// How long the two passes of the layer GC are apart.
 ///
@@ -56,6 +56,111 @@ use super::{DaemonBackend, names};
 /// image store mid-pull are each momentarily incomplete, and a pass taken while
 /// one of them is settling must not be the only pass.
 const SETTLE: Duration = Duration::from_millis(1500);
+
+/// The shortest image-ID prefix `DELETE /images/{name}` will resolve.
+///
+/// Docker's own floor. Shorter than this and a prefix stops identifying
+/// anything in a store of any size, and "remove the image whose digest starts
+/// with `a`" is not a request anybody means.
+const MIN_ID_PREFIX: usize = 6;
+
+/// Every image reference the cluster -- or, on a worker, this node -- asks
+/// for, split by how strong the claim is.
+///
+/// Both spellings of every reference are inserted, the raw one from the spec
+/// and its canonical form, because a record is keyed
+/// `docker.io/library/alpine:latest` while a spec may say `alpine`, and
+/// comparing the two literally would miss.
+#[derive(Debug, Default)]
+pub(super) struct ImageClaims {
+    /// References a **non-terminal** task, or a service that still wants
+    /// tasks, asks for — mapped to the operator-facing name of what holds
+    /// them. `--force` cannot override these: a service that will mint another
+    /// task is a standing order, and untagging under it turns the next start
+    /// into a pull against a registry that may be gone.
+    live: BTreeMap<String, String>,
+    /// References only **terminal** tasks hold. `--force` untags anyway.
+    stopped: BTreeMap<String, String>,
+    /// Specs whose image reference will not parse. One of these makes the
+    /// whole claim set incomplete by construction.
+    unparsable: usize,
+}
+
+impl ImageClaims {
+    /// Record a claim under both spellings of `image`.
+    fn add(&mut self, image: &str, holder: String, live: bool) {
+        let Ok(parsed) = satl_image::ImageReference::parse(image) else {
+            self.unparsable += 1;
+            return;
+        };
+        let map = if live {
+            &mut self.live
+        } else {
+            &mut self.stopped
+        };
+        map.entry(parsed.canonical())
+            .or_insert_with(|| holder.clone());
+        map.entry(image.to_owned()).or_insert(holder);
+    }
+
+    /// A task claims its image; whether the claim is live is the task's own
+    /// state. Deliberately **not** `is_stoppable`: a task created but never
+    /// started sits at a non-terminal state with `desired = Ready`, and it
+    /// still needs its image to start.
+    fn add_task(&mut self, task: &satl_core::Task) {
+        let live = !task.status.state.is_terminal();
+        let holder = if live {
+            format!("running container {}", task.id)
+        } else {
+            format!("container {}", task.id)
+        };
+        self.add(&task.spec.container.image, holder, live);
+    }
+
+    /// A service claims its image, live **unless it has stopped wanting
+    /// tasks**.
+    ///
+    /// The nuance is forced by invariant #2. Every container is a task of a
+    /// service, so a `satl stop`ped container still has its service, and a
+    /// service that claimed unconditionally would make Docker's
+    /// `(must force)` arm unreachable: there would be no way to reach "only a
+    /// stopped container references this image", because the service behind it
+    /// always would too.
+    ///
+    /// So the question is not "does a service exist" but "will it produce a
+    /// task that needs this image". It will unless **every** task it owns is
+    /// terminal *and* desired-shutdown — which is exactly the state `satl
+    /// stop` leaves, and exactly the rail `prune_containers_impl` already uses
+    /// to decide a service is prunable. A service with no tasks yet is live:
+    /// it is about to have some.
+    fn add_service(&mut self, service: &satl_core::Service, tasks: &[&satl_core::Task]) {
+        let owned: Vec<&&satl_core::Task> = tasks
+            .iter()
+            .filter(|task| task.service_id.as_ref() == Some(&service.id))
+            .collect();
+        let live = owned.is_empty()
+            || owned.iter().any(|task| {
+                !task.status.state.is_terminal() || task.desired_state < DesiredState::Shutdown
+            });
+        let holder = format!("service {}", service.spec.annotations.name);
+        self.add(&service.spec.task.container.image, holder, live);
+    }
+
+    /// Whether any reference here is claimed at all -- used by the prune to
+    /// skip a record without building an error for it.
+    fn holds(&self, reference: &str) -> bool {
+        self.live.contains_key(reference) || self.stopped.contains_key(reference)
+    }
+}
+
+/// What the operator named, as the set of store records it selects.
+#[derive(Debug)]
+pub(super) struct ImageTarget {
+    /// The image ID -- SatL's is the manifest digest (api-compat #41).
+    pub(super) id: String,
+    /// Every canonical reference in this node's store that resolves to it.
+    pub(super) references: Vec<String>,
+}
 
 impl DaemonBackend {
     /// `POST /containers/prune`: remove every stopped container, with the
@@ -207,54 +312,235 @@ impl DaemonBackend {
         if all {
             self.untag_unused_images(&mut report).await?;
         }
-        self.collect_layers(&mut report).await;
-        self.collect_content(&mut report).await;
+        self.reclaim(&mut report).await;
         Ok(report)
     }
 
-    /// Forget every image record no task's spec asks for.
+    /// `DELETE /images/{name}?force=&noprune=`: forget one image record and
+    /// reclaim what stopped being referenced.
     ///
-    /// Comparison is on the **canonical** reference both ways: a record is keyed
-    /// `docker.io/library/alpine:latest` while a spec may say `alpine`, and
-    /// comparing the two literally would untag an image a service is about to
-    /// pull. A spec image that will not parse is treated as claiming everything
-    /// it could possibly mean — nothing is untagged on this pass — because a
-    /// reference we cannot read is not evidence that nothing uses it.
-    async fn untag_unused_images(&self, report: &mut PrunedImages) -> Result<()> {
-        let mut wanted: BTreeSet<String> = BTreeSet::new();
-        let mut unparsable = 0;
-        let mut add = |image: &str| match satl_image::ImageReference::parse(image) {
-            Ok(parsed) => {
-                wanted.insert(parsed.canonical());
-                wanted.insert(image.to_owned());
-            }
-            Err(_) => unparsable += 1,
-        };
+    /// The same three stages as [`prune_images_impl`], scoped to one target.
+    /// In particular the layer sweep is the *same* sweep, two agreeing
+    /// readings [`SETTLE`] apart, which is why a single removal takes about a
+    /// second and a half (api-compat 155): a layer's loss is not recoverable
+    /// by re-running anything, so one reading is not evidence here either.
+    /// `noprune` skips both sweeps, and is the way to pay that cost once for a
+    /// batch instead of once per image.
+    pub(super) async fn remove_image_impl(
+        &self,
+        reference: &str,
+        force: bool,
+        noprune: bool,
+    ) -> Result<PrunedImages> {
+        let claims = self.image_claims().await?;
+        let target = self.resolve_image_target(reference).await?;
+        let mut report = PrunedImages::default();
+        self.untag_image(&claims, &target, force, &mut report)
+            .await?;
+        if !noprune {
+            self.reclaim(&mut report).await;
+        }
+        Ok(report)
+    }
+
+    /// The two sweeps, without the record pass: layers on two agreeing
+    /// readings, then unreachable content.
+    async fn reclaim(&self, report: &mut PrunedImages) {
+        self.collect_layers(report).await;
+        self.collect_content(report).await;
+    }
+
+    /// One reading of every image reference this node's cluster asks for.
+    ///
+    /// On a manager the claim set is the whole store's tasks and services; on
+    /// a worker it is this node's local task DB. That fallback is why image
+    /// removal **never answers 503** — an image is node-local (api-compat
+    /// #130) and has no cluster read to be refused for, unlike `satl node ps`.
+    async fn image_claims(&self) -> Result<ImageClaims> {
+        let mut claims = ImageClaims::default();
         match Self::manager_of(self.cluster()?.as_ref()) {
             Ok(manager) => {
                 let view = manager.store.view();
-                for task in view.tasks() {
-                    add(&task.spec.container.image);
+                let owned = view.tasks();
+                let tasks: Vec<&satl_core::Task> =
+                    owned.iter().map(std::convert::AsRef::as_ref).collect();
+                for task in &tasks {
+                    claims.add_task(task);
                 }
                 for service in view.services() {
-                    add(&service.spec.task.container.image);
+                    claims.add_service(service.as_ref(), &tasks);
                 }
             }
             Err(_) => {
                 for task in self.local_tasks().await? {
-                    add(&task.spec.container.image);
+                    claims.add_task(&task);
                 }
             }
         }
-        if unparsable > 0 {
+        if claims.unparsable > 0 {
             tracing::warn!(
-                specs = unparsable,
+                specs = claims.unparsable,
                 "some task specs name an image reference that will not parse; no image \
                  record will be untagged on this pass"
             );
-            return Ok(());
+        }
+        Ok(claims)
+    }
+
+    /// The one place "is this image in use" is decided.
+    ///
+    /// Both `DELETE /images/{name}` and the `-a` half of `POST /images/prune`
+    /// ask this function the same question, so the two verbs cannot disagree
+    /// about what is in use — the same discipline `remove_network_impl` and
+    /// `prune_networks_impl` already share (api-compat 161).
+    fn image_conflict(
+        claims: &ImageClaims,
+        target: &ImageTarget,
+        force: bool,
+    ) -> Option<BackendError> {
+        let named = target
+            .references
+            .first()
+            .map_or(target.id.as_str(), String::as_str);
+
+        // A claim set assembled from a spec that will not parse is incomplete
+        // by construction, so nothing may go on this reading. This is the
+        // fail-safe `untag_unused_images` has always had, now expressed once
+        // for both callers.
+        if claims.unparsable > 0 {
+            return Some(BackendError::conflict(format!(
+                "unable to delete {named} (cannot be forced) - a task spec names an image \
+                 reference that cannot be read, so what still uses this image is unknown"
+            )));
         }
 
+        for reference in &target.references {
+            if let Some(holder) = claims.live.get(reference) {
+                return Some(BackendError::conflict(format!(
+                    "unable to delete {reference} (cannot be forced) - image is being used \
+                     by {holder}"
+                )));
+            }
+        }
+
+        // More than one reference resolving to the same image is Docker's
+        // "referenced in multiple repositories": removing by ID would forget
+        // all of them, which is not what an unqualified request means.
+        if !force && target.references.len() > 1 {
+            return Some(BackendError::conflict(format!(
+                "unable to delete {} (must be forced) - image is referenced in multiple \
+                 repositories",
+                short_id(&target.id)
+            )));
+        }
+
+        if force {
+            return None;
+        }
+        for reference in &target.references {
+            if let Some(holder) = claims.stopped.get(reference) {
+                return Some(BackendError::conflict(format!(
+                    "unable to remove repository reference \"{reference}\" (must force) - \
+                     {holder} is using its referenced image {}",
+                    short_id(&target.id)
+                )));
+            }
+        }
+        None
+    }
+
+    /// Resolve what the operator named to the store records it selects.
+    ///
+    /// The **image-ID form is tried first, before the reference parser**, and
+    /// that order is load-bearing: `sha256:abcdef` is a syntactically valid
+    /// Docker reference (`docker.io/library/sha256:abcdef`), so parsing first
+    /// would turn every removal by ID into a lookup that can only miss
+    /// (api-compat 158).
+    pub(super) async fn resolve_image_target(&self, name: &str) -> Result<ImageTarget> {
+        let images = self
+            .executor
+            .images()
+            .list()
+            .await
+            .map_err(|err| BackendError::internal(format!("cannot list images: {err}")))?;
+
+        if let Some(prefix) = id_prefix(name) {
+            let mut references = Vec::new();
+            let mut id = None;
+            for image in &images {
+                if image.manifest_digest.hex().starts_with(prefix) {
+                    id = Some(image.manifest_digest.as_str().to_owned());
+                    references.push(image.reference.clone());
+                }
+            }
+            if let Some(id) = id {
+                return Ok(ImageTarget { id, references });
+            }
+            return Err(BackendError::not_found(format!("No such image: {name}")));
+        }
+
+        let parsed = satl_image::ImageReference::parse(name)
+            .map_err(|err| BackendError::invalid(format!("invalid reference {name}: {err}")))?;
+        let canonical = parsed.canonical();
+        let found = images
+            .iter()
+            .find(|image| image.reference == canonical)
+            .ok_or_else(|| BackendError::not_found(format!("No such image: {name}")))?;
+        Ok(ImageTarget {
+            id: found.manifest_digest.as_str().to_owned(),
+            references: vec![found.reference.clone()],
+        })
+    }
+
+    /// Forget one target's records, refusing if anything still claims them.
+    ///
+    /// `ImageStore::remove` writes `repositories.json` before anything is
+    /// deleted, so a store read is never left pointing at a file that has
+    /// gone; the sweeps that follow are what actually reclaim disk.
+    async fn untag_image(
+        &self,
+        claims: &ImageClaims,
+        target: &ImageTarget,
+        force: bool,
+        report: &mut PrunedImages,
+    ) -> Result<()> {
+        if let Some(conflict) = Self::image_conflict(claims, target, force) {
+            return Err(conflict);
+        }
+        for reference in &target.references {
+            match self.executor.images().remove(reference).await {
+                Ok(true) => {
+                    report
+                        .deleted
+                        .push(ImageDeleted::Untagged(reference.clone()));
+                    let _ = self.local_events.send(events::image_untag(reference));
+                }
+                // Raced with another remover; nothing to report.
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(BackendError::internal(format!(
+                        "cannot forget the image record {reference}: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Forget every image record no task's spec asks for.
+    ///
+    /// Drives the same single-object path `DELETE /images/{name}` does and
+    /// swallows its `Conflict` as a skip — the shape `prune_networks_impl`
+    /// already uses for networks, and the reason the two image verbs cannot
+    /// disagree about what is in use.
+    ///
+    /// The claim set is read **once** for the whole pass. A spec image that
+    /// will not parse still means nothing is untagged at all, because
+    /// `image_conflict` turns `unparsable > 0` into a conflict for every
+    /// record: a reference we cannot read is not evidence that nothing uses
+    /// it.
+    async fn untag_unused_images(&self, report: &mut PrunedImages) -> Result<()> {
+        let claims = self.image_claims().await?;
         let images = self
             .executor
             .images()
@@ -262,14 +548,24 @@ impl DaemonBackend {
             .await
             .map_err(|err| BackendError::internal(format!("cannot list images: {err}")))?;
         for image in images {
-            if wanted.contains(&image.reference) {
+            if claims.holds(&image.reference) {
                 continue;
             }
-            match self.executor.images().remove(&image.reference).await {
-                Ok(true) => report
-                    .deleted
-                    .push(ImageDeleted::Untagged(image.reference.clone())),
-                Ok(false) => {}
+            let target = ImageTarget {
+                id: image.manifest_digest.as_str().to_owned(),
+                references: vec![image.reference.clone()],
+            };
+            // `force` is true so a record held only by a terminal task is
+            // still reclaimed: a prune is the verb whose whole job is
+            // reclaiming those. A *live* claim is refused regardless, which is
+            // the point of the distinction.
+            match self.untag_image(&claims, &target, true, report).await {
+                Ok(()) => {}
+                Err(BackendError::Conflict(reason)) => tracing::debug!(
+                    reference = %image.reference,
+                    %reason,
+                    "image still in use; not untagged"
+                ),
                 Err(error) => tracing::warn!(
                     reference = %image.reference,
                     %error,
@@ -558,5 +854,270 @@ impl DaemonBackend {
             .await
             .map(|rows| rows.iter().map(|row| row.used).sum())
             .unwrap_or_default()
+    }
+}
+
+/// The hex part of `name`, if it names an image by ID rather than by
+/// reference: `sha256:<hex>` or a bare hex prefix of at least
+/// [`MIN_ID_PREFIX`] characters.
+///
+/// Returns `None` for anything that could be a repository name, so an image
+/// called `deadbeef` is still addressable — it is simply spelled with its tag
+/// (`deadbeef:latest`), which the reference parser then accepts.
+fn id_prefix(name: &str) -> Option<&str> {
+    let hex = match name.strip_prefix("sha256:") {
+        // With the algorithm spelled out there is no ambiguity, so any
+        // non-empty hex run is an ID.
+        Some(rest) => rest,
+        // Bare hex is only an ID when it cannot be a reference: no separator
+        // of any kind, and long enough to mean something.
+        None if !name.contains([':', '/', '@', '.']) && name.len() >= MIN_ID_PREFIX => name,
+        None => return None,
+    };
+    (!hex.is_empty() && hex.len() <= 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(hex)
+}
+
+/// An image ID as Docker prints it in a conflict: the first 12 hex
+/// characters, without the algorithm prefix.
+fn short_id(id: &str) -> &str {
+    let hex = id.strip_prefix("sha256:").unwrap_or(id);
+    &hex[..hex.len().min(12)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `sha256:<hex>` and a long enough bare hex run are IDs; anything that
+    /// could be a repository name is not.
+    #[test]
+    fn an_image_id_is_recognised_before_it_can_parse_as_a_reference() {
+        assert_eq!(id_prefix("sha256:deadbeef"), Some("deadbeef"));
+        assert_eq!(id_prefix("deadbeef"), Some("deadbeef"));
+        // Too short to mean anything.
+        assert_eq!(id_prefix("dead"), None);
+        // Not hex.
+        assert_eq!(id_prefix("nginxserver"), None);
+        // Carries a separator, so it is a reference: `alpine:latest`,
+        // `ghcr.io/x/y`, `x@sha256:...`, and a bare `deadbeef:latest` are all
+        // addressable by name.
+        assert_eq!(id_prefix("deadbeef:latest"), None);
+        assert_eq!(id_prefix("ghcr.io/x/y"), None);
+        assert_eq!(id_prefix("x@sha256:aa"), None);
+        // `sha256:` with a non-hex tail is not an ID either.
+        assert_eq!(id_prefix("sha256:zzzz"), None);
+    }
+
+    #[test]
+    fn short_id_is_dockers_twelve_characters_without_the_algorithm() {
+        assert_eq!(short_id("sha256:0123456789abcdef0123"), "0123456789ab");
+        assert_eq!(short_id("sha256:abc"), "abc");
+    }
+
+    /// A service naming `image`, as the control plane would write it.
+    fn a_service(name: &str, image: &str) -> satl_core::Service {
+        let mut spec = crate::backend::service_spec(
+            name.to_owned(),
+            &satl_api::model::CreateContainerOptions {
+                image: image.to_owned(),
+                ..satl_api::model::CreateContainerOptions::default()
+            },
+        );
+        spec.task.container.image = image.to_owned();
+        satl_core::Service {
+            id: Id::generate(),
+            meta: satl_core::Meta::new(),
+            spec,
+            endpoint: None,
+            spec_version: satl_core::Version::default(),
+            previous_spec: None,
+            update_status: None,
+        }
+    }
+
+    /// One task of `service`, in the given observed and desired states.
+    fn a_task(service: &Id, state: satl_core::TaskState, desired: DesiredState) -> satl_core::Task {
+        satl_core::Task {
+            id: Id::generate(),
+            annotations: satl_core::Annotations::default(),
+            meta: satl_core::Meta::new(),
+            spec: crate::backend::tests::empty_task_spec(),
+            spec_version: None,
+            service_id: Some(service.clone()),
+            slot: 1,
+            node_id: None,
+            service_annotations: satl_core::Annotations::default(),
+            status: satl_core::TaskStatus::new(state, "test"),
+            desired_state: desired,
+            networks: Vec::new(),
+            endpoint: None,
+            job_iteration: None,
+        }
+    }
+
+    fn target(references: &[&str]) -> ImageTarget {
+        ImageTarget {
+            id: "sha256:0123456789abcdef".to_owned(),
+            references: references.iter().map(|r| (*r).to_owned()).collect(),
+        }
+    }
+
+    fn claims(live: &[(&str, &str)], stopped: &[(&str, &str)]) -> ImageClaims {
+        let owned = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        ImageClaims {
+            live: owned(live),
+            stopped: owned(stopped),
+            unparsable: 0,
+        }
+    }
+
+    /// A live claim is the one thing `--force` cannot buy past.
+    #[test]
+    fn a_live_claim_cannot_be_forced() {
+        let claims = claims(
+            &[("docker.io/library/alpine:latest", "running container 1kql")],
+            &[],
+        );
+        let target = target(&["docker.io/library/alpine:latest"]);
+        for force in [false, true] {
+            let error = DaemonBackend::image_conflict(&claims, &target, force)
+                .expect("a running container still holds it");
+            let text = error.to_string();
+            assert!(text.contains("cannot be forced"), "{text}");
+            assert!(text.contains("running container 1kql"), "{text}");
+        }
+    }
+
+    /// A service spec is a standing order to create tasks, so it is live even
+    /// with no task running yet.
+    #[test]
+    fn a_service_spec_is_a_live_claim() {
+        let claims = claims(&[("docker.io/library/nginx:1.27", "service web")], &[]);
+        let target = target(&["docker.io/library/nginx:1.27"]);
+        let error = DaemonBackend::image_conflict(&claims, &target, true)
+            .expect("the service spec still names it");
+        assert!(error.to_string().contains("service web"), "{error}");
+    }
+
+    /// The classification a stopped container has to produce.
+    ///
+    /// Invariant #2 makes every container a task of a service, so if a service
+    /// claimed unconditionally there would be no reachable state in which only
+    /// a *stopped* container references an image -- and Docker's `(must
+    /// force)` arm would be dead code. A service is live while it still wants
+    /// tasks, and stops being live exactly when `satl stop` has left every one
+    /// of its tasks terminal and desired-shutdown.
+    #[test]
+    fn a_service_stops_claiming_live_once_it_has_stopped_wanting_tasks() {
+        let service = a_service("web", "alpine");
+        let stopped_task = a_task(
+            &service.id,
+            satl_core::TaskState::Shutdown,
+            DesiredState::Shutdown,
+        );
+        let running_task = a_task(
+            &service.id,
+            satl_core::TaskState::Running,
+            DesiredState::Running,
+        );
+
+        // Every task terminal and desired-shutdown: a stopped container.
+        let mut claims = ImageClaims::default();
+        claims.add_service(&service, &[&stopped_task]);
+        assert!(
+            !claims.live.contains_key("docker.io/library/alpine:latest"),
+            "a service whose every task is stopped is not a live claim"
+        );
+        assert!(
+            claims
+                .stopped
+                .contains_key("docker.io/library/alpine:latest")
+        );
+
+        // One task still running: live.
+        let mut claims = ImageClaims::default();
+        claims.add_service(&service, &[&stopped_task, &running_task]);
+        assert!(claims.live.contains_key("docker.io/library/alpine:latest"));
+
+        // No tasks yet: live, because it is about to have some.
+        let mut claims = ImageClaims::default();
+        claims.add_service(&service, &[]);
+        assert!(claims.live.contains_key("docker.io/library/alpine:latest"));
+    }
+
+    /// Only terminal tasks: refused by default, reclaimed with `--force`.
+    #[test]
+    fn a_stopped_claim_is_refused_by_default_and_forced_through() {
+        let claims = claims(
+            &[],
+            &[("docker.io/library/alpine:latest", "container 2ju5")],
+        );
+        let target = target(&["docker.io/library/alpine:latest"]);
+        let error = DaemonBackend::image_conflict(&claims, &target, false)
+            .expect("a stopped container still references it");
+        assert!(error.to_string().contains("must force"), "{error}");
+        assert!(DaemonBackend::image_conflict(&claims, &target, true).is_none());
+    }
+
+    /// Nothing claims it: it goes, forced or not.
+    #[test]
+    fn an_unclaimed_image_is_removable() {
+        let claims = claims(&[], &[]);
+        let target = target(&["docker.io/library/alpine:latest"]);
+        assert!(DaemonBackend::image_conflict(&claims, &target, false).is_none());
+    }
+
+    /// Removing by ID when several references share the digest is Docker's
+    /// multi-repository refusal.
+    #[test]
+    fn an_image_reachable_from_several_references_must_be_forced() {
+        let claims = claims(&[], &[]);
+        let target = target(&[
+            "docker.io/library/alpine:3.20",
+            "docker.io/library/alpine:latest",
+        ]);
+        let error = DaemonBackend::image_conflict(&claims, &target, false)
+            .expect("two references resolve to it");
+        let text = error.to_string();
+        assert!(text.contains("must be forced"), "{text}");
+        assert!(
+            text.contains("referenced in multiple repositories"),
+            "{text}"
+        );
+        assert!(DaemonBackend::image_conflict(&claims, &target, true).is_none());
+    }
+
+    /// The fail-safe: one spec we cannot read makes the claim set incomplete
+    /// by construction, so nothing may go — which is what keeps
+    /// `untag_unused_images` untagging nothing at all on such a pass.
+    #[test]
+    fn one_unparsable_spec_refuses_every_removal() {
+        let mut claims = claims(&[], &[]);
+        claims.unparsable = 1;
+        let target = target(&["docker.io/library/alpine:latest"]);
+        for force in [false, true] {
+            let error = DaemonBackend::image_conflict(&claims, &target, force)
+                .expect("the claim set is incomplete");
+            let text = error.to_string();
+            assert!(text.contains("cannot be forced"), "{text}");
+            assert!(text.contains("cannot be read"), "{text}");
+        }
+    }
+
+    /// Both spellings of a spec image are claimed, so a spec saying `alpine`
+    /// protects the record keyed `docker.io/library/alpine:latest`. This is
+    /// the comparison `list_images`' Containers count used to get wrong.
+    #[test]
+    fn a_short_spec_reference_claims_the_canonical_record() {
+        let mut claims = ImageClaims::default();
+        claims.add("alpine", "running container 1kql".to_owned(), true);
+        assert!(claims.holds("docker.io/library/alpine:latest"));
+        assert!(claims.holds("alpine"));
     }
 }

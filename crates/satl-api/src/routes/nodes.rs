@@ -16,6 +16,21 @@ use crate::types::NodeSpecWire;
 
 /// `GET /nodes`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    get,
+    path = "/nodes",
+    operation_id = "NodeList",
+    tag = "Node",
+    description = "`Description.Engine.Plugins` is always empty and \
+        `Description.TLSInfo` is omitted (api-compat #53).",
+    params(("filters" = Option<String>, Query, description = "A non-empty value is rejected with 501 rather than silently listing everything (api-compat #47).")),
+    responses(
+        (status = 200, description = "One row per cluster member.", body = Vec<crate::types::NodeResponse>),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "`?filters=` was non-empty, or the daemon has no store wired.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn list(
     State(state): State<ApiState>,
     Query(params): Query<Params>,
@@ -31,6 +46,21 @@ pub(super) async fn list(
 
 /// `GET /nodes/{id}`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    get,
+    path = "/nodes/{id}",
+    operation_id = "NodeInspect",
+    tag = "Node",
+    description = "One cluster member.",
+    params(("id" = String, Path, description = "Node ID or hostname.")),
+    responses(
+        (status = 200, description = "The node document.", body = crate::types::NodeResponse),
+        (status = 404, description = "No such node.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn inspect(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -41,6 +71,32 @@ pub(super) async fn inspect(
 
 /// `POST /nodes/{id}/update?version=`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    post,
+    path = "/nodes/{id}/update",
+    operation_id = "NodeUpdate",
+    tag = "Node",
+    description = "Promotion and demotion apply live: the role change reaches \
+        the node on its session, it renews its certificate to the new role \
+        and rebuilds its cluster runtime in place. Running containers are not \
+        disturbed and the daemon does not restart (api-compat #48). A missing \
+        or unparsable `?version=` is a 400 before the backend is called \
+        (api-compat #54).",
+    params(
+        ("id" = String, Path, description = "Node ID or hostname."),
+        ("version" = Option<String>, Query, description = "The object version being updated. Required: a missing or unparsable value is a 400 (api-compat #54).")
+    ),
+    request_body = crate::types::NodeSpecWire,
+    responses(
+        (status = 200, description = "Updated."),
+        (status = 400, description = "Missing or unparsable `?version=`, or an invalid spec.", body = crate::types::ErrorBody),
+        (status = 404, description = "No such node.", body = crate::types::ErrorBody),
+        (status = 409, description = "The stored object version has moved on.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn update(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -62,6 +118,25 @@ pub(super) async fn update(
 
 /// `DELETE /nodes/{id}?force=`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    delete,
+    path = "/nodes/{id}",
+    operation_id = "NodeDelete",
+    tag = "Node",
+    description = "Removes a member from the cluster.",
+    params(
+        ("id" = String, Path, description = "Node ID or hostname."),
+        ("force" = Option<String>, Query, description = "Remove a node that is still reachable or still a manager. Docker `BoolValue` semantics.")
+    ),
+    responses(
+        (status = 200, description = "Removed."),
+        (status = 404, description = "No such node.", body = crate::types::ErrorBody),
+        (status = 409, description = "The node is still active and `?force=` was not set.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn remove(
     State(state): State<ApiState>,
     Path(id): Path<String>,

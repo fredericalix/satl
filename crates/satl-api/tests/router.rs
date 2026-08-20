@@ -1226,6 +1226,133 @@ async fn tag_image_maps_backend_errors_to_docker_statuses() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+/// Docker's rmi answers a bare array of `{"Untagged"}`/`{"Deleted"}` items.
+#[tokio::test]
+async fn remove_image_answers_dockers_array_and_forwards_its_flags() {
+    let (state, recorder) = MockBackend::new()
+        .answer(|answers| {
+            answers.image_removed = satl_api::model::PrunedImages {
+                deleted: vec![
+                    satl_api::model::ImageDeleted::Untagged(
+                        "docker.io/library/nginx:1.25".to_owned(),
+                    ),
+                    satl_api::model::ImageDeleted::Deleted("sha256:abc".to_owned()),
+                ],
+                space_reclaimed: 42,
+                deferred: Vec::new(),
+            };
+        })
+        .into_state();
+
+    let response = send_json(
+        &state,
+        "DELETE",
+        "/images/nginx:1.25?force=1&noprune=yes",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // `noprune=yes` is true under Docker's BoolValue, not just `1`/`true`.
+    assert_eq!(
+        recorder.only_call(),
+        Call::RemoveImage("nginx:1.25".to_owned(), true, true)
+    );
+    let body = body_json(response).await;
+    assert_eq!(body[0]["Untagged"], "docker.io/library/nginx:1.25");
+    assert_eq!(body[1]["Deleted"], "sha256:abc");
+    assert!(body[0].get("Deleted").is_none(), "{body}");
+}
+
+/// An image name carries slashes and colons; the tail wildcard must hand the
+/// reference to the backend whole, with nothing stripped.
+#[tokio::test]
+async fn remove_image_passes_a_slashed_reference_through_verbatim() {
+    let (state, recorder) = MockBackend::new().into_state();
+    let response = send_json(&state, "DELETE", "/images/ghcr.io/team/app:v1", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        recorder.only_call(),
+        Call::RemoveImage("ghcr.io/team/app:v1".to_owned(), false, false)
+    );
+}
+
+/// What the layer sweep deferred has nowhere to go in Docker's array, so it
+/// rides on a header — and only when there is something to say.
+#[tokio::test]
+async fn deferred_layers_travel_in_a_header_and_only_when_there_are_any() {
+    let (state, _) = MockBackend::new()
+        .answer(|answers| {
+            answers.image_removed = satl_api::model::PrunedImages {
+                deferred: vec!["aaa".to_owned(), "bbb".to_owned()],
+                ..satl_api::model::PrunedImages::default()
+            };
+        })
+        .into_state();
+    let response = send_json(&state, "DELETE", "/images/nginx:1.25", None).await;
+    assert_eq!(
+        response
+            .headers()
+            .get("X-Satl-Deferred-Layers")
+            .and_then(|value| value.to_str().ok()),
+        Some("2")
+    );
+
+    let (state, _) = MockBackend::new().into_state();
+    let response = send_json(&state, "DELETE", "/images/nginx:1.25", None).await;
+    assert!(
+        response.headers().get("X-Satl-Deferred-Layers").is_none(),
+        "nothing deferred means no header at all"
+    );
+}
+
+#[tokio::test]
+async fn remove_image_maps_backend_errors_to_dockers_statuses() {
+    for (error, status) in [
+        (
+            BackendError::not_found("No such image: nginx:1.25"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            BackendError::conflict(
+                "unable to delete nginx:1.25 (cannot be forced) - image is being used by running container 1kql",
+            ),
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let (state, _) = MockBackend::failing(error).into_state();
+        let response = send_json(&state, "DELETE", "/images/nginx:1.25", None).await;
+        assert_eq!(response.status(), status);
+    }
+}
+
+#[tokio::test]
+async fn inspect_image_serves_the_docker_document() {
+    let (state, recorder) = MockBackend::new()
+        .answer(|answers| {
+            answers.image_inspect = satl_api::model::ImageInspect {
+                id: "sha256:abc".to_owned(),
+                repo_tags: vec!["docker.io/library/nginx:1.25".to_owned()],
+                rootfs_layers: vec!["sha256:layer".to_owned()],
+                ..satl_api::model::ImageInspect::default()
+            };
+        })
+        .into_state();
+    let response = send_json(&state, "GET", "/images/nginx:1.25/json", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        recorder.only_call(),
+        Call::InspectImage("nginx:1.25".to_owned())
+    );
+    let body = body_json(response).await;
+    assert_eq!(body["Id"], "sha256:abc");
+    assert_eq!(body["RootFS"]["Type"], "layers");
+    assert_eq!(body["RootFS"]["Layers"][0], "sha256:layer");
+    assert_eq!(body["GraphDriver"]["Name"], "zfs");
+    // Labels is null, not an empty map: the config parser does not read them,
+    // and `{}` would claim the image declares none (api-compat 160).
+    assert!(body["Config"]["Labels"].is_null(), "{body}");
+}
+
 #[tokio::test]
 async fn tag_image_requires_a_repo_and_the_other_image_name_verbs_stay_404() {
     // No repo: 400, and the backend is never called.
@@ -1243,13 +1370,17 @@ async fn tag_image_requires_a_repo_and_the_other_image_name_verbs_stay_404() {
         "a rejected request must not reach the backend"
     );
 
-    // The rest of the /images/{name}/* family keeps the fallback's 404 shape
-    // (docs/api-compat.md #22).
+    // The still-unimplemented rest of the /images/{name}/* family keeps the
+    // fallback's 404 shape (docs/api-compat.md #22). `GET .../json` and a bare
+    // `DELETE` left this list when they were implemented; a DELETE whose tail
+    // ends in a sub-verb word did not (api-compat 157).
     let (state, _) = MockBackend::new().into_state();
     for (method, path) in [
         ("POST", "/images/nginx/push"),
-        ("GET", "/images/nginx/json"),
-        ("DELETE", "/images/nginx:1.25"),
+        ("GET", "/images/nginx/history"),
+        ("DELETE", "/images/nginx/push"),
+        ("DELETE", "/images/team/get"),
+        ("PUT", "/images/nginx:1.25"),
     ] {
         let response = send_json(&state, method, path, None).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");

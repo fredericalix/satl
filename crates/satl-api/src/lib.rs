@@ -23,6 +23,7 @@ mod error;
 mod framing;
 mod locked;
 mod middleware;
+mod openapi;
 mod render;
 mod routes;
 mod server;

@@ -10,7 +10,12 @@ mod configs;
 mod containers;
 mod events;
 mod exec;
-mod images;
+// `pub(crate)` for this module alone: the three operations behind the
+// `/images/{name}/*` tail wildcard cannot be registered through `routes!`
+// (OpenAPI has no tail wildcard), so they are declared on `ApiDoc` in
+// `crate::openapi` instead, and that sibling module has to be able to name
+// them.
+pub(crate) mod images;
 mod networks;
 mod nodes;
 mod prune;
@@ -25,10 +30,12 @@ use std::collections::HashMap;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, get, post};
+use axum::routing::any;
 use axum::{Json, Router, middleware as axum_middleware};
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
 use crate::API_VERSION;
 use crate::backend::model::{BackendError, Counts, RegistryAuth};
@@ -72,95 +79,19 @@ const PAYLOAD_JSON_BODY: usize = 2 * 1024 * 1024;
 /// middleware). All responses carry a `Server: SatL/<version>` header, and
 /// unmatched paths return Docker's `{"message": "page not found"}` shape.
 pub fn router(state: ApiState) -> Router {
-    let api = Router::new()
-        .route("/_ping", get(ping).head(ping_head))
-        .route("/version", get(version))
-        .route("/info", get(info))
-        .route("/events", get(events::stream))
-        // Containers.
-        .route("/containers/create", post(containers::create))
-        .route("/containers/json", get(containers::list))
-        // Before `/containers/{id}`: axum matches literals first, but keeping
-        // the prune routes adjacent to their siblings is what stops a future
-        // `/containers/{id}` verb from shadowing one.
-        .route("/containers/prune", post(prune::containers))
-        .route("/containers/{id}", delete(containers::remove))
-        .route("/containers/{id}/json", get(containers::inspect))
-        .route("/containers/{id}/start", post(containers::start))
-        .route("/containers/{id}/stop", post(containers::stop))
-        .route("/containers/{id}/kill", post(containers::kill))
-        .route("/containers/{id}/wait", post(containers::wait))
-        .route("/containers/{id}/logs", get(containers::logs))
-        .route("/containers/{id}/exec", post(exec::create))
-        // Exec.
-        .route("/exec/{id}/start", post(exec::start))
-        .route("/exec/{id}/json", get(exec::inspect))
-        // Images.
-        .route("/images/create", post(images::create))
-        .route("/images/json", get(images::list))
-        .route("/images/prune", post(prune::images))
-        // `/images/{name}/tag` — a tail wildcard because an image name may
-        // carry slashes; the handler serves only the tag verb and answers
-        // the fallback's 404 to everything else. Literals above win over
-        // the wildcard, so `/images/create` & co. are untouched.
+    let api = api_router()
+        .split_for_parts()
+        .0
+        // The ONE route in this file not registered through `routes!`, and
+        // the only `.route(` call a reviewer should find here: OpenAPI cannot
+        // express a tail wildcard. The `/images/{name}/*` family needs one
+        // because an image name may carry slashes; the handler dispatches on
+        // the method and serves tag, inspect and remove, answering the
+        // fallback's 404 to everything else. Its three operations are
+        // documented on `ApiDoc` (`crate::openapi`) instead. Literals
+        // registered above win over the wildcard, so `/images/create` & co.
+        // are untouched.
         .route("/images/{*rest}", any(images::by_name))
-        // Volumes.
-        .route("/volumes", get(volumes::list))
-        .route("/volumes/create", post(volumes::create))
-        .route("/volumes/prune", post(prune::volumes))
-        .route(
-            "/volumes/{name}",
-            get(volumes::inspect).delete(volumes::remove),
-        )
-        // Networks.
-        .route("/networks", get(networks::list))
-        .route("/networks/create", post(networks::create))
-        .route("/networks/prune", post(prune::networks))
-        .route(
-            "/networks/{id}",
-            get(networks::inspect).delete(networks::remove),
-        )
-        .route("/networks/{id}/connect", post(networks::connect))
-        .route("/networks/{id}/disconnect", post(networks::disconnect))
-        // Swarm.
-        .route("/swarm", get(swarm::inspect))
-        .route("/swarm/init", post(swarm::init))
-        .route("/swarm/join", post(swarm::join))
-        .route("/swarm/leave", post(swarm::leave))
-        .route("/swarm/update", post(swarm::update))
-        .route("/swarm/unlock", post(swarm::unlock))
-        .route("/swarm/unlockkey", get(swarm::unlock_key))
-        // Nodes.
-        .route("/nodes", get(nodes::list))
-        .route("/nodes/{id}", get(nodes::inspect).delete(nodes::remove))
-        .route("/nodes/{id}/update", post(nodes::update))
-        // Services.
-        .route("/services", get(services::list))
-        .route("/services/create", post(services::create))
-        .route(
-            "/services/{id}",
-            get(services::inspect).delete(services::remove),
-        )
-        .route("/services/{id}/update", post(services::update))
-        // Tasks.
-        .route("/tasks", get(tasks::list))
-        .route("/tasks/{id}", get(tasks::inspect))
-        // Secrets.
-        .route("/secrets", get(secrets::list))
-        .route("/secrets/create", post(secrets::create))
-        .route(
-            "/secrets/{id}",
-            get(secrets::inspect).delete(secrets::remove),
-        )
-        .route("/secrets/{id}/update", post(secrets::update))
-        // Configs.
-        .route("/configs", get(configs::list))
-        .route("/configs/create", post(configs::create))
-        .route(
-            "/configs/{id}",
-            get(configs::inspect).delete(configs::remove),
-        )
-        .route("/configs/{id}/update", post(configs::update))
         .fallback(not_found)
         .with_state(state.clone());
 
@@ -181,15 +112,126 @@ pub fn router(state: ApiState) -> Router {
         .layer(axum_middleware::from_fn(middleware::trace_http))
 }
 
+/// The route set, declared once for both the axum router and the `OpenAPI`
+/// document.
+///
+/// Every operation is registered through [`routes!`], which reads its method
+/// and path off the handler's own `#[utoipa::path]` attribute — so a route
+/// and its documentation cannot drift apart. All handlers in one `routes!`
+/// invocation must declare the *same* path: that is the direct translation of
+/// `.route(p, get(x).delete(y))`.
+fn api_router() -> OpenApiRouter<ApiState> {
+    OpenApiRouter::new()
+        .routes(routes!(ping, ping_head))
+        .routes(routes!(version))
+        .routes(routes!(info))
+        .routes(routes!(events::stream))
+        // Containers.
+        .routes(routes!(containers::create))
+        .routes(routes!(containers::list))
+        // Before `/containers/{id}`: axum matches literals first, but keeping
+        // the prune routes adjacent to their siblings is what stops a future
+        // `/containers/{id}` verb from shadowing one.
+        .routes(routes!(prune::containers))
+        .routes(routes!(containers::remove))
+        .routes(routes!(containers::inspect))
+        .routes(routes!(containers::start))
+        .routes(routes!(containers::stop))
+        .routes(routes!(containers::kill))
+        .routes(routes!(containers::wait))
+        .routes(routes!(containers::logs))
+        .routes(routes!(exec::create))
+        // Exec.
+        .routes(routes!(exec::start))
+        .routes(routes!(exec::inspect))
+        // Images.
+        .routes(routes!(images::create))
+        .routes(routes!(images::list))
+        .routes(routes!(prune::images))
+        // The `/images/{name}/*` family is the tail wildcard added in
+        // `router`; its three operations live on `ApiDoc` instead.
+        // Volumes.
+        .routes(routes!(volumes::list))
+        .routes(routes!(volumes::create))
+        .routes(routes!(prune::volumes))
+        .routes(routes!(volumes::inspect, volumes::remove))
+        // Networks.
+        .routes(routes!(networks::list))
+        .routes(routes!(networks::create))
+        .routes(routes!(prune::networks))
+        .routes(routes!(networks::inspect, networks::remove))
+        .routes(routes!(networks::connect))
+        .routes(routes!(networks::disconnect))
+        // Swarm.
+        .routes(routes!(swarm::inspect))
+        .routes(routes!(swarm::init))
+        .routes(routes!(swarm::join))
+        .routes(routes!(swarm::leave))
+        .routes(routes!(swarm::update))
+        .routes(routes!(swarm::unlock))
+        .routes(routes!(swarm::unlock_key))
+        // Nodes.
+        .routes(routes!(nodes::list))
+        .routes(routes!(nodes::inspect, nodes::remove))
+        .routes(routes!(nodes::update))
+        // Services.
+        .routes(routes!(services::list))
+        .routes(routes!(services::create))
+        .routes(routes!(services::inspect, services::remove))
+        .routes(routes!(services::update))
+        // Tasks.
+        .routes(routes!(tasks::list))
+        .routes(routes!(tasks::inspect))
+        // Secrets.
+        .routes(routes!(secrets::list))
+        .routes(routes!(secrets::create))
+        .routes(routes!(secrets::inspect, secrets::remove))
+        .routes(routes!(secrets::update))
+        // Configs.
+        .routes(routes!(configs::list))
+        .routes(routes!(configs::create))
+        .routes(routes!(configs::inspect, configs::remove))
+        .routes(routes!(configs::update))
+}
+
+/// The paths and schemas collected off the route set, for
+/// [`crate::openapi::spec`] to dress with info, tags and servers.
+// Only the document generator (a test) calls this; see the note at the top of
+// `crate::openapi`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn openapi() -> utoipa::openapi::OpenApi {
+    api_router().split_for_parts().1
+}
+
 /// `GET /_ping`: liveness probe plus version-negotiation headers.
 // Handlers must be `async` for axum even when they never await.
 #[allow(clippy::unused_async)]
+#[utoipa::path(
+    get,
+    path = "/_ping",
+    operation_id = "SystemPing",
+    tag = "System",
+    description = "Liveness probe. The body is the literal string `OK`; the \
+        version-negotiation headers are what clients read: `Api-Version`, \
+        `Ostype`, `Docker-Experimental` (always `false`) and no \
+        `Builder-Version` -- SatL has no BuildKit (api-compat, daemon-wide). \
+        One of the two routes a locked manager still serves.",
+    responses((status = 200, description = "The daemon is alive.", body = String, content_type = "text/plain"))
+)]
 async fn ping() -> impl IntoResponse {
     (PING_HEADERS, "OK")
 }
 
 /// `HEAD /_ping`: same headers as `GET`, empty body.
 #[allow(clippy::unused_async)]
+#[utoipa::path(
+    head,
+    path = "/_ping",
+    operation_id = "SystemPingHead",
+    tag = "System",
+    description = "The same headers as `GET /_ping`, with an empty body.",
+    responses((status = 200, description = "The daemon is alive."))
+)]
 async fn ping_head() -> impl IntoResponse {
     (PING_HEADERS, "")
 }
@@ -197,6 +239,15 @@ async fn ping_head() -> impl IntoResponse {
 /// `GET /version`: Docker `SystemVersion` document built from [`ApiState`].
 // Extractors are taken by value; `ApiState` is an Arc handle, cloning is the point.
 #[allow(clippy::unused_async, clippy::needless_pass_by_value)]
+#[utoipa::path(
+    get,
+    path = "/version",
+    operation_id = "SystemVersion",
+    tag = "System",
+    description = "Build and version identity of this daemon. No `GoVersion` \
+        and no `Experimental` field: SatL is not Go (api-compat, daemon-wide).",
+    responses((status = 200, description = "Daemon version document.", body = crate::types::VersionResponse))
+)]
 async fn version(State(state): State<ApiState>) -> Json<VersionResponse> {
     let v = state.version();
     Json(VersionResponse {
@@ -236,6 +287,23 @@ async fn version(State(state): State<ApiState>) -> Json<VersionResponse> {
 /// injected into [`ApiState`], so `/info` never fails for want of cluster
 /// state.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    get,
+    path = "/info",
+    operation_id = "SystemInfo",
+    tag = "System",
+    description = "A minimal coherent Docker `SystemInfo`: `Driver` is always \
+        `zfs` (invariant #5), and `LoggingDriver`, `RegistryConfig`, \
+        `Plugins`, cgroup and runtime fields are absent. `Swarm` omits \
+        Docker's `Cluster` sub-document (api-compat #46), and \
+        `LocalNodeState` is `active` from first boot because a SatL node \
+        bootstraps a single-node cluster (api-compat, daemon-wide).",
+    responses(
+        (status = 200, description = "Daemon and node information.", body = crate::types::InfoResponse),
+        (status = 500, description = "The daemon failed to gather its counts.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node cannot answer for the cluster right now.", body = crate::types::ErrorBody)
+    )
+)]
 async fn info(State(state): State<ApiState>) -> Result<Json<InfoResponse>, BackendError> {
     let sys = state.system();
     let counts: Counts = state.backend().system_counts().await?;

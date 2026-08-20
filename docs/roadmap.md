@@ -5,8 +5,8 @@
 > definition of done). Milestone definitions come from `docs/project-brief.md`; this
 > file tracks progress against them.
 
-**Last updated:** 2026-08-17
-**Current focus:** M6 — data-plane encryption done (2026-08-16, branch `m6-encryption`: `--opt encrypted`, ESP/aes-gcm-16 over VXLAN, verified live on the cluster). M6a–M6g done per `plan-m6.md`; M7 (jobs, placement preferences, autolock) and M8 (`satl build`) done. The 2026-08-16 external audit's fixes landed 2026-08-17 (decision log). Of the M6 backlog, plugin volumes remain unscheduled. Release hygiene landed 2026-08-17: `CHANGELOG.md`, `SECURITY.md` (security@satl.cc) and an explicit no-CI paragraph in the README, tagged `v0.1.0-beta` locally (decision log).
+**Last updated:** 2026-08-19
+**Current focus:** M9 — the 2026-08-19 verb audit found five daemon capabilities with no CLI client at all (`/events`, `/info`, `/volumes/{name}`, the `node` task filter, the four prune endpoints) and one operation missing at both layers: there was no way to delete a single image. M9a closed the CLI half and added `DELETE /images/{name}` and `GET /images/{name}/json`; M9b, the generated OpenAPI contract, is in progress. The cluster testbed was replaced the same day (decision log): `fbsd{1,2,3}.satl.cc`, underlay now 10.0.0.0/24, full suite 22/22 plus 7/7 encrypted. M6a–M6g, M7 and M8 remain done; of the M6 backlog only plugin volumes are unscheduled.
 
 | Milestone | Scope | Status |
 |---|---|---|
@@ -17,6 +17,7 @@
 | M3 | Overlay networking | ✅ done (DoD verified 2026-08-12) |
 | M4 | Desired state, rolling updates, global services | ✅ done (DoD verified 2026-08-12) |
 | M5 | Secrets, configs, compose, hardening | ✅ done (DoD verified 2026-08-13) |
+| M9 | CLI parity and a generated API contract | `[~]` partially done (M9a verbs ✅; M9b OpenAPI contract in progress) |
 | M6 | Backlog (routing mesh, dataplane encryption, build, metrics) | `[~]` partially done (`plan-m6.md`: M6a–M6g ✅; dataplane encryption ✅ 2026-08-16 on `m6-encryption`; jobs/placement prefs/autolock landed in M7; only plugin volumes remain, unscheduled) |
 
 Legend: ⏳ not started · 🔨 in progress · 🔍 in review · ✅ done · 🧊 frozen · `[~]` partially done
@@ -576,6 +577,43 @@ explicitly out.
   against 51 s cold, selective invalidation, multi-layer manifests, push to
   a registry and pull back by digest.
 
+## M9 — CLI parity and a generated API contract (2026-08-19)
+
+Started because there was no way to delete an image. `satl system prune` was the
+only reclamation and it is all-or-nothing, node-global, and takes containers and
+networks with it; `DELETE /images/{name}` answered 404 by design, so a Docker
+client could not do it either.
+
+The audit that followed found the omission was not isolated: **five capabilities
+the daemon has served since M1-M2 had no CLI client at all** — `GET /events`
+first among them, which means an operator had no way to watch a cluster work.
+The lesson worth keeping is in the decision log: an endpoint with no verb has no
+user, and nothing exercises it end to end.
+
+### M9a — the missing verbs
+
+- [x] `satl images` becomes a noun (`ls`, `rm`, `prune`, `inspect`), bare
+      `satl images` unchanged; `satl rmi` as the top-level alias (api-compat 154)
+- [x] `DELETE /images/{name}?force=&noprune=`, running the same two-pass layer
+      sweep the prune runs, with the deferral on `X-Satl-Deferred-Layers`
+      (api-compat 155, 156, 157)
+- [x] Removal by image ID, recognised before the reference parser, and the
+      multi-repository refusal (api-compat 158, 159)
+- [x] `GET /images/{name}/json` + `satl images inspect`, aggregated by image ID
+      (api-compat 160)
+- [x] One place decides "is this image in use", shared by the removal and the
+      prune (api-compat 161) — and it fixed a real defect on the way, see below
+- [x] `satl events`, `satl info`, `satl volume inspect`, `satl node ps`
+      (api-compat 162, 164, 165)
+- [x] `satl images prune`, `satl container prune`, `satl network prune`,
+      `satl volume prune`, superseding the "one prune verb" statement
+      (api-compat 163)
+
+### M9b — a generated API contract
+
+- [ ] `docs/openapi.yaml` generated from the handlers, drift gated by
+      `make check`; `docs/api.html` rendering it offline (api-compat 166)
+
 ## M7 — Swarm parity and the app story (per `plan-m7.md`, 2026-08-15)
 
 Scoped with Frédéric: placement preferences, jobs mode, autolock/KEK, real
@@ -748,6 +786,10 @@ written claims overturned by measurement, two of them mine.
 
 | Date | Decision |
 |---|---|
+| 2026-08-19 | **An endpoint with no CLI verb has no user, and nothing exercises it end to end.** The M9 audit went looking for why an image could not be deleted and found five capabilities the daemon has served since M1-M2 that **no client reaches**: `GET /events`, `GET /info`, `GET /volumes/{name}`, the `node` filter on `/tasks`, and all four prune endpoints. `/info` was invisible because the CLI called it internally in five places without ever exposing it; `/events` was invisible because nothing called it at all. The rule to keep: a route that no verb drives is a route no test drives either, and the gap will be found by an operator rather than by the suite |
+| 2026-08-19 | **`list_images`' `Containers` count was structurally zero for exactly the images most likely to be in use** — found while building the removal's conflict check, not by a test. It keyed the in-use map on the raw `task.spec.container.image` and looked it up by the record's canonical reference, so a service whose spec says `alpine` never counted against `docker.io/library/alpine:latest`. `untag_unused_images` had always got this right, inserting both spellings, which is precisely the kind of divergence that two copies of one rule produce. The fix was to make it one copy: `image_claims` reads the claim set, `image_conflict` answers the question, and `list_images`, `POST /images/prune` and `DELETE /images/{name}` all call them — the same "one rule, two callers, one of them drifts" family as `remove_network_impl`/`prune_networks_impl`, and now the third instance resolved the same way |
+| 2026-08-19 | **`satl images rm` costs about 1.5 s by construction, and that is the price of #131 rather than a slip.** A targeted removal has no more right to a single reading of the claim set than a prune does: a layer's loss is recoverable only from a registry that may not answer. So the removal runs the *same* `collect_layers`/`collect_content` the prune runs, two readings `SETTLE` apart, and `--no-prune` is the documented way to pay that cost once for a batch instead of once per image. **Measured 2 s wall on fbsd1** for an image reachable from two references (`satl images rm -f` by ID prefix, 5 items reported, 1374 bytes reclaimed, 0 deferred): the 1.5 s settle plus process start and the sweeps. Two things the API forced: Docker's rmi body is a bare array with no field for what the second pass deferred, so it rides on `X-Satl-Deferred-Layers` (a third field would corrupt a real Docker client's output — moby prints a bare `Untagged: ` for an item with neither field set); and the image-ID form has to be recognised *before* `ImageReference::parse`, because `sha256:abcdef` parses happily as `docker.io/library/sha256:abcdef` and would resolve to nothing |
+| 2026-08-19 | **The cluster testbed was replaced, and the underlay changed shape: 10.2.0.0/16 became 10.0.0.0/24.** The `fbsd-dev---N.fredalix.ovh` VMs no longer resolve at all; the replacements are `fbsd{1,2,3}.satl.cc` (same spec: FreeBSD 15.1-p2, 4 vCPU / 8 GiB, zroot 48.5 GiB) and they arrived bare — no satl, no ocijail, no registry, `kern.racct.enable=0`. `inventory.toml` was the only file that had to change for addresses, which is what it exists for; `provision.sh` → `deploy.sh` → `images.sh` → `run.sh` then worked unmodified, the cluster forming in 13 s and **all 22 scenarios passing on the new fabric** (~26 min wall clock), plus all 7 of `encrypted.sh` — the rotation scenario walked `generate -> append -> promote` and the outbound SPI moved from 0x1b026082 to 0x13faadaf, leaving 3 SAs as designed. **The narrower mask is not cosmetic**: satld derives the VXLAN blackhole remote from the underlay prefix as its last usable host (`underlay::blackhole_in`), so the value moved from 10.2.255.254 to **10.0.0.254** — measured free on this fabric (silent to ping, ARP incomplete), and the only other live host on the /24 is 10.0.0.11, the OpenStack metadata helper. Nothing in the code needed changing for it: `parse_netmask` is generic and `blackhole_in` refuses only prefixes narrower than /29. Underlay latency re-measured at 0.76 ms and 0.86 ms average over 30 packets, no loss, so the README's "sub-millisecond" claim still holds; the underlay MTU is still exactly 1500 (a DF ping of 1472+28 crosses, 1473 does not), so the measured overlay figures are unchanged and `encrypted.sh` confirmed them at the bit — 1450 plain, 1416 encrypted. One transient: `images.sh`'s `ssh -R` tunnel dropped mid-seed on one node (`connect_to 127.0.0.1 port 5000: failed`) and a re-run of that node alone fixed it, the idempotence the script advertises. `docs/vxlan.md`'s FDB capture still shows 10.2.x addresses and was deliberately left alone — it is recorded measurement, not a claim about the current fabric |
 | 2026-08-19 | **`make package` now also writes `dist/CHECKSUM.SHA512`**, so a `.pkg` handed to an operator out of band (no repository, no signature) can be verified before `pkg add`. Format is sha512sum(1)'s, not a ports `distinfo`, because the consumer-side command is what matters: `sha512sum -c CHECKSUM.SHA512` from inside `dist/`. It lists only the package that run built and is rewritten each time, so a `dist/` holding several versions describes just the last one. Not yet run on the FreeBSD host — `make package` needs `pkg create` and a release build |
 | 2026-08-17 | **`v0.1.0-beta` tagged, with a CHANGELOG, a SECURITY.md and the absence of CI stated in the README.** The repo had one commit, no tags and nothing release-facing: the whole M0-M8 history lived in this gitignored file, a project advertising mTLS/CA/secrets/autolock offered no reporting address, and a contributor opening a PR saw an empty checks tab with no way to tell a broken pipeline from a deliberate choice. `CHANGELOG.md` is one release entry grouped by area (containers, cluster, networking, images, security, compatibility) plus an honest known-limitations list, drawn from this file's measured milestones; `SECURITY.md` points at security@satl.cc and, more usefully, lists the *deliberate* choices a reporter would otherwise burn a week on (2378 unauthenticated by design, no user-level authz in v1, root daemon, unauthenticated `/metrics`, handshake-time identity). **`Cargo.toml` stays at `0.1.0`** — the beta qualifier lives on the git tag only, because a hyphen in a pkg(8) version is the name/version separator and `satl-0.1.0-beta.pkg` would parse as name `satl-0.1.0`, version `beta`, breaking `make package`. Tag is annotated and local; pushing is Frédéric's call. Three things this surfaced and did *not* fix: the README's `docs/*.md` and `CLAUDE.md` links all 404 on GitHub (both trees are gitignored), `architecture.md` §12.4/§14 still call autolock/KEK deferred though M7f shipped it, and `/tests/` being gitignored means a contributor cannot run the `make cluster-test` the README points them at |
 | 2026-08-17 | **The 2026-08-16 external audit (N1-N8) is landed in full.** N1 made the restart supervisor's `Delay` admission default 5 s (a zero delay restarted crash-looping tasks in a hot loop); N4 added a startup purge of orphaned rctl rule sets and corrected what `rctl -r`'s ESRCH means — "the filter matched no rule", not "the jail is gone" (measured on node1; `is_missing_jail` renamed to `is_no_rule_matched`); N2 added `satl tag`; N3 turned the raw registry 404 into a manifest-unknown message and made `satl build` warn when its base image is missing; N6/N7 were help and CLAUDE.md text fixes; N8 added five cluster scenarios, including the B1 non-regression; and N5's residual was the satl-doc M7b/M8 catch-up. Findings that were misunderstandings of the code were rejected in review rather than patched |

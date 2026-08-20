@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: BSD-2-Clause
-//! `satl node ls|inspect|update|rm|promote|demote`.
+//! `satl node ls|ps|inspect|update|rm|promote|demote`.
 //!
 //! `update` (and its `promote`/`demote` wrappers) follows docker's
 //! read-modify-write: inspect the node, edit the spec, then `POST
 //! /nodes/{id}/update?version=<index>` so the daemon can reject a concurrent
 //! change with `409`.
 
-use crate::api::cluster::{Node, NodeSpec, SystemInfo};
+use std::collections::BTreeMap;
+
+use crate::api::cluster::{Node, NodeSpec, SystemInfo, Task};
 use crate::client::{self, Host};
-use crate::cmd::FAILURE;
+use crate::cmd::{FAILURE, service};
 use crate::format::{self, Table};
 use crate::output::Streams;
 use crate::parse;
@@ -18,6 +20,8 @@ use crate::parse;
 pub enum NodeCommand {
     /// List nodes in the swarm.
     Ls(LsArgs),
+    /// List the tasks running on one or more nodes.
+    Ps(PsArgs),
     /// Display detailed information on one or more nodes.
     Inspect(InspectArgs),
     /// Update a node.
@@ -36,6 +40,32 @@ pub struct LsArgs {
     /// Only display IDs.
     #[arg(short, long)]
     pub quiet: bool,
+}
+
+/// Flags of `satl node ps`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct PsArgs {
+    /// Don't truncate output.
+    #[arg(long = "no-trunc")]
+    pub no_trunc: bool,
+
+    /// Only display task IDs.
+    #[arg(short, long)]
+    pub quiet: bool,
+
+    /// Nodes whose tasks to list; defaults to this one, as docker does.
+    #[arg(value_name = "NODE", default_value = "self")]
+    pub nodes: Vec<String>,
+}
+
+impl Default for PsArgs {
+    fn default() -> Self {
+        Self {
+            no_trunc: false,
+            quiet: false,
+            nodes: vec!["self".to_owned()],
+        }
+    }
 }
 
 /// Flags of `satl node inspect`.
@@ -112,6 +142,7 @@ pub async fn execute(
             streams.out(render(&nodes, &local, args).as_bytes()).await;
             Ok(0)
         }
+        NodeCommand::Ps(args) => ps(host, args, streams).await,
         NodeCommand::Inspect(args) => inspect(host, args, streams).await,
         NodeCommand::Update(args) => {
             update(host, &args.node, |spec| apply(spec, args)).await?;
@@ -122,6 +153,54 @@ pub async fn execute(
         NodeCommand::Promote(args) => set_role(host, args, "manager", streams).await,
         NodeCommand::Demote(args) => set_role(host, args, "worker", streams).await,
     }
+}
+
+/// `satl node ps [NODE...]` — the tasks bound to each node, in `satl service
+/// ps`'s table.
+///
+/// **Manager-only.** `/tasks` is served from the Raft store, and the daemon's
+/// `list_tasks` requires a manager, so this answers `503` on a worker. That
+/// is unlike `satl images rm`, which is node-local by nature: a task is a
+/// cluster object and only a manager can enumerate them.
+async fn ps(host: &Host, args: &PsArgs, streams: &mut Streams) -> anyhow::Result<u8> {
+    let mut tasks: Vec<Task> = Vec::new();
+    let mut failed = false;
+    for reference in &args.nodes {
+        // `self` is a node ID the daemon knows and we do not; the same
+        // resolution every other node verb does.
+        let resolved = resolve_self(host, reference).await;
+        match client::get_json::<Vec<Task>>(host, &tasks_path(&resolved)).await {
+            Ok(found) => tasks.extend(found),
+            Err(err) => {
+                streams.error(&format!("{err:#}")).await;
+                failed = true;
+            }
+        }
+    }
+    // Docker shows hostnames in the NODE column; the node list is the only
+    // place that maps a node ID to one.
+    let nodes: Vec<Node> = client::get_json(host, "/nodes").await.unwrap_or_default();
+    let hostnames: BTreeMap<String, String> = nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.display_name().to_owned()))
+        .collect();
+    let render_args = service::PsArgs {
+        no_trunc: args.no_trunc,
+        quiet: args.quiet,
+        services: Vec::new(),
+    };
+    streams
+        .out(service::render_ps(&tasks, &hostnames, &render_args, format::now_unix()).as_bytes())
+        .await;
+    Ok(if failed { FAILURE } else { 0 })
+}
+
+/// Build the `GET /tasks` URL for one node (pure). `node` is a real filter
+/// the daemon understands, matched against the node ID *or* its hostname.
+#[must_use]
+pub fn tasks_path(node: &str) -> String {
+    let filters = serde_json::json!({ "node": { node: true } }).to_string();
+    format!("/tasks{}", client::query(&[("filters", filters.as_str())]))
 }
 
 async fn inspect(host: &Host, args: &InspectArgs, streams: &mut Streams) -> anyhow::Result<u8> {
@@ -711,5 +790,152 @@ Engine Version:\t\t0.1.0
             .expect("rm succeeds");
         assert_eq!(out.contents(), "self\n");
         assert!(stub.routes().contains(&format!("DELETE /nodes/{ALPHA}")));
+    }
+
+    #[test]
+    fn tasks_path_is_dockers_node_filter() {
+        assert_eq!(
+            tasks_path("alpha"),
+            "/tasks?filters=%7B%22node%22%3A%7B%22alpha%22%3Atrue%7D%7D"
+        );
+        // Percent-decoded, that is `{"node":{"alpha":true}}`.
+        assert_eq!(
+            tasks_path(ALPHA),
+            format!("/tasks?filters=%7B%22node%22%3A%7B%22{ALPHA}%22%3Atrue%7D%7D")
+        );
+    }
+
+    fn tasks_json() -> String {
+        format!(
+            r#"[{{"ID":"2ju54ic19pyb0mmqmb4z2ncdo","Name":"web.1.2ju54ic19pyb",
+                 "ServiceID":"9hvy0lj3x0b883f8e30fyp211","Slot":1,"NodeID":"{ALPHA}",
+                 "Spec":{{"ContainerSpec":{{"Image":"nginx:1.27"}}}},
+                 "DesiredState":"running",
+                 "Status":{{"State":"running","Timestamp":"2026-08-19T14:00:00Z"}}}}]"#
+        )
+    }
+
+    #[tokio::test]
+    async fn ps_defaults_to_self_and_renders_the_task_table() {
+        let stub = Stub::start().await;
+        stub.on(
+            "GET",
+            "/info",
+            Reply::json(200, &format!(r#"{{"Swarm":{{"NodeID":"{ALPHA}"}}}}"#)),
+        )
+        .on("GET", "/tasks", Reply::json(200, &tasks_json()))
+        .on("GET", "/nodes", Reply::json(200, &nodes_json()));
+
+        let (mut streams, out, _err) = testing::streams();
+        let code = execute(
+            &stub.host(),
+            &NodeCommand::Ps(PsArgs::default()),
+            &mut streams,
+        )
+        .await
+        .expect("ps succeeds");
+        assert_eq!(code, 0);
+        // `self` was resolved through /info before the tasks were asked for.
+        assert_eq!(stub.routes(), vec!["GET /info", "GET /tasks", "GET /nodes"]);
+        assert_eq!(
+            stub.first_call("GET /tasks").unwrap().query,
+            format!("filters=%7B%22node%22%3A%7B%22{ALPHA}%22%3Atrue%7D%7D")
+        );
+        let printed = out.contents();
+        assert!(printed.starts_with("ID  "), "{printed}");
+        // The NODE column shows the hostname, not the node ID.
+        assert!(printed.contains("alpha"), "{printed}");
+        assert!(printed.contains("web.1"), "{printed}");
+        assert!(printed.contains("nginx:1.27"), "{printed}");
+        assert!(
+            !printed.contains(ALPHA),
+            "the node ID is not a column: {printed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ps_queries_every_named_node_and_never_resolves_self() {
+        let stub = Stub::start().await;
+        stub.on("GET", "/tasks", Reply::json(200, "[]")).on(
+            "GET",
+            "/nodes",
+            Reply::json(200, "[]"),
+        );
+
+        let (mut streams, _out, _err) = testing::streams();
+        let args = PsArgs {
+            nodes: vec!["alpha".to_owned(), "beta".to_owned()],
+            ..PsArgs::default()
+        };
+        execute(&stub.host(), &NodeCommand::Ps(args), &mut streams)
+            .await
+            .expect("ps succeeds");
+        let task_calls: Vec<_> = stub
+            .calls()
+            .into_iter()
+            .filter(|call| call.route() == "GET /tasks")
+            .collect();
+        assert_eq!(task_calls.len(), 2, "one query per node");
+        assert!(
+            task_calls[0].query.contains("alpha"),
+            "{:?}",
+            task_calls[0].query
+        );
+        assert!(
+            task_calls[1].query.contains("beta"),
+            "{:?}",
+            task_calls[1].query
+        );
+        assert!(
+            !stub.routes().contains(&"GET /info".to_owned()),
+            "a named node needs no resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn ps_quiet_prints_only_task_ids() {
+        let stub = Stub::start().await;
+        stub.on("GET", "/tasks", Reply::json(200, &tasks_json()))
+            .on("GET", "/nodes", Reply::json(200, "[]"));
+
+        let (mut streams, out, _err) = testing::streams();
+        let args = PsArgs {
+            quiet: true,
+            no_trunc: true,
+            nodes: vec!["alpha".to_owned()],
+        };
+        execute(&stub.host(), &NodeCommand::Ps(args), &mut streams)
+            .await
+            .expect("ps succeeds");
+        assert_eq!(out.contents(), "2ju54ic19pyb0mmqmb4z2ncdo\n");
+    }
+
+    /// `/tasks` is manager-only; a worker answers 503 and the operator has to
+    /// see why rather than an empty table.
+    #[tokio::test]
+    async fn ps_on_a_worker_reports_the_managers_only_error_and_exits_1() {
+        let stub = Stub::start().await;
+        stub.on(
+            "GET",
+            "/tasks",
+            Reply::json(503, r#"{"message":"This node is not a swarm manager."}"#),
+        )
+        .on("GET", "/nodes", Reply::json(200, "[]"));
+
+        let (mut streams, out, err) = testing::streams();
+        let args = PsArgs {
+            nodes: vec!["beta".to_owned()],
+            ..PsArgs::default()
+        };
+        let code = execute(&stub.host(), &NodeCommand::Ps(args), &mut streams)
+            .await
+            .expect("ps returns an exit code");
+        assert_eq!(code, FAILURE);
+        assert_eq!(
+            err.contents(),
+            "Error response from daemon: This node is not a swarm manager.\n"
+        );
+        // The header is still printed, as `service ps` does with no tasks.
+        assert!(out.contents().starts_with("ID  "), "{}", out.contents());
     }
 }

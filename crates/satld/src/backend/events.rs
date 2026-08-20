@@ -77,8 +77,16 @@ pub fn image_tag(reference: &str) -> EventMessage {
     image_event("tag", reference)
 }
 
-/// An image event for `reference` (pull, tag) — node-local, so injected by
-/// the backend rather than mapped from a store event.
+/// The `image untag` event the backend injects when a record is forgotten,
+/// by `satl images rm` or by the `-a` half of a prune. Docker emits `untag`
+/// for exactly this, and it is what makes a removal visible in `satl events`.
+#[must_use]
+pub fn image_untag(reference: &str) -> EventMessage {
+    image_event("untag", reference)
+}
+
+/// An image event for `reference` (pull, tag, untag) — node-local, so injected
+/// by the backend rather than mapped from a store event.
 fn image_event(action: &str, reference: &str) -> EventMessage {
     EventMessage {
         kind: IMAGE.to_owned(),

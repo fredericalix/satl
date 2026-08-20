@@ -25,6 +25,13 @@ serde_json = "1.0.151"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["fs", "io-util", "net", "rt", "sync"] }
 tracing = "0.1.44"
+# Do NOT add "preserve_order" or "preserve_path_order": with them off, utoipa
+# backs its paths and schema maps with BTreeMap, so docs/openapi.yaml comes out
+# sorted and byte-identical on every run. Enabling either makes the generated
+# file churn with declaration order, and the drift test in src/openapi.rs would
+# fail on an unrelated edit.
+utoipa = { version = "5.5", features = ["yaml"] }
+utoipa-axum = "0.2"
 
 [lints]
 workspace = true

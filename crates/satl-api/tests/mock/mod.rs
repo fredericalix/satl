@@ -16,13 +16,14 @@ use futures_util::stream::{self, BoxStream, StreamExt as _};
 use satl_api::model::{
     BackendError, ChangeOutcome, ConfigCreated, ContainerInspect, ContainerSummary, Counts,
     CreateContainerOptions, CreateNetworkOptions, CreateVolumeOptions, CreatedContainer,
-    EventMessage, ExecConfig, ExecId, ExecInspect, ExecStream, ImageSummary, LogFrame, LogOptions,
-    NetworkConnectOptions, NetworkCreated, NetworkDetail, NetworkDisconnectOptions, NetworkSummary,
-    NodeDetail, NodeSpecUpdate, NodeSummary, PrunedContainers, PrunedImages, PrunedNetworks,
-    PrunedVolumes, PullProgressLine, RegistryAuth, Result, SecretCreated, ServiceCreateOptions,
-    ServiceCreated, ServiceDetail, ServiceSummary, ServiceUpdateOptions, SwarmDetail,
-    SwarmInitOptions, SwarmInitResult, SwarmJoinOptions, SwarmStatus, TaskDetail, TaskFilters,
-    TaskSummary, TokenRole, VolumeInfo, WaitCondition, WaitResult,
+    EventMessage, ExecConfig, ExecId, ExecInspect, ExecStream, ImageInspect, ImageSummary,
+    LogFrame, LogOptions, NetworkConnectOptions, NetworkCreated, NetworkDetail,
+    NetworkDisconnectOptions, NetworkSummary, NodeDetail, NodeSpecUpdate, NodeSummary,
+    PrunedContainers, PrunedImages, PrunedNetworks, PrunedVolumes, PullProgressLine, RegistryAuth,
+    Result, SecretCreated, ServiceCreateOptions, ServiceCreated, ServiceDetail, ServiceSummary,
+    ServiceUpdateOptions, SwarmDetail, SwarmInitOptions, SwarmInitResult, SwarmJoinOptions,
+    SwarmStatus, TaskDetail, TaskFilters, TaskSummary, TokenRole, VolumeInfo, WaitCondition,
+    WaitResult,
 };
 use satl_api::{ApiState, Backend, SwarmInfo, SystemInfo, VersionInfo};
 use satl_core::{Config, ConfigSpec, Platform, Secret, SecretSpec, Version};
@@ -44,6 +45,8 @@ pub enum Call {
     /// `POST /images/{name}/tag`, carrying the source name and the joined
     /// target reference.
     TagImage(String, String),
+    RemoveImage(String, bool, bool),
+    InspectImage(String),
     /// `POST /containers/prune`.
     PruneContainers,
     /// `POST /images/prune`, carrying whether `-a` reached the backend.
@@ -110,6 +113,8 @@ pub struct Answers {
     pub log_frames: Vec<LogFrame>,
     pub pull_lines: Vec<PullProgressLine>,
     pub images: Vec<ImageSummary>,
+    pub image_removed: PrunedImages,
+    pub image_inspect: ImageInspect,
     pub exec_id: String,
     pub exec_frames: Vec<LogFrame>,
     pub exec_exit_code: i64,
@@ -353,6 +358,23 @@ impl Backend for MockBackend {
     async fn tag_image(&self, source: &str, target: &str) -> Result<()> {
         self.record(Call::TagImage(source.to_owned(), target.to_owned()));
         self.injected().unwrap_or(Ok(()))
+    }
+
+    async fn remove_image(
+        &self,
+        reference: &str,
+        force: bool,
+        noprune: bool,
+    ) -> Result<PrunedImages> {
+        self.record(Call::RemoveImage(reference.to_owned(), force, noprune));
+        self.injected()
+            .unwrap_or_else(|| Ok(self.answers.image_removed.clone()))
+    }
+
+    async fn inspect_image(&self, reference: &str) -> Result<ImageInspect> {
+        self.record(Call::InspectImage(reference.to_owned()));
+        self.injected()
+            .unwrap_or_else(|| Ok(self.answers.image_inspect.clone()))
     }
 
     async fn prune_containers(&self) -> Result<PrunedContainers> {

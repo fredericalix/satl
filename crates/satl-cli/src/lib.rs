@@ -12,6 +12,7 @@ pub mod client;
 pub mod cmd;
 pub mod format;
 pub mod frames;
+pub mod ndjson;
 pub mod output;
 pub mod parse;
 pub mod version;

@@ -16,11 +16,11 @@ use crate::{API_VERSION, MIN_API_VERSION};
 
 /// Maximum accepted `/vX.Y/` prefix, as (major, minor). Kept in sync with
 /// [`API_VERSION`] (asserted by a unit test below).
-const MAX_VERSION: (u64, u64) = (1, 43);
+pub(crate) const MAX_VERSION: (u64, u64) = (1, 43);
 
 /// Minimum accepted `/vX.Y/` prefix, as (major, minor). Kept in sync with
 /// [`MIN_API_VERSION`].
-const MIN_VERSION: (u64, u64) = (1, 24);
+pub(crate) const MIN_VERSION: (u64, u64) = (1, 24);
 
 /// Outcome of inspecting a request path for a Docker API version prefix.
 enum VersionPrefix {

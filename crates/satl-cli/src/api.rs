@@ -351,6 +351,47 @@ pub struct VolumesPruneResponse {
     pub space_reclaimed: u64,
 }
 
+/// One line of the `GET /events` stream.
+///
+/// The daemon renders it in `satl-api`'s `render::event`, so the casing is
+/// Docker's own and deliberately inconsistent: `Type`, `Action` and `Actor`
+/// are capitalised, `scope`, `time` and `timeNano` are not.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct EventMessage {
+    /// Object kind (`container`, `image`).
+    #[serde(default, deserialize_with = "null_as_default", rename = "Type")]
+    pub kind: String,
+    /// What happened (`create`, `start`, `die`, `destroy`, `pull`, `tag`, ...).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub action: String,
+    /// Who it happened to.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub actor: EventActor,
+    /// `local` or `swarm`.
+    #[serde(default, deserialize_with = "null_as_default", rename = "scope")]
+    pub scope: String,
+    /// Event time, unix seconds.
+    #[serde(default, deserialize_with = "null_as_default", rename = "time")]
+    pub time: i64,
+    /// Event time, unix nanoseconds — the field the human line is built from.
+    #[serde(default, deserialize_with = "null_as_default", rename = "timeNano")]
+    pub time_nano: i64,
+}
+
+/// `Actor` of an [`EventMessage`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct EventActor {
+    /// Task ID for a container event, image reference for an image one.
+    #[serde(default, deserialize_with = "null_as_default", rename = "ID")]
+    pub id: String,
+    /// Free-form attributes: always `name`, plus `image` and the container
+    /// labels on a container event, plus `exitCode` on a `die`.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub attributes: BTreeMap<String, String>,
+}
+
 /// Response of `GET /volumes`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]

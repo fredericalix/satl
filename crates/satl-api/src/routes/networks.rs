@@ -28,6 +28,23 @@ use crate::types::{
 
 /// `GET /networks`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    get,
+    path = "/networks",
+    operation_id = "NetworkList",
+    tag = "Network",
+    description = "`Scope` follows the driver, always: `overlay` is `swarm`, \
+        `bridge` is `local` (api-compat #60). An overlay row carries an extra \
+        `Vni`, the VXLAN network identifier the allocator assigned \
+        (api-compat #62).",
+    params(("filters" = Option<String>, Query, description = "A non-empty value is rejected with 501 rather than silently listing everything (api-compat #47).")),
+    responses(
+        (status = 200, description = "One row per network.", body = Vec<crate::types::NetworkResponse>),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "`?filters=` was non-empty, or the daemon has no store wired.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn list(
     State(state): State<ApiState>,
     Query(params): Query<Params>,
@@ -40,6 +57,24 @@ pub(super) async fn list(
 
 /// `GET /networks/{id}`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    get,
+    path = "/networks/{id}",
+    operation_id = "NetworkInspect",
+    tag = "Network",
+    description = "`IPAM.Config[0].Gateway` is **this node's** gateway on the \
+        network, never a cluster-wide one: an overlay has one gateway per \
+        participating node, so a shared address on one L2 segment would be a \
+        duplicate address (api-compat #61, `docs/vxlan.md` section 8).",
+    params(("id" = String, Path, description = "Network ID or name.")),
+    responses(
+        (status = 200, description = "The network document.", body = crate::types::NetworkResponse),
+        (status = 404, description = "No such network.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn inspect(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -57,6 +92,25 @@ pub(super) async fn inspect(
 /// backend re-checks it under the store lock — this is the 400 the operator
 /// sees, not the guarantee.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    post,
+    path = "/networks/create",
+    operation_id = "NetworkCreate",
+    tag = "Network",
+    description = "A create whose `Scope` contradicts its `Driver` is a 400, \
+        not a network with the other scope (api-compat #60). A cluster has \
+        exactly one ingress network: the second request for one is a 400 \
+        naming the existing one.",
+    request_body = crate::types::NetworkCreateBody,
+    responses(
+        (status = 201, description = "Created.", body = crate::types::NetworkCreateResponse),
+        (status = 400, description = "Invalid spec, contradictory scope, or a second ingress network.", body = crate::types::ErrorBody),
+        (status = 409, description = "A network of that name already exists.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn create(
     State(state): State<ApiState>,
     body: Bytes,
@@ -90,6 +144,23 @@ pub(super) async fn create(
 
 /// `DELETE /networks/{id}`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    delete,
+    path = "/networks/{id}",
+    operation_id = "NetworkDelete",
+    tag = "Network",
+    description = "Removes a network from the cluster store. A network is a \
+        store object, so this is cluster-wide (api-compat #130).",
+    params(("id" = String, Path, description = "Network ID or name.")),
+    responses(
+        (status = 204, description = "Removed."),
+        (status = 404, description = "No such network.", body = crate::types::ErrorBody),
+        (status = 409, description = "The network still has endpoints attached.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn remove(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -101,6 +172,26 @@ pub(super) async fn remove(
 
 /// `POST /networks/{id}/connect`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    post,
+    path = "/networks/{id}/connect",
+    operation_id = "NetworkConnect",
+    tag = "Network",
+    description = "Attaches a container to a network. Only \
+        `EndpointConfig.Aliases` is honoured; static addressing is rejected \
+        because the cluster allocator owns addresses.",
+    params(("id" = String, Path, description = "Network ID or name.")),
+    request_body = crate::types::NetworkConnectBody,
+    responses(
+        (status = 200, description = "Attached."),
+        (status = 400, description = "Invalid body, or a field SatL refuses to ignore.", body = crate::types::ErrorBody),
+        (status = 404, description = "No such network or container.", body = crate::types::ErrorBody),
+        (status = 409, description = "The container is already attached.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn connect(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -120,6 +211,23 @@ pub(super) async fn connect(
 
 /// `POST /networks/{id}/disconnect`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    post,
+    path = "/networks/{id}/disconnect",
+    operation_id = "NetworkDisconnect",
+    tag = "Network",
+    description = "Detaches a container from a network.",
+    params(("id" = String, Path, description = "Network ID or name.")),
+    request_body = crate::types::NetworkDisconnectBody,
+    responses(
+        (status = 200, description = "Detached."),
+        (status = 400, description = "Invalid body.", body = crate::types::ErrorBody),
+        (status = 404, description = "No such network or container.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn disconnect(
     State(state): State<ApiState>,
     Path(id): Path<String>,

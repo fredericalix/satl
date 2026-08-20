@@ -28,6 +28,26 @@ use crate::state::ApiState;
 
 /// `POST /containers/prune?filters=`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    post,
+    path = "/containers/prune",
+    operation_id = "ContainerPrune",
+    tag = "Container",
+    description = "Removes stopped containers **cluster-wide**, and with each \
+        one the service backing it, exactly as `DELETE /containers/{id}` does \
+        (api-compat #33, #129). `SpaceReclaimed` is measured before removal \
+        and can be short of the truth: a rootfs cannot be destroyed while its \
+        jail is still dying (api-compat #136). Any filter at all is a 400 \
+        rather than a silent no-op (api-compat #134).",
+    params(("filters" = Option<String>, Query, description = "No filter is supported here; a non-empty value is a 400 (api-compat #134).")),
+    responses(
+        (status = 200, description = "What was removed and how much was reclaimed.", body = crate::types::ContainersPruneResponse),
+        (status = 400, description = "A filter was supplied.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn containers(
     State(state): State<ApiState>,
     Query(params): Query<Params>,
@@ -46,6 +66,26 @@ pub(super) async fn containers(
 ///
 /// `filters={"dangling":["false"]}` is Docker's wire form of `-a`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    post,
+    path = "/images/prune",
+    operation_id = "ImagePrune",
+    tag = "Image",
+    description = "Reclaims images, layers and blobs on **this node only** \
+        (api-compat #130). A layer dataset is destroyed only when two \
+        consecutive passes 1.5 s apart agree it is unreferenced; what the \
+        sweep deferred comes back in a `Deferred` array Docker has no \
+        equivalent for (api-compat #131). A pull in flight stops content \
+        reclamation for that pass and says so (api-compat #133).",
+    params(("filters" = Option<String>, Query, description = "Only `dangling` is understood -- `filters={\"dangling\":[\"false\"]}` is how `-a` reaches the daemon, in either of Docker's two encodings. Any other key is a 400 (api-compat #134).")),
+    responses(
+        (status = 200, description = "What was deleted, what was deferred and how much was reclaimed.", body = crate::types::ImagesPruneResponse),
+        (status = 400, description = "An unsupported filter, or a nonsense `dangling` value.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn images(
     State(state): State<ApiState>,
     Query(params): Query<Params>,
@@ -64,6 +104,23 @@ pub(super) async fn images(
 
 /// `POST /networks/prune?filters=`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    post,
+    path = "/networks/prune",
+    operation_id = "NetworkPrune",
+    tag = "Network",
+    description = "Removes unused networks **cluster-wide**: a network is a \
+        store object (api-compat #130). Any filter at all is a 400 rather \
+        than a silent no-op (api-compat #134).",
+    params(("filters" = Option<String>, Query, description = "No filter is supported here; a non-empty value is a 400 (api-compat #134).")),
+    responses(
+        (status = 200, description = "What was removed.", body = crate::types::NetworksPruneResponse),
+        (status = 400, description = "A filter was supplied.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn networks(
     State(state): State<ApiState>,
     Query(params): Query<Params>,
@@ -76,6 +133,23 @@ pub(super) async fn networks(
 
 /// `POST /volumes/prune?filters=`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    post,
+    path = "/volumes/prune",
+    operation_id = "VolumePrune",
+    tag = "Volume",
+    description = "Removes unused volumes on **this node only**: a volume is \
+        a ZFS dataset on whichever node holds it (api-compat #130). Any \
+        filter at all is a 400 rather than a silent no-op (api-compat #134).",
+    params(("filters" = Option<String>, Query, description = "No filter is supported here; a non-empty value is a 400 (api-compat #134).")),
+    responses(
+        (status = 200, description = "What was removed and how much was reclaimed.", body = crate::types::VolumesPruneResponse),
+        (status = 400, description = "A filter was supplied.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn volumes(
     State(state): State<ApiState>,
     Query(params): Query<Params>,

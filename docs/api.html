@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SatL Engine API</title>
+    <!--
+      Deliberately no <link> to Google Fonts, which Redoc's canonical template
+      carries: it is the one thing on this page that would touch the network.
+      Everything else is a sibling file, so the page works from file:// with no
+      daemon, no server and no connectivity.
+
+      The spec is loaded as a *script* (docs/openapi.js sets
+      window.SATL_OPENAPI) rather than through Redoc's spec-url, because Chrome
+      blocks fetch/XHR from file:// -- a spec-url would spin on the loading
+      spinner forever offline. Both files are generated: `make openapi`.
+    -->
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+      }
+      #redoc {
+        min-height: 100vh;
+      }
+      #boot-error {
+        display: none;
+        font: 16px/1.5 system-ui, sans-serif;
+        margin: 3rem auto;
+        max-width: 40rem;
+        padding: 0 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="redoc"></div>
+    <p id="boot-error">
+      This page could not load <code>openapi.js</code> and
+      <code>vendor/redoc.standalone.js</code>. Both are siblings of this file in
+      the repository's <code>docs/</code> directory; open <code>api.html</code>
+      from there rather than copying it elsewhere.
+    </p>
+    <script src="openapi.js"></script>
+    <script src="vendor/redoc.standalone.js"></script>
+    <script>
+      (function () {
+        if (!window.Redoc || !window.SATL_OPENAPI) {
+          document.getElementById("boot-error").style.display = "block";
+          return;
+        }
+        Redoc.init(
+          window.SATL_OPENAPI,
+          { hideDownloadButton: true, expandResponses: "200,201,204" },
+          document.getElementById("redoc")
+        );
+      })();
+    </script>
+  </body>
+</html>

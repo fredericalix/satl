@@ -23,8 +23,9 @@ use crate::client::Host;
 /// What the stub answers for one call.
 #[derive(Debug, Clone)]
 pub enum Reply {
-    /// Status plus a body (JSON unless the body is not JSON-shaped).
-    Body(StatusCode, Vec<u8>),
+    /// Status, extra response headers, and a body (JSON unless the body is
+    /// not JSON-shaped).
+    Body(StatusCode, Vec<(String, String)>, Vec<u8>),
     /// `101 Switching Protocols`, then these bytes on the hijacked socket.
     Hijack(Vec<u8>),
 }
@@ -34,6 +35,7 @@ impl Reply {
     pub fn json(status: u16, body: &str) -> Self {
         Self::Body(
             StatusCode::from_u16(status).expect("valid status"),
+            Vec::new(),
             body.as_bytes().to_vec(),
         )
     }
@@ -43,12 +45,27 @@ impl Reply {
         Self::Body(
             StatusCode::from_u16(status).expect("valid status"),
             Vec::new(),
+            Vec::new(),
         )
     }
 
     /// A raw byte body — multiplexed log frames, progress lines, …
     pub fn raw(status: u16, body: Vec<u8>) -> Self {
-        Self::Body(StatusCode::from_u16(status).expect("valid status"), body)
+        Self::Body(
+            StatusCode::from_u16(status).expect("valid status"),
+            Vec::new(),
+            body,
+        )
+    }
+
+    /// Add a response header. The daemon puts what does not fit Docker's
+    /// response shapes here — `X-Satl-Deferred-Layers` on an image removal.
+    #[must_use]
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        if let Self::Body(_, headers, _) = &mut self {
+            headers.push((name.to_owned(), value.to_owned()));
+        }
+        self
     }
 }
 
@@ -186,11 +203,15 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
         .push(recorded);
 
     match shared.take(&route) {
-        Some(Reply::Body(status, body)) => Response::builder()
-            .status(status)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .expect("valid response"),
+        Some(Reply::Body(status, headers, body)) => {
+            let mut builder = Response::builder()
+                .status(status)
+                .header(CONTENT_TYPE, "application/json");
+            for (name, value) in headers {
+                builder = builder.header(name, value);
+            }
+            builder.body(Body::from(body)).expect("valid response")
+        }
         Some(Reply::Hijack(payload)) => {
             if let Some(upgrade) = upgrade {
                 tokio::spawn(async move {
