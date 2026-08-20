@@ -32,7 +32,12 @@ pub struct ObjectVersion {
 // /info and /swarm
 // ---------------------------------------------------------------------------
 
-/// The subset of `GET /info` the cluster verbs read.
+/// `GET /info`, as the CLI reads it.
+///
+/// Grown additively, one field at a time, as verbs needed them: the cluster
+/// verbs read `Swarm` and `ServerVersion`, `satl system prune` reads `Name`,
+/// and `satl info` reads the rest. Every field defaults, so a daemon that
+/// serves fewer of them still parses.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct SystemInfo {
@@ -42,6 +47,51 @@ pub struct SystemInfo {
     /// Daemon version, used as the local node's `ENGINE VERSION`.
     #[serde(default, deserialize_with = "null_as_default")]
     pub server_version: String,
+    /// Unique daemon identifier.
+    #[serde(default, deserialize_with = "null_as_default", rename = "ID")]
+    pub id: String,
+    /// The node's hostname -- what every node-local statement names.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub name: String,
+    /// Logical CPUs.
+    #[serde(default, deserialize_with = "null_as_default", rename = "NCPU")]
+    pub ncpu: i64,
+    /// Physical memory, bytes.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub mem_total: i64,
+    /// Operating system family (`FreeBSD`).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub operating_system: String,
+    /// Operating system release (`15.1-RELEASE`).
+    #[serde(default, deserialize_with = "null_as_default", rename = "OSVersion")]
+    pub os_version: String,
+    /// Docker's `OSType` (`freebsd`).
+    #[serde(default, deserialize_with = "null_as_default", rename = "OSType")]
+    pub os_type: String,
+    /// CPU architecture, Docker-style.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub architecture: String,
+    /// Storage driver -- always `zfs` (invariant #5).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub driver: String,
+    /// Total containers on this node.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub containers: i64,
+    /// Running containers.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub containers_running: i64,
+    /// Paused containers.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub containers_paused: i64,
+    /// Stopped containers.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub containers_stopped: i64,
+    /// Images in this node's store.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub images: i64,
+    /// Daemon warnings meant for the operator.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub warnings: Vec<String>,
 }
 
 /// `Swarm` section of `GET /info`.
@@ -64,6 +114,27 @@ pub struct SwarmInfo {
     /// zero because it genuinely does not know (`SwarmInfoResponse.Nodes`).
     #[serde(default, deserialize_with = "null_as_default")]
     pub nodes: i64,
+    /// Manager members; manager-only, zero on a worker, same reason.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub managers: i64,
+    /// Cluster error string, empty when healthy.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub error: String,
+    /// Known manager endpoints; the daemon sends `null` when none are known.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub remote_managers: Vec<RemoteManager>,
+}
+
+/// One entry of [`SwarmInfo::remote_managers`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct RemoteManager {
+    /// Manager node ID.
+    #[serde(default, deserialize_with = "null_as_default", rename = "NodeID")]
+    pub node_id: String,
+    /// The address its control plane answers on.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub addr: String,
 }
 
 /// `GET /swarm`.

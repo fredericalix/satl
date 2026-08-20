@@ -65,6 +65,19 @@ pub enum Command {
     /// Return low-level information on containers.
     Inspect(cmd::inspect::InspectArgs),
 
+    /// Get real-time events from the daemon.
+    ///
+    /// The stream starts now and runs until interrupted. `--since` is sent
+    /// but has no effect -- SatL keeps no event history (docs/api-compat.md
+    /// #37) -- and `--until` is refused by the daemon. `--filter` is applied
+    /// by this client, on the keys type, event, container, image, label and
+    /// scope; any other key is refused rather than ignored.
+    #[command(verbatim_doc_comment)]
+    Events(cmd::events::EventsArgs),
+
+    /// Display system-wide information about this node's daemon.
+    Info(cmd::info::InfoArgs),
+
     /// Download an image from a registry.
     Pull(cmd::pull::PullArgs),
 
@@ -78,8 +91,32 @@ pub enum Command {
     /// Build a FreeBSD image from a Satlfile into this node's store.
     Build(cmd::build::BuildArgs),
 
-    /// List images.
+    /// List images, or manage them (`ls`, `rm`, `prune`, `inspect`).
+    ///
+    /// Bare `satl images` is docker's `docker images`. The subcommands are
+    /// SatL's own spelling -- docker has `docker image rm`, never
+    /// `docker images rm` (docs/api-compat.md 154).
+    #[command(verbatim_doc_comment)]
     Images(cmd::images::ImagesArgs),
+
+    /// Remove one or more images. Alias of `satl images rm`, which is the
+    /// canonical spelling; docker keeps `rmi` for the same reason.
+    Rmi(cmd::images::RmArgs),
+
+    /// Manage containers -- the verbs that have no top-level spelling.
+    ///
+    /// The lifecycle verbs stay at the top level, where docker puts them and
+    /// where muscle memory reaches for them: `satl ps`, `satl rm`, `satl
+    /// stop`, `satl kill`, `satl logs`, `satl inspect`. Docker's container
+    /// surface is flat, and a second spelling of a verb that already has one
+    /// would only be a second thing to keep in sync. This noun exists for the
+    /// verbs with no flat spelling at all -- today, `prune`.
+    #[command(verbatim_doc_comment)]
+    Container {
+        /// The container subcommand.
+        #[command(subcommand)]
+        command: cmd::container::ContainerCommand,
+    },
 
     /// Manage volumes.
     Volume {
@@ -205,15 +242,15 @@ pub async fn dispatch(cli: &Cli, streams: &mut Streams) -> anyhow::Result<u8> {
         Command::Logs(args) => cmd::logs::execute(&host, args, streams).await,
         Command::Exec(args) => cmd::exec::execute(&host, args, streams).await,
         Command::Inspect(args) => cmd::inspect::execute(&host, args, streams).await,
+        Command::Events(args) => cmd::events::execute(&host, args, streams).await,
+        Command::Info(args) => cmd::info::execute(&host, args, streams).await,
         Command::Pull(args) => cmd::pull::execute(&host, args, streams).await,
         Command::Push(args) => cmd::push::execute(&host, args, streams).await,
         Command::Tag(args) => cmd::tag::execute(&host, args, streams).await,
         Command::Build(args) => cmd::build::execute(&host, args, streams).await,
-        Command::Images(args) => {
-            let table = cmd::images::execute(&host, args).await?;
-            streams.out(table.as_bytes()).await;
-            Ok(0)
-        }
+        Command::Images(args) => cmd::images::execute(&host, args, streams).await,
+        Command::Rmi(args) => cmd::images::remove(&host, args, streams).await,
+        Command::Container { command } => cmd::container::execute(&host, command, streams).await,
         Command::Volume { command } => cmd::volume::execute(&host, command, streams).await,
         Command::Network { command } => cmd::network::execute(&host, command, streams).await,
         Command::System { command } => cmd::system::execute(&host, command, streams).await,
@@ -401,6 +438,172 @@ mod tests {
         }
     }
 
+    fn events_args(command_line: &[&str]) -> cmd::events::EventsArgs {
+        let cli = Cli::parse_from(command_line);
+        match cli.command {
+            Command::Events(args) => args,
+            other => panic!("expected events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn events_flags_mirror_docker() {
+        let args = events_args(&[
+            "satl",
+            "events",
+            "--since",
+            "1755613351",
+            "--until",
+            "2026-08-19T15:00:00Z",
+            "-f",
+            "type=container",
+            "--filter",
+            "event=start",
+            "--format",
+            "json",
+        ]);
+        assert_eq!(args.since.as_deref(), Some("1755613351"));
+        assert_eq!(args.until.as_deref(), Some("2026-08-19T15:00:00Z"));
+        assert_eq!(args.filter, vec!["type=container", "event=start"]);
+        assert_eq!(args.format.as_deref(), Some("json"));
+    }
+
+    #[test]
+    fn events_takes_no_arguments_and_defaults_to_everything() {
+        let args = events_args(&["satl", "events"]);
+        assert!(args.since.is_none() && args.until.is_none() && args.format.is_none());
+        assert!(args.filter.is_empty());
+        assert!(Cli::try_parse_from(["satl", "events", "web"]).is_err());
+    }
+
+    #[test]
+    fn info_takes_no_arguments() {
+        assert!(matches!(
+            Cli::parse_from(["satl", "info"]).command,
+            Command::Info(_)
+        ));
+        assert!(Cli::try_parse_from(["satl", "info", "--format", "json"]).is_err());
+    }
+
+    /// The lifecycle verbs stay top-level; `container` holds only `prune`.
+    #[test]
+    fn container_subcommands() {
+        let cli = Cli::parse_from(["satl", "container", "prune", "-f"]);
+        match cli.command {
+            Command::Container {
+                command: cmd::container::ContainerCommand::Prune(args),
+            } => assert!(args.force),
+            other => panic!("expected container prune, got {other:?}"),
+        }
+        let cli = Cli::parse_from(["satl", "container", "prune"]);
+        match cli.command {
+            Command::Container {
+                command: cmd::container::ContainerCommand::Prune(args),
+            } => assert!(!args.force),
+            other => panic!("expected container prune, got {other:?}"),
+        }
+        for absent in ["ls", "rm", "stop", "logs", "inspect"] {
+            assert!(
+                Cli::try_parse_from(["satl", "container", absent, "web"]).is_err(),
+                "satl container {absent} must not exist: the flat spelling is the only one"
+            );
+        }
+    }
+
+    #[test]
+    fn node_ps_defaults_to_self() {
+        let cli = Cli::parse_from(["satl", "node", "ps"]);
+        match cli.command {
+            Command::Node {
+                command: cmd::node::NodeCommand::Ps(args),
+            } => {
+                assert_eq!(args.nodes, vec!["self"]);
+                assert!(!args.quiet && !args.no_trunc);
+            }
+            other => panic!("expected node ps, got {other:?}"),
+        }
+        let cli = Cli::parse_from(["satl", "node", "ps", "--no-trunc", "-q", "alpha", "beta"]);
+        match cli.command {
+            Command::Node {
+                command: cmd::node::NodeCommand::Ps(args),
+            } => {
+                assert!(args.no_trunc && args.quiet);
+                assert_eq!(args.nodes, vec!["alpha", "beta"]);
+            }
+            other => panic!("expected node ps, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn network_prune_takes_only_force() {
+        let cli = Cli::parse_from(["satl", "network", "prune", "-f"]);
+        match cli.command {
+            Command::Network {
+                command: cmd::network::NetworkCommand::Prune(args),
+            } => assert!(args.force),
+            other => panic!("expected network prune, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["satl", "network", "prune", "blue"]).is_err());
+    }
+
+    #[test]
+    fn images_is_a_noun_that_still_lists_bare() {
+        // Bare `satl images` keeps docker's listing, flags and all: this is
+        // the backwards-compatibility assertion for the noun change.
+        let cli = Cli::parse_from(["satl", "images", "-q", "--no-trunc"]);
+        match cli.command {
+            Command::Images(args) => {
+                assert!(args.command.is_none(), "no subcommand means list");
+                assert!(args.ls.quiet && args.ls.no_trunc);
+            }
+            other => panic!("expected images, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(["satl", "images", "rm", "-f", "--no-prune", "a", "b"]);
+        match cli.command {
+            Command::Images(args) => match args.command {
+                Some(cmd::images::ImagesCommand::Rm(rm)) => {
+                    assert!(rm.force && rm.no_prune);
+                    assert_eq!(rm.images, ["a", "b"]);
+                }
+                other => panic!("expected images rm, got {other:?}"),
+            },
+            other => panic!("expected images, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(["satl", "images", "prune", "-a", "-f"]);
+        match cli.command {
+            Command::Images(args) => match args.command {
+                Some(cmd::images::ImagesCommand::Prune(prune)) => {
+                    assert!(prune.all && prune.force);
+                }
+                other => panic!("expected images prune, got {other:?}"),
+            },
+            other => panic!("expected images, got {other:?}"),
+        }
+
+        // `args_conflicts_with_subcommands`: a listing flag and a subcommand
+        // in one invocation is an error, not a silently ignored flag.
+        assert!(Cli::try_parse_from(["satl", "images", "-q", "rm", "a"]).is_err());
+        // rm takes at least one image.
+        assert!(Cli::try_parse_from(["satl", "images", "rm"]).is_err());
+    }
+
+    #[test]
+    fn rmi_parses_the_same_arguments_as_images_rm() {
+        let flat = Cli::parse_from(["satl", "rmi", "-f", "nginx:1.25"]);
+        let noun = Cli::parse_from(["satl", "images", "rm", "-f", "nginx:1.25"]);
+        let (Command::Rmi(flat), Command::Images(noun)) = (flat.command, noun.command) else {
+            panic!("expected rmi and images rm");
+        };
+        let Some(cmd::images::ImagesCommand::Rm(noun)) = noun.command else {
+            panic!("expected images rm");
+        };
+        assert_eq!(flat.force, noun.force);
+        assert_eq!(flat.no_prune, noun.no_prune);
+        assert_eq!(flat.images, noun.images);
+    }
+
     #[test]
     fn volume_subcommands() {
         let cli = Cli::parse_from(["satl", "volume", "create", "--driver", "local", "web-data"]);
@@ -423,6 +626,22 @@ mod tests {
             }
             other => panic!("expected volume rm, got {other:?}"),
         }
+        let cli = Cli::parse_from(["satl", "volume", "inspect", "a", "b"]);
+        match cli.command {
+            Command::Volume {
+                command: cmd::volume::VolumeCommand::Inspect(args),
+            } => assert_eq!(args.volumes, vec!["a", "b"]),
+            other => panic!("expected volume inspect, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["satl", "volume", "inspect"]).is_err());
+        let cli = Cli::parse_from(["satl", "volume", "prune", "--force"]);
+        match cli.command {
+            Command::Volume {
+                command: cmd::volume::VolumeCommand::Prune(args),
+            } => assert!(args.force),
+            other => panic!("expected volume prune, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["satl", "volume", "prune", "web-data"]).is_err());
         assert!(Cli::try_parse_from(["satl", "volume", "ls"]).is_ok());
     }
 
@@ -500,7 +719,7 @@ mod tests {
         }
         let cli = Cli::parse_from(["satl", "images", "--no-trunc", "-q"]);
         match cli.command {
-            Command::Images(args) => assert!(args.no_trunc && args.quiet),
+            Command::Images(args) => assert!(args.ls.no_trunc && args.ls.quiet),
             other => panic!("expected images, got {other:?}"),
         }
     }

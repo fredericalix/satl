@@ -64,20 +64,35 @@ const IMAGE: &str = "127.0.0.1:5000/satl-test/freebsd-nginx";
 /// Test networks. Each test owns one: the interface group is what startup
 /// reconciliation sweeps, so two daemons must never share it. Neither is a
 /// prefix of the production `satl`.
+///
+/// Each also owns a **manager port**. The default is 2377, and a dev host
+/// running a real `satld` already holds it — without a port of its own a test
+/// daemon dies at startup with `Address already in use`, which reads as a
+/// broken test rather than as an occupied host. These are outside the
+/// ephemeral range and away from 2377/2378.
 const FLOW_NETWORK: Net = Net {
     name: "wire",
     pool: "10.83.0.0/16",
+    port: 23_771,
 };
 const ADOPT_NETWORK: Net = Net {
     name: "rewire",
     pool: "10.86.0.0/16",
+    port: 23_773,
+};
+const RMI_NETWORK: Net = Net {
+    name: "unwire",
+    pool: "10.89.0.0/16",
+    port: 23_775,
 };
 
-/// A test network: its bridge is `<name>0` and its interface group `<name>`.
+/// A test network: its bridge is `<name>0` and its interface group `<name>`,
+/// and `port` is the manager port its daemon listens on.
 #[derive(Debug, Clone, Copy)]
 struct Net {
     name: &'static str,
     pool: &'static str,
+    port: u16,
 }
 
 /// Host port the container publishes (unreachable without pf; see the module
@@ -296,11 +311,13 @@ fn write_config(path: &Path, socket: &Path, state_dir: &Path, sandbox: &str, net
              node_name = \"wire-node\"\n\
              network_name = \"{network}\"\n\
              network_pool = \"{pool}\"\n\
+             listen_addr = \"127.0.0.1:{port}\"\n\
              pf_mode = \"disabled\"\n",
             socket = socket.display(),
             state = state_dir.display(),
             network = net.name,
             pool = net.pool,
+            port = net.port,
         ),
     )
     .expect("write config");
@@ -799,4 +816,295 @@ fn a_running_container_is_readopted_after_a_daemon_restart() {
     });
 
     stop_daemon(guard.daemon.take().expect("the daemon"));
+}
+
+/// `DELETE /images/{name}` end to end: the conflict arms, then a real removal
+/// that takes the layer datasets with it.
+///
+/// The two things this exists to catch, neither of which a unit test can:
+///
+/// 1. **the removal really destroys ZFS datasets**, and only the right ones —
+///    the whole point of running the two agreeing passes inside the request;
+/// 2. **a running container's image cannot be removed even with `--force`**,
+///    and a stopped one's can. That distinction is the api-compat 161 rule,
+///    and it is decided from the store, so only a live daemon exercises it.
+#[test]
+#[ignore = "integration: root, ZFS, ocijail and the local test registry (make integration)"]
+#[allow(clippy::too_many_lines)]
+fn an_image_is_removed_with_its_layers_over_the_rest_api() {
+    assert_root();
+    assert!(Path::new(CURL).exists(), "{CURL} is missing");
+
+    let net = RMI_NETWORK;
+    let (sandbox, mountpoint) = create_sandbox("rmi");
+    let dir = tempfile::Builder::new()
+        .prefix("rmi-satld-")
+        .tempdir()
+        .expect("tempdir");
+    let socket = dir.path().join("satl.sock");
+    let config = dir.path().join("satld.toml");
+    write_config(&config, &socket, &mountpoint, &sandbox, net);
+
+    let mut guard = Guard {
+        daemon: None,
+        task_id: None,
+        ocijail_root: mountpoint.join("ocijail"),
+        sandbox: sandbox.clone(),
+        mountpoint: mountpoint.clone(),
+        network: net,
+    };
+    guard.daemon = Some(spawn_daemon(&config, &socket));
+
+    let api = |method: &str, path: &str, body: Option<&str>, timeout: u64| {
+        request(&socket, dir.path(), method, path, body, timeout)
+    };
+
+    // ---- pull ------------------------------------------------------------
+    api(
+        "POST",
+        &format!("/v1.43/images/create?fromImage={IMAGE}&tag=latest"),
+        None,
+        300,
+    )
+    .expect(200, "POST /images/create");
+
+    let layers_root = format!("{sandbox}/layers");
+    // A pull writes blobs and metadata and *no datasets*: `satl-image` owns
+    // bytes, `satl-storage` owns datasets, and the unpack happens when a task
+    // prepares (architecture §9/§10). So the layer datasets appear below, once
+    // a container has been created from this image -- not here.
+    assert!(
+        zfs_children(&layers_root).is_empty(),
+        "a pull alone should not have unpacked anything under {layers_root}"
+    );
+
+    // Inspect answers now, and will 404 at the end: that is the observable
+    // difference a removal makes to the store.
+    let inspected = api(
+        "GET",
+        &format!("/v1.43/images/{IMAGE}:latest/json"),
+        None,
+        30,
+    )
+    .expect(200, "GET /images/{name}/json")
+    .json();
+    assert_eq!(inspected["RootFS"]["Type"], "layers");
+    assert!(
+        inspected["RepoTags"]
+            .as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == &format!("{IMAGE}:latest"))),
+        "inspect should list the reference it was asked about: {inspected}"
+    );
+
+    // ---- a running container's image cannot be removed, forced or not ----
+    let created = api(
+        "POST",
+        &format!("/v1.43/containers/create?name={NAME}"),
+        Some(&format!(r#"{{"Image":"{IMAGE}:latest"}}"#)),
+        60,
+    )
+    .expect(201, "POST /containers/create")
+    .json();
+    let task_id = created["Id"].as_str().expect("task id").to_owned();
+    guard.task_id = Some(task_id.clone());
+    api(
+        "POST",
+        &format!("/v1.43/containers/{task_id}/start"),
+        None,
+        120,
+    )
+    .expect(204, "POST /containers/{id}/start");
+
+    // `start` only writes the desired state; the agent prepares and runs the
+    // task asynchronously, and it is the *prepare* that unpacks the layers.
+    eventually(
+        "the container to report running",
+        Duration::from_mins(2),
+        || {
+            let state = api(
+                "GET",
+                &format!("/v1.43/containers/{task_id}/json"),
+                None,
+                10,
+            )
+            .json();
+            state["State"]["Running"] == serde_json::Value::Bool(true)
+        },
+    );
+
+    // Now the image really is on disk as datasets. This is the set the removal
+    // has to reclaim.
+    let datasets_before = zfs_children(&layers_root);
+    assert!(
+        !datasets_before.is_empty(),
+        "preparing a task from {IMAGE} should have unpacked layers under {layers_root}"
+    );
+
+    for query in ["", "?force=1"] {
+        let refused = api(
+            "DELETE",
+            &format!("/v1.43/images/{IMAGE}:latest{query}"),
+            None,
+            30,
+        )
+        .expect(409, "DELETE while running");
+        let message = refused.json()["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            message.contains("cannot be forced"),
+            "a live claim is not forceable: {message}"
+        );
+        assert!(
+            message.contains(&task_id) || message.contains("service"),
+            "the refusal must name what holds it: {message}"
+        );
+    }
+    // Nothing was destroyed by a refusal.
+    assert_eq!(zfs_children(&layers_root), datasets_before);
+
+    // ---- stopped: refused by default, forced through ---------------------
+    api(
+        "POST",
+        &format!("/v1.43/containers/{task_id}/stop"),
+        None,
+        120,
+    )
+    .expect(204, "POST /containers/{id}/stop");
+
+    // `stop`, like `start`, only writes the desired state. The claim stays
+    // *live* until the task actually reaches a terminal state, which is the
+    // distinction api-compat 161 turns on -- so waiting here is not a timing
+    // workaround, it is the precondition of the assertion below.
+    eventually(
+        "the container to report exited",
+        Duration::from_mins(1),
+        || {
+            let state = api(
+                "GET",
+                &format!("/v1.43/containers/{task_id}/json"),
+                None,
+                10,
+            )
+            .json();
+            state["State"]["Status"] == "exited"
+        },
+    );
+
+    let must_force = api("DELETE", &format!("/v1.43/images/{IMAGE}:latest"), None, 30)
+        .expect(409, "DELETE while a stopped container references it")
+        .json();
+    assert!(
+        must_force["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("must force"),
+        "a terminal claim is forceable, and says so: {must_force}"
+    );
+
+    // ---- the real removal ------------------------------------------------
+    let started = Instant::now();
+    let removed = api(
+        "DELETE",
+        &format!("/v1.43/images/{IMAGE}:latest?force=1"),
+        None,
+        60,
+    )
+    .expect(200, "DELETE /images/{name}")
+    .json();
+    let elapsed = started.elapsed();
+
+    // The two agreeing passes are 1.5 s apart *inside* the request; measuring
+    // it here is what makes api-compat 155's "about a second and a half" a
+    // fact rather than a claim.
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "the removal must run both layer passes, took {elapsed:?}"
+    );
+
+    let items = removed.as_array().expect("Docker's rmi array");
+    assert!(
+        items
+            .iter()
+            .any(|item| item["Untagged"] == format!("{IMAGE}:latest")),
+        "the removal reports the reference it forgot: {removed}"
+    );
+
+    // The record is gone from both the listing and inspect.
+    let listed = api("GET", "/v1.43/images/json", None, 30)
+        .expect(200, "GET /images/json")
+        .json();
+    assert!(
+        !listed.as_array().expect("array").iter().any(|image| {
+            image["RepoTags"]
+                .as_array()
+                .is_some_and(|tags| tags.iter().any(|tag| tag == &format!("{IMAGE}:latest")))
+        }),
+        "the removed image is still listed: {listed}"
+    );
+    api(
+        "GET",
+        &format!("/v1.43/images/{IMAGE}:latest/json"),
+        None,
+        30,
+    )
+    .expect(404, "GET /images/{name}/json after removal");
+
+    // ---- the layers survive, and that is the invariant, not a leak --------
+    //
+    // The stopped container's rootfs is a ZFS *clone* of the image's top
+    // layer, so the chain is still claimed even though the image record that
+    // named it has gone. `gc.rs`'s `a_layer_held_only_by_a_stopped_container_
+    // is_never_collected` is exactly this, and the whole point of exercising
+    // it here is that the *new* verb runs the same sweep and therefore obeys
+    // the same claim -- a removal that destroyed these datasets would have
+    // pulled the ground out from under a container the operator can still
+    // start.
+    assert_eq!(
+        zfs_children(&layers_root),
+        datasets_before,
+        "the stopped container's clone still claims its chain: removing the \
+         image record must not destroy it"
+    );
+
+    // ---- once nothing holds them, a prune reclaims them -------------------
+    api("DELETE", &format!("/v1.43/containers/{task_id}"), None, 120)
+        .expect(204, "DELETE /containers/{id}");
+    guard.task_id = None;
+    eventually(
+        "the container's rootfs clone to go",
+        Duration::from_mins(1),
+        || zfs_children(&format!("{sandbox}/containers")).is_empty(),
+    );
+
+    api("POST", "/v1.43/images/prune", None, 120).expect(200, "POST /images/prune");
+    let datasets_after = zfs_children(&layers_root);
+    assert!(
+        datasets_after.is_empty(),
+        "with the record forgotten and the clone gone, nothing claims these \
+         chains: before {datasets_before:?}, after {datasets_after:?}"
+    );
+
+    stop_daemon(guard.daemon.take().expect("the daemon"));
+}
+
+/// The immediate children of a ZFS dataset, sorted. Empty when it does not
+/// exist, which is what "everything under it went" looks like.
+fn zfs_children(dataset: &str) -> Vec<String> {
+    let (ok, out) = run(
+        "zfs",
+        &["list", "-H", "-r", "-d", "1", "-o", "name", dataset],
+    );
+    if !ok {
+        return Vec::new();
+    }
+    let mut rows: Vec<String> = out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != dataset)
+        .map(ToOwned::to_owned)
+        .collect();
+    rows.sort();
+    rows
 }

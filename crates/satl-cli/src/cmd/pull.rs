@@ -9,6 +9,7 @@ use hyper::Method;
 
 use crate::api::JsonMessage;
 use crate::client::{self, Host};
+use crate::ndjson::LineSplitter;
 use crate::output::Streams;
 use crate::parse::{self, ImageRef};
 
@@ -81,33 +82,6 @@ pub fn create_path(reference: &ImageRef, platform: Option<&str>) -> String {
         pairs.push(("platform", platform));
     }
     format!("/images/create{}", client::query(&pairs))
-}
-
-/// Split a byte stream into newline-delimited JSON messages.
-#[derive(Debug, Default)]
-struct LineSplitter {
-    buffer: String,
-}
-
-impl LineSplitter {
-    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
-        let mut lines = Vec::new();
-        while let Some(index) = self.buffer.find('\n') {
-            let line: String = self.buffer.drain(..=index).collect();
-            let line = line.trim().to_owned();
-            if !line.is_empty() {
-                lines.push(line);
-            }
-        }
-        lines
-    }
-
-    fn finish(&mut self) -> Option<String> {
-        let line = self.buffer.trim().to_owned();
-        self.buffer.clear();
-        if line.is_empty() { None } else { Some(line) }
-    }
 }
 
 /// Renders progress messages. On a terminal, consecutive updates about the
@@ -211,22 +185,6 @@ mod tests {
             ),
             "/images/create?fromImage=127.0.0.1%3A5000%2Ffreebsd-nginx&tag=v1&platform=freebsd%2Famd64"
         );
-    }
-
-    #[test]
-    fn splits_lines_across_chunks() {
-        let mut splitter = LineSplitter::default();
-        assert!(splitter.push(b"{\"status\":\"Pull").is_empty());
-        assert_eq!(
-            splitter.push(b"ing\"}\n{\"status\":\"Done\"}\n"),
-            vec![
-                "{\"status\":\"Pulling\"}".to_owned(),
-                "{\"status\":\"Done\"}".to_owned()
-            ]
-        );
-        assert!(splitter.finish().is_none());
-        assert!(splitter.push(b"{\"status\":\"tail\"}").is_empty());
-        assert_eq!(splitter.finish(), Some("{\"status\":\"tail\"}".to_owned()));
     }
 
     const STREAM: &[&str] = &[

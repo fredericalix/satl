@@ -848,6 +848,11 @@ what any operator on a stock GENERIC host gets.
 - Layer *unpacking* is `satl-storage`'s job (§10); `satl-image` owns bytes and
   metadata, `satl-storage` owns datasets. GC (M5 `satl system prune`): delete blobs
   and datasets unreferenced by images/containers, leaf-first.
+- **Removing one record** (M9, `DELETE /images/{name}`): a record *is* a reference,
+  so removal is `ImageStore::remove` — which writes `repositories.json` before
+  anything is deleted, so a store read is never left pointing at a file that has
+  gone — followed by the same sweep the prune runs. What makes the record
+  unreachable is what makes its content collectable; the order is not negotiable.
 
 ## 10. Storage: ZFS layer store (`satl-storage`)
 
@@ -883,6 +888,13 @@ zroot/satl                      mountpoint=/var/db/satl
 ### 10.1 Layer garbage collection (M5)
 
 The planner is pure and lives in `satl_storage::gc`; `satld::backend::prune` drives it.
+Since M9 it has **two** drivers through one `reclaim()`: `POST /images/prune` and
+`DELETE /images/{name}`. That is deliberate — a targeted removal destroys layers too,
+so it earns the same two-agreeing-readings rule, and a removal that skipped it would
+be a second, weaker policy for the same irreversible act. The deferral is reported on
+both, as a body field on the prune and as `X-Satl-Deferred-Layers` on the removal,
+whose Docker-shaped array has no room for it.
+
 A layer dataset is referenced when **any** of three readings claims it, and the claim is
 then closed **upward** through the clone `origin` edges on disk:
 
@@ -1245,7 +1257,8 @@ requires a client certificate from the cluster CA.
   Docker's (field-for-field where implemented).
 - Endpoint groups by milestone: M0 `/version`, `/_ping`, `/info` (minimal); M1
   containers + images + local volumes/networks + `/events` + `/exec`; M2 `/swarm`,
-  `/nodes`, `/services`, `/tasks`; M3 overlay networks; M5 `/secrets`, `/configs`.
+  `/nodes`, `/services`, `/tasks`; M3 overlay networks; M5 `/secrets`, `/configs`;
+  M9 `DELETE /images/{name}` and `GET /images/{name}/json`.
 - `satl` CLI verbs map 1:1 to docker's; `satl compose` (M5) consumes Compose Spec
   files (services, networks, volumes, secrets, deploy.{replicas,resources,placement}).
 - **Every intentional deviation gets an entry in `docs/api-compat.md` in the same PR**
@@ -1255,6 +1268,12 @@ requires a client certificate from the cluster CA.
   FreeBSD-specific fields (jail id in inspect output, `PLATFORM` column); unsupported
   Linux-only container options rejected with explicit errors (cgroup options, seccomp,
   etc.).
+- **The surface has a machine-readable half since M9**: `docs/openapi.yaml` is
+  generated from the handlers' own annotations and `make check` fails when it drifts
+  from the code, with `docs/api.html` rendering it offline. It is a file and not an
+  endpoint — invariant #8 makes the Docker API the only external surface, and a
+  `/swagger` route would not be part of it. `api-compat.md` stays the prose half: the
+  document says what the API *is*, the entries say where it departs from Docker's.
 
 ## 14. SwarmKit feature mapping
 

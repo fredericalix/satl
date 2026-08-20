@@ -19,13 +19,14 @@ use futures_util::stream::BoxStream;
 use model::{
     BackendError, ChangeOutcome, ConfigCreated, ContainerInspect, ContainerSummary, Counts,
     CreateContainerOptions, CreateNetworkOptions, CreateVolumeOptions, CreatedContainer,
-    EventMessage, ExecConfig, ExecId, ExecInspect, ExecStream, ImageSummary, LogFrame, LogOptions,
-    NetworkConnectOptions, NetworkCreated, NetworkDetail, NetworkDisconnectOptions, NetworkSummary,
-    NodeDetail, NodeSpecUpdate, NodeSummary, PrunedContainers, PrunedImages, PrunedNetworks,
-    PrunedVolumes, PullProgressLine, RegistryAuth, Result, SecretCreated, ServiceCreateOptions,
-    ServiceCreated, ServiceDetail, ServiceSummary, ServiceUpdateOptions, SwarmDetail,
-    SwarmInitOptions, SwarmInitResult, SwarmJoinOptions, SwarmStatus, TaskDetail, TaskFilters,
-    TaskSummary, TokenRole, VolumeInfo, WaitCondition, WaitResult,
+    EventMessage, ExecConfig, ExecId, ExecInspect, ExecStream, ImageInspect, ImageSummary,
+    LogFrame, LogOptions, NetworkConnectOptions, NetworkCreated, NetworkDetail,
+    NetworkDisconnectOptions, NetworkSummary, NodeDetail, NodeSpecUpdate, NodeSummary,
+    PrunedContainers, PrunedImages, PrunedNetworks, PrunedVolumes, PullProgressLine, RegistryAuth,
+    Result, SecretCreated, ServiceCreateOptions, ServiceCreated, ServiceDetail, ServiceSummary,
+    ServiceUpdateOptions, SwarmDetail, SwarmInitOptions, SwarmInitResult, SwarmJoinOptions,
+    SwarmStatus, TaskDetail, TaskFilters, TaskSummary, TokenRole, VolumeInfo, WaitCondition,
+    WaitResult,
 };
 use satl_core::{Platform, Version};
 use std::time::{Duration, SystemTime};
@@ -101,6 +102,39 @@ pub trait Backend: Send + Sync + 'static {
     /// image with the name it already has is a no-op success (Docker's
     /// behavior).
     async fn tag_image(&self, source: &str, target: &str) -> Result<()>;
+
+    /// Removes one local image and reclaims what stops being referenced
+    /// (`DELETE /images/{name}`).
+    ///
+    /// `reference` is `name[:tag|@digest]`, an image ID — SatL's is the
+    /// manifest digest (api-compat #41) — or an unambiguous prefix of one.
+    /// `force` is Docker's: it overrides a reference held only by *terminal*
+    /// tasks, and never one held by a live task or a service spec
+    /// (api-compat 161). `noprune` skips the layer and content sweep, which is
+    /// the only way to avoid its two-pass settle (api-compat 155).
+    ///
+    /// Returns the same shape as [`Backend::prune_images`] because it is the
+    /// same reclamation: `deleted` renders as Docker's `ImagesDeleted` array
+    /// and `deferred` as the `X-Satl-Deferred-Layers` header, which is where
+    /// it goes because Docker's response has no field for it.
+    ///
+    /// `NotFound` when nothing local answers to `reference`; `Conflict` when
+    /// something still uses it.
+    async fn remove_image(
+        &self,
+        reference: &str,
+        force: bool,
+        noprune: bool,
+    ) -> Result<PrunedImages>;
+
+    /// The full inspect document for one local image
+    /// (`GET /images/{name}/json`).
+    ///
+    /// Aggregated by image ID: every reference resolving to the same manifest
+    /// digest is one image with several `RepoTags`, which is Docker's model
+    /// and deliberately not the one-row-per-reference shape `list_images` has
+    /// (api-compat 15, 160).
+    async fn inspect_image(&self, reference: &str) -> Result<ImageInspect>;
 
     // -- prune --------------------------------------------------------------
     //
@@ -401,6 +435,19 @@ impl Backend for UnwiredBackend {
     }
 
     async fn tag_image(&self, _source: &str, _target: &str) -> Result<()> {
+        Self::unwired()
+    }
+
+    async fn remove_image(
+        &self,
+        _reference: &str,
+        _force: bool,
+        _noprune: bool,
+    ) -> Result<PrunedImages> {
+        Self::unwired()
+    }
+
+    async fn inspect_image(&self, _reference: &str) -> Result<ImageInspect> {
         Self::unwired()
     }
 

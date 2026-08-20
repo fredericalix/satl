@@ -15,24 +15,28 @@ never speaks gRPC). There is no standalone mode — a single node is a cluster o
 
 ## Where things live
 
-- **Design docs are in `inprogess/docs/`** in this working tree (gitignored), while every
-  reference in code and docs calls them `docs/…`: `architecture.md` (the reference —
+- **Design docs are in `docs/`** and are tracked in git: `architecture.md` (the reference —
   numbered sections cited throughout the code), `roadmap.md` (live status + decision log),
   `project-brief.md` (the non-negotiables), `api-compat.md` (numbered Docker deviations),
   plus `networking.md`, `vxlan.md`, `ocijail.md`, `linuxulator.md`, `jail-teardown.md`,
   `image-sources.md`, `operations.md`.
-- `inprogess/hack/experiments/` — throwaway FreeBSD experiments with captured output;
-  this is where uncertainty about jail/vxlan/ocijail behavior gets settled before code.
+- `hack/experiments/` — throwaway FreeBSD experiments with captured output; this is where
+  uncertainty about jail/vxlan/ocijail behavior gets settled before code. **Not present in
+  this checkout**, though the decision log cites results from it (`hack/experiments/esp/`),
+  and `make check`'s SPDX scan still looks for `hack/**/*.c`.
 - The SwarmKit behavioral spec (`features.md`, cited as **SWK §n**) lives outside the repo
   on the dev host.
 - User-facing documentation is a separate repo, `satl-doc`.
-- This macOS checkout **cannot build** (workspace needs rustc ≥ 1.96, code is FreeBSD-only)
-  and has no commits yet. Build and test on the FreeBSD 15.1 dev host.
+- **This checkout is the FreeBSD 15.1 dev host** (`alpha`): rustc/cargo 1.96.1 are
+  installed, `satld` is installed with a live socket at `/var/run/satl.sock`, and
+  `make check`, `sudo make integration` and `make cluster-test` all run here. The
+  cluster testbed is `fbsd{1,2,3}.satl.cc` (replaced 2026-08-19; underlay 10.0.0.0/24).
 
 ## Commands
 
 ```sh
 make check              # SPDX headers, fmt --check, clippy -D warnings, cargo test --workspace
+make openapi            # regenerate docs/openapi.yaml + docs/openapi.js (make check only *checks* them)
 make build / release    # debug / release build of satl + satld
 sudo make install       # binaries + rc.d + sample config (builds into target/install)
 make package            # dist/satl-<version>.pkg + dist/CHECKSUM.SHA512

@@ -65,13 +65,14 @@ use satl_api::model::{
     ContainerHealthLog, ContainerInspect, ContainerRuntimeState, ContainerSummary, Counts,
     CreateContainerOptions, CreateNetworkOptions, CreateVolumeOptions, CreatedContainer,
     EventMessage, ExecConfig, ExecId, ExecInspect, ExecStream, ExposedPort, HostConfig,
-    ImageSummary, LogFrame, LogOptions, NetworkConnectOptions, NetworkCreated, NetworkDetail,
-    NetworkDisconnectOptions, NetworkSettings, NetworkSummary, NodeDetail, NodeSpecUpdate,
-    NodeSummary, PortMapping, ProgressDetail, PrunedContainers, PrunedImages, PrunedNetworks,
-    PrunedVolumes, PullProgressLine, RegistryAuth, Result, SecretCreated, ServiceCreateOptions,
-    ServiceCreated, ServiceDetail, ServiceSummary, ServiceUpdateOptions, SwarmDetail,
-    SwarmInitOptions, SwarmInitResult, SwarmJoinOptions, SwarmStatus, TaskDetail, TaskFilters,
-    TaskSummary, TokenRole, VolumeInfo, WaitCondition, WaitResult,
+    ImageConfigDoc, ImageInspect, ImageSummary, LogFrame, LogOptions, NetworkConnectOptions,
+    NetworkCreated, NetworkDetail, NetworkDisconnectOptions, NetworkSettings, NetworkSummary,
+    NodeDetail, NodeSpecUpdate, NodeSummary, PortMapping, ProgressDetail, PrunedContainers,
+    PrunedImages, PrunedNetworks, PrunedVolumes, PullProgressLine, RegistryAuth, Result,
+    SecretCreated, ServiceCreateOptions, ServiceCreated, ServiceDetail, ServiceSummary,
+    ServiceUpdateOptions, SwarmDetail, SwarmInitOptions, SwarmInitResult, SwarmJoinOptions,
+    SwarmStatus, TaskDetail, TaskFilters, TaskSummary, TokenRole, VolumeInfo, WaitCondition,
+    WaitResult,
 };
 use satl_cluster::{ClusterStore, ForwardError, ProposalRejection, StoreView};
 use satl_core::{
@@ -1306,18 +1307,30 @@ impl satl_api::Backend for DaemonBackend {
         // The in-use counts come from the store on a manager and from the
         // local task set on a worker — the image list itself is node-local
         // either way.
+        //
+        // Keyed on the **canonical** reference, because that is how the store
+        // keys its records: a spec that says `alpine` has to count against the
+        // record `docker.io/library/alpine:latest`, and keying on the raw spec
+        // string made `Containers` read 0 for exactly the images most likely
+        // to be in use. Same comparison `image_claims` makes for the removal
+        // conflict, so the column and the 409 cannot disagree.
         let in_use: BTreeMap<String, i64> = {
             let mut counts: BTreeMap<String, i64> = BTreeMap::new();
+            let mut count = |image: &str| {
+                let key = satl_image::ImageReference::parse(image)
+                    .map_or_else(|_| image.to_owned(), |parsed| parsed.canonical());
+                *counts.entry(key).or_default() += 1;
+            };
             match Self::manager_of(self.cluster()?.as_ref()) {
                 Ok(manager) => {
                     let view = manager.store.view();
                     for task in view.tasks() {
-                        *counts.entry(task.spec.container.image.clone()).or_default() += 1;
+                        count(&task.spec.container.image);
                     }
                 }
                 Err(_) => {
                     for task in self.local_tasks().await? {
-                        *counts.entry(task.spec.container.image.clone()).or_default() += 1;
+                        count(&task.spec.container.image);
                     }
                 }
             }
@@ -1330,6 +1343,87 @@ impl satl_api::Backend for DaemonBackend {
                 image_summary(image, containers)
             })
             .collect())
+    }
+
+    /// `DELETE /images/{name}`: forget one record, then reclaim.
+    ///
+    /// Body in `backend/prune.rs`, beside the sweeps it drives — the removal
+    /// and the prune run the same reclamation and decide "in use" with the
+    /// same function, so the two cannot disagree.
+    #[tracing::instrument(skip_all, fields(image = %reference, force, noprune))]
+    async fn remove_image(
+        &self,
+        reference: &str,
+        force: bool,
+        noprune: bool,
+    ) -> Result<PrunedImages> {
+        let report = self.remove_image_impl(reference, force, noprune).await?;
+        tracing::info!(
+            items = report.deleted.len(),
+            deferred = report.deferred.len(),
+            space_reclaimed = report.space_reclaimed,
+            "image removed"
+        );
+        Ok(report)
+    }
+
+    /// `GET /images/{name}/json`: the inspect document, aggregated by image
+    /// ID.
+    #[tracing::instrument(skip_all, fields(image = %reference))]
+    async fn inspect_image(&self, reference: &str) -> Result<ImageInspect> {
+        let target = self.resolve_image_target(reference).await?;
+        let images = self
+            .executor
+            .images()
+            .list()
+            .await
+            .map_err(|err| BackendError::internal(format!("cannot list images: {err}")))?;
+        // The store is keyed by reference, so one image is however many
+        // records share its manifest digest; Docker's document is one per
+        // image, listing them all (api-compat 160).
+        let mut members: Vec<&satl_image::PulledImage> = images
+            .iter()
+            .filter(|image| image.manifest_digest.as_str() == target.id)
+            .collect();
+        members.sort_by(|a, b| a.reference.cmp(&b.reference));
+        let first = members
+            .first()
+            .ok_or_else(|| BackendError::not_found(format!("No such image: {reference}")))?;
+
+        Ok(ImageInspect {
+            id: target.id.clone(),
+            repo_tags: members
+                .iter()
+                .map(|image| image.reference.clone())
+                .collect(),
+            repo_digests: members
+                .iter()
+                .map(|image| format!("{}@{}", repository_of(&image.reference), target.id))
+                .collect(),
+            created: first.created,
+            size: first
+                .layers
+                .iter()
+                .map(|layer| i64::try_from(layer.size).unwrap_or(i64::MAX))
+                .sum(),
+            config: ImageConfigDoc {
+                env: first.config.env.clone(),
+                entrypoint: first.config.entrypoint.clone(),
+                cmd: first.config.cmd.clone(),
+                working_dir: first.config.working_dir.clone().unwrap_or_default(),
+                user: first.config.user.clone().unwrap_or_default(),
+                exposed_ports: first.config.exposed_ports.clone(),
+            },
+            rootfs_layers: first
+                .layers
+                .iter()
+                .map(|layer| layer.diff_id.to_string())
+                .collect(),
+            platform: Some(satl_core::Platform {
+                os: first.platform.os.clone(),
+                arch: first.platform.architecture.clone(),
+            }),
+        })
     }
 
     /// `POST /images/{name}/tag`: one more local reference to the same image.

@@ -26,14 +26,15 @@ use satl_core::{Mount, MountType, Platform, PortProtocol, RestartCondition, Task
 
 use crate::backend::model::{
     ContainerHealth, ContainerInspect, ContainerRuntimeState, ContainerSummary, EventMessage,
-    ExecInspect, ExposedPort, ImageDeleted, ImageSummary, PortMapping, PrunedContainers,
-    PrunedImages, PrunedNetworks, PrunedVolumes, PullProgressLine, VolumeInfo,
+    ExecInspect, ExposedPort, ImageDeleted, ImageInspect, ImageSummary, PortMapping,
+    PrunedContainers, PrunedImages, PrunedNetworks, PrunedVolumes, PullProgressLine, VolumeInfo,
 };
 use crate::timefmt;
 use crate::types::{
     ContainerHealthResponse, ContainerInspectResponse, ContainerStateResponse,
     ContainerSummaryResponse, ContainersPruneResponse, EventActorResponse, EventResponse,
-    ExecInspectResponse, HealthLogEntryResponse, ImageDeleteResponseItem, ImageSummaryResponse,
+    ExecInspectResponse, HealthLogEntryResponse, ImageDeleteResponseItem, ImageGraphDriver,
+    ImageInspectConfig, ImageInspectResponse, ImageRootFs, ImageSummaryResponse,
     ImagesPruneResponse, InspectConfig, InspectHostConfig, InspectNetworkSettings, JsonErrorDetail,
     JsonMessage, JsonProgressDetail, MountPoint, NetworksPruneResponse, PortBindingBody,
     PortSummary, ProcessConfig, RestartPolicyResponse, SummaryHostConfig, SummaryNetworkSettings,
@@ -371,6 +372,55 @@ pub fn image_summary(image: &ImageSummary) -> ImageSummaryResponse {
     }
 }
 
+/// The `GET /images/{name}/json` document.
+#[must_use]
+pub fn image_inspect(image: &ImageInspect) -> ImageInspectResponse {
+    let (os, architecture) = image
+        .platform
+        .as_ref()
+        .map_or_else(Default::default, |platform| {
+            (platform.os.clone(), platform.arch.clone())
+        });
+    ImageInspectResponse {
+        id: image.id.clone(),
+        repo_tags: image.repo_tags.clone(),
+        repo_digests: image.repo_digests.clone(),
+        // Empty rather than absent: Docker clients read these positionally,
+        // and an OCI pull gives SatL no source for any of them (#41).
+        parent: String::new(),
+        comment: String::new(),
+        created: timefmt::rfc3339_nano_or_zero(image.created),
+        author: String::new(),
+        config: ImageInspectConfig {
+            user: image.config.user.clone(),
+            exposed_ports: (!image.config.exposed_ports.is_empty()).then(|| {
+                image
+                    .config
+                    .exposed_ports
+                    .iter()
+                    .map(|port| (port.clone(), serde_json::json!({})))
+                    .collect()
+            }),
+            env: (!image.config.env.is_empty()).then(|| image.config.env.clone()),
+            cmd: (!image.config.cmd.is_empty()).then(|| image.config.cmd.clone()),
+            entrypoint: (!image.config.entrypoint.is_empty())
+                .then(|| image.config.entrypoint.clone()),
+            working_dir: image.config.working_dir.clone(),
+            labels: None,
+        },
+        architecture,
+        os,
+        size: image.size,
+        virtual_size: image.size,
+        graph_driver: ImageGraphDriver::default(),
+        root_fs: ImageRootFs {
+            kind: "layers".to_owned(),
+            layers: image.rootfs_layers.clone(),
+        },
+        platform: image.platform.as_ref().map(platform_string),
+    }
+}
+
 /// A volume document.
 #[must_use]
 pub fn volume(volume: &VolumeInfo) -> VolumeResponse {
@@ -398,24 +448,30 @@ pub fn pruned_containers(pruned: &PrunedContainers) -> ContainersPruneResponse {
     }
 }
 
+/// One `ImagesDeleted` item, in Docker's two shapes.
+///
+/// Shared by `POST /images/prune` and `DELETE /images/{name}`: Docker's rmi
+/// response is a bare array of exactly these, and the prune wraps the same
+/// items in an object, so the mapping has one home.
+#[must_use]
+pub fn image_deleted(item: &ImageDeleted) -> ImageDeleteResponseItem {
+    match item {
+        ImageDeleted::Untagged(what) => ImageDeleteResponseItem {
+            untagged: Some(what.clone()),
+            deleted: None,
+        },
+        ImageDeleted::Deleted(what) => ImageDeleteResponseItem {
+            untagged: None,
+            deleted: Some(what.clone()),
+        },
+    }
+}
+
 /// A `POST /images/prune` response.
 #[must_use]
 pub fn pruned_images(pruned: &PrunedImages) -> ImagesPruneResponse {
     ImagesPruneResponse {
-        images_deleted: pruned
-            .deleted
-            .iter()
-            .map(|item| match item {
-                ImageDeleted::Untagged(what) => ImageDeleteResponseItem {
-                    untagged: Some(what.clone()),
-                    deleted: None,
-                },
-                ImageDeleted::Deleted(what) => ImageDeleteResponseItem {
-                    untagged: None,
-                    deleted: Some(what.clone()),
-                },
-            })
-            .collect(),
+        images_deleted: pruned.deleted.iter().map(image_deleted).collect(),
         space_reclaimed: pruned.space_reclaimed,
         deferred: pruned.deferred.clone(),
     }

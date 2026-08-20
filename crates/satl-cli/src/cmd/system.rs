@@ -16,6 +16,7 @@
 
 use std::fmt::Write as _;
 
+use crate::api::cluster::SystemInfo;
 use crate::api::{
     ContainersPruneResponse, ImagesPruneResponse, NetworksPruneResponse, VolumesPruneResponse,
 };
@@ -131,19 +132,27 @@ async fn prune(host: &Host, args: &PruneArgs, streams: &mut Streams) -> anyhow::
     Ok(0)
 }
 
-/// Just the `Name` field of `GET /info` — the daemon's hostname.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct InfoName {
-    #[serde(default)]
-    name: String,
-}
-
 /// The daemon's own name, for the node-local statement. Best effort: a prune
 /// that cannot read `/info` still prunes, it just says "this node".
-async fn node_name(host: &Host) -> Option<String> {
-    let info: InfoName = client::get_json(host, "/info").await.ok()?;
+pub(crate) async fn node_name(host: &Host) -> Option<String> {
+    let info: SystemInfo = client::get_json(host, "/info").await.ok()?;
     (!info.name.is_empty()).then_some(info.name)
+}
+
+/// api-compat #130's node-local statement, in one place.
+///
+/// Every verb that reclaims disk ends on this exact line -- `satl system
+/// prune`, `satl container prune`, `satl volume prune`, `satl images prune`
+/// -- so an operator who meets it on two different verbs meets the same
+/// words. `satl network prune` is the one that does not: a network is not
+/// disk, and there is no space to report.
+#[must_use]
+pub fn reclaimed_line(reclaimed: u64, node: Option<&str>) -> String {
+    format!(
+        "Total reclaimed space: {} (on {}; images, layers and volumes are node-local)\n",
+        human_size(i64::try_from(reclaimed).unwrap_or(i64::MAX)),
+        node.unwrap_or("this node")
+    )
 }
 
 /// The confirmation text, exactly what will be removed and where.
@@ -181,7 +190,7 @@ pub fn warning(args: &PruneArgs, node: Option<&str>) -> String {
 /// Read one line from stdin and decide. `n` on anything unclear, including a
 /// stdin that cannot be read at all — a prune that proceeds because it could not
 /// ask is the worst possible reading of silence.
-async fn confirmed() -> bool {
+pub(crate) async fn confirmed() -> bool {
     use tokio::io::AsyncBufReadExt as _;
     let mut line = String::new();
     let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
@@ -196,6 +205,20 @@ async fn confirmed() -> bool {
 #[must_use]
 pub fn answer_is_yes(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// The two-pass deferral hint (api-compat #131), in one place.
+///
+/// Every verb that can defer a layer prints this exact sentence -- `satl
+/// system prune`, `satl images prune` and `satl images rm` -- so an operator
+/// who meets it twice meets the same words and does not wonder whether two
+/// different things happened.
+#[must_use]
+pub fn deferred_hint(count: usize) -> String {
+    format!(
+        "\n{count} layer(s) were unreferenced on only one of the two passes and were \
+         left alone.\nRun prune again to reclaim them.\n"
+    )
 }
 
 /// The summary, Docker's layout plus the node-local statement and the deferrals.
@@ -226,20 +249,10 @@ pub fn render(outcome: &PruneOutcome, node: Option<&str>) -> String {
         }
     }
     if !outcome.deferred.is_empty() {
-        let _ = writeln!(
-            text,
-            "\n{} layer(s) were unreferenced on only one of the two passes and were \
-             left alone.\nRun prune again to reclaim them.",
-            outcome.deferred.len()
-        );
+        text.push_str(&deferred_hint(outcome.deferred.len()));
     }
     text.push('\n');
-    let _ = writeln!(
-        text,
-        "Total reclaimed space: {} (on {}; images, layers and volumes are node-local)",
-        human_size(i64::try_from(outcome.reclaimed).unwrap_or(i64::MAX)),
-        node.unwrap_or("this node")
-    );
+    text.push_str(&reclaimed_line(outcome.reclaimed, node));
     text
 }
 

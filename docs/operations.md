@@ -1715,12 +1715,27 @@ consequences worth knowing before the first `up`:
   numeric); a task that starts and dies with a healthcheck is `Failed` with the
   probe's exit code in `satl service ps`'s ERROR column.
 
-## Reclaiming disk: `satl system prune` (M5)
+## Reclaiming disk: `satl system prune` (M5), `satl images rm` (M9)
 
 Before M5 nothing on a SatL node reclaimed anything. Every image layer a node ever
 pulled stayed on disk as a ZFS dataset, and deleting one by hand was not a remedy
 because nothing reconciled it. `satl system prune` is the reclamation, and there are
 three facts to know before running it.
+
+**To reclaim one image rather than everything, use `satl images rm`** (M9; `satl rmi`
+is the same verb). It refuses while a running task or any service spec still names
+the image, and `--force` does not override that -- a service spec is a standing order
+to create tasks, so untagging under it turns the next start into a pull against a
+registry that may be gone. Only stopped containers referencing it is a refusal
+`--force` *does* override. **Budget about a second and a half per image**: the
+removal runs the same two agreeing passes described below, for the same reason, and
+`--no-prune` is how you pay that once for a batch instead of once per image:
+
+```sh
+for i in $(satl images -q); do satl images rm --no-prune $i; done
+satl images prune          # one sweep at the end
+```
+
 
 **It is node-local for everything that costs disk.** Containers and networks are cluster
 objects, so pruning them acts on the whole cluster. Images, layers, blobs and volumes

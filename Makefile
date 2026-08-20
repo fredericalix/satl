@@ -5,7 +5,7 @@ CARGO?=		cargo
 PREFIX?=	/usr/local
 DESTDIR?=
 
-.PHONY: check build release install integration cluster-test clean license-check
+.PHONY: check build release install integration cluster-test clean license-check openapi
 
 check: license-check
 	${CARGO} fmt --all --check
@@ -107,6 +107,13 @@ INTEGRATION_TARGET_DIR?=	target/integration
 integration:
 	${CARGO} test --workspace --target-dir ${INTEGRATION_TARGET_DIR} \
 	    -- --ignored --test-threads=1
+
+# Regenerates docs/openapi.yaml and docs/openapi.js from the #[utoipa::path]
+# attributes on the satl-api handlers. `check` deliberately has no openapi rule
+# of its own: the drift test rides inside the `cargo test --workspace` it
+# already runs, and fails naming the first differing line.
+openapi:
+	UPDATE_OPENAPI=1 ${CARGO} test -p satl-api --lib openapi::
 
 cluster-test:
 	sh tests/cluster/run.sh

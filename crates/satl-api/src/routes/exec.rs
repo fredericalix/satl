@@ -32,6 +32,27 @@ use crate::{convert, framing, render};
 
 /// `POST /containers/{id}/exec`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    post,
+    path = "/containers/{id}/exec",
+    operation_id = "ContainerExec",
+    tag = "Exec",
+    description = "Creates an exec instance. Exec is non-interactive: \
+        `Tty:true` is a 400 on create *and* on start, `Privileged:true` is a \
+        400, `DetachKeys` is ignored, and stdin on the hijacked socket is \
+        read and discarded (api-compat #17, #38).",
+    params(("id" = String, Path, description = "Container (task) ID or name.")),
+    request_body = crate::types::ExecCreateBody,
+    responses(
+        (status = 201, description = "The exec instance was created.", body = crate::types::ExecCreateResponse),
+        (status = 400, description = "`Tty` or `Privileged` was set, or the body is invalid.", body = crate::types::ErrorBody),
+        (status = 404, description = "No such container.", body = crate::types::ErrorBody),
+        (status = 409, description = "The container is not running.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn create(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -52,6 +73,32 @@ pub(super) async fn create(
 
 /// `POST /exec/{id}/start`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    post,
+    path = "/exec/{id}/start",
+    operation_id = "ExecStart",
+    tag = "Exec",
+    description = "**Not JSON, and two shapes.** With `Connection: Upgrade` \
+        and `Upgrade: tcp` the daemon answers `101 Switching Protocols` with \
+        an empty body and then owns the raw socket, writing Docker \
+        multiplexed frames over it until the process exits. **Without** the \
+        upgrade headers it answers `200` with the same frames as an ordinary \
+        chunked body, where Docker would hijack in both cases (api-compat \
+        #18). Output is delivered when the process exits rather than streamed \
+        live (api-compat #38).",
+    params(("id" = String, Path, description = "Exec instance ID.")),
+    request_body = crate::types::ExecStartBody,
+    responses(
+        (status = 101, description = "Connection hijacked: the raw socket now carries Docker multiplexed frames."),
+        (status = 200, description = "No upgrade was requested: the same frames as a chunked body (api-compat #18).", body = String, content_type = "application/vnd.docker.raw-stream"),
+        (status = 400, description = "`Tty` was set, or the body is invalid.", body = crate::types::ErrorBody),
+        (status = 404, description = "No such exec instance.", body = crate::types::ErrorBody),
+        (status = 409, description = "The exec instance has already run.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "`Detach` was set (api-compat #17), or the daemon has no executor wired.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn start(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -155,6 +202,22 @@ where
 
 /// `GET /exec/{id}/json`.
 #[allow(clippy::needless_pass_by_value)]
+#[utoipa::path(
+    get,
+    path = "/exec/{id}/json",
+    operation_id = "ExecInspect",
+    tag = "Exec",
+    description = "`ProcessConfig.privileged` is always false, `DetachKeys` \
+        always empty and `CanRemove` always true (api-compat #19).",
+    params(("id" = String, Path, description = "Exec instance ID.")),
+    responses(
+        (status = 200, description = "The exec instance document.", body = crate::types::ExecInspectResponse),
+        (status = 404, description = "No such exec instance.", body = crate::types::ErrorBody),
+        (status = 500, description = "Daemon error.", body = crate::types::ErrorBody),
+        (status = 501, description = "Not implemented by this daemon.", body = crate::types::ErrorBody),
+        (status = 503, description = "This node is not a swarm manager, or no manager is reachable.", body = crate::types::ErrorBody)
+    )
+)]
 pub(super) async fn inspect(
     State(state): State<ApiState>,
     Path(id): Path<String>,

@@ -8,9 +8,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::api::{CreateNetworkBody, CreateNetworkResponse, Ipam, IpamConfig, Network};
+use crate::api::{
+    CreateNetworkBody, CreateNetworkResponse, Ipam, IpamConfig, Network, NetworksPruneResponse,
+};
 use crate::client::{self, Host};
-use crate::cmd::FAILURE;
+use crate::cmd::{FAILURE, system};
 use crate::format::{self, Table};
 use crate::output::Streams;
 use crate::parse;
@@ -26,6 +28,8 @@ pub enum NetworkCommand {
     Inspect(InspectArgs),
     /// Remove one or more networks.
     Rm(RmArgs),
+    /// Remove all unused networks.
+    Prune(PruneArgs),
 }
 
 /// Flags of `satl network ls`.
@@ -84,6 +88,14 @@ pub struct RmArgs {
     pub networks: Vec<String>,
 }
 
+/// Flags of `satl network prune`.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct PruneArgs {
+    /// Do not prompt for confirmation.
+    #[arg(short, long)]
+    pub force: bool,
+}
+
 /// Dispatch a `satl network` subcommand.
 pub async fn execute(
     host: &Host,
@@ -114,7 +126,46 @@ pub async fn execute(
         }
         NetworkCommand::Inspect(args) => inspect(host, args, streams).await,
         NetworkCommand::Rm(args) => remove(host, args, streams).await,
+        NetworkCommand::Prune(args) => prune(host, args, streams).await,
     }
+}
+
+/// `satl network prune [-f]`.
+///
+/// The one verb of the prune family that reports no space at all: a network
+/// is a store object and a handful of interfaces, not a dataset, so there is
+/// nothing on disk to reclaim and a `Total reclaimed space: 0B` line would
+/// only invite the question of why it is always zero. Networks are cluster
+/// objects, so this removes them cluster-wide (api-compat #130's other half).
+async fn prune(host: &Host, args: &PruneArgs, streams: &mut Streams) -> anyhow::Result<u8> {
+    if !args.force {
+        streams.out(PRUNE_WARNING.as_bytes()).await;
+        if !system::confirmed().await {
+            return Ok(0);
+        }
+    }
+    let pruned: NetworksPruneResponse = client::post_empty_json(host, "/networks/prune").await?;
+    streams.out(render_prune(&pruned).as_bytes()).await;
+    Ok(0)
+}
+
+/// The confirmation text of `satl network prune`.
+const PRUNE_WARNING: &str = "WARNING! This will remove all networks not used by at least one \
+                             container.\nNetworks are cluster objects, so this acts on the whole \
+                             cluster.\nAre you sure you want to continue? [y/N] ";
+
+/// Docker's `network prune` summary (pure, for goldens).
+#[must_use]
+pub fn render_prune(pruned: &NetworksPruneResponse) -> String {
+    if pruned.networks_deleted.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("Deleted Networks:\n");
+    for name in &pruned.networks_deleted {
+        text.push_str(name);
+        text.push('\n');
+    }
+    text
 }
 
 fn create_body(args: &CreateArgs) -> anyhow::Result<CreateNetworkBody> {
@@ -508,5 +559,80 @@ NETWORK ID     NAME    DRIVER    SCOPE
             format!("{error:#}").contains("Attachable is not supported"),
             "{error:#}"
         );
+    }
+
+    fn pruned(raw: &str) -> NetworksPruneResponse {
+        serde_json::from_str(raw).expect("fixture parses")
+    }
+
+    #[test]
+    fn prune_summary_golden() {
+        assert_eq!(
+            render_prune(&pruned(r#"{"NetworksDeleted":["scratch","blue"]}"#)),
+            "Deleted Networks:\nscratch\nblue\n"
+        );
+    }
+
+    /// A network is not disk: there is nothing to report reclaiming.
+    #[test]
+    fn prune_never_reports_space() {
+        for raw in ["{}", r#"{"NetworksDeleted":["scratch"]}"#] {
+            let rendered = render_prune(&pruned(raw));
+            assert!(!rendered.contains("reclaimed"), "{rendered}");
+        }
+        assert!(render_prune(&pruned("{}")).is_empty());
+    }
+
+    #[test]
+    fn the_prune_prompt_says_what_goes_and_how_far_it_reaches() {
+        assert!(PRUNE_WARNING.contains("all networks not used by at least one container"));
+        assert!(PRUNE_WARNING.contains("whole cluster"));
+        assert!(PRUNE_WARNING.ends_with("Are you sure you want to continue? [y/N] "));
+        assert!(PRUNE_WARNING.is_ascii(), "operator text must be ASCII");
+    }
+
+    #[tokio::test]
+    async fn prune_with_force_posts_once_and_never_reads_info() {
+        use crate::output::testing;
+        use crate::stub::{Reply, Stub};
+
+        let stub = Stub::start().await;
+        stub.on(
+            "POST",
+            "/networks/prune",
+            Reply::json(200, r#"{"NetworksDeleted":["scratch"]}"#),
+        );
+        let (mut streams, out, _err) = testing::streams();
+        let command = NetworkCommand::Prune(PruneArgs { force: true });
+        let code = execute(&stub.host(), &command, &mut streams)
+            .await
+            .expect("prune succeeds");
+        assert_eq!(code, 0);
+        // No `/info`: nothing node-local is being claimed here.
+        assert_eq!(stub.routes(), vec!["POST /networks/prune"]);
+        assert_eq!(out.contents(), "Deleted Networks:\nscratch\n");
+    }
+
+    #[tokio::test]
+    async fn prune_surfaces_a_daemon_error() {
+        use crate::output::testing;
+        use crate::stub::{Reply, Stub};
+
+        let stub = Stub::start().await;
+        stub.on(
+            "POST",
+            "/networks/prune",
+            Reply::json(503, r#"{"message":"this node is not a swarm manager"}"#),
+        );
+        let (mut streams, out, _err) = testing::streams();
+        let command = NetworkCommand::Prune(PruneArgs { force: true });
+        let error = execute(&stub.host(), &command, &mut streams)
+            .await
+            .expect_err("a 503 is an error");
+        assert_eq!(
+            error.to_string(),
+            "Error response from daemon: this node is not a swarm manager"
+        );
+        assert!(out.contents().is_empty());
     }
 }

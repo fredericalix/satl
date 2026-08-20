@@ -74,7 +74,7 @@ usage() {
 SCENARIOS="init_and_join worker_join replicas_spread node_kill leader_kill overlay_dns \
 overlay_dns_multinet publish_port rolling_update global_service global_update \
 global_node_loss constraint_enforcer restart_budget ca_rotate compose_stack \
-mesh_failed_start build_push_run stack_verbs jobs_and_prefs hot_resize cleanup"
+mesh_failed_start build_push_run stack_verbs jobs_and_prefs hot_resize images_rm cleanup"
 
 READINESS_ONLY=0
 while [ "$#" -gt 0 ]; do
@@ -5754,11 +5754,11 @@ stale attachment claimed a re-allocated address, which is B1 back"
 #      reset.sh would not take it), the build directory removed, the tunnel
 #      down.
 #
-# The brief's bonus (tag, prune the source reference, run from the target) is
-# deliberately NOT covered: the CLI and the REST API have no image-remove or
-# untag verb at all (`/images/{name}` serves only POST .../tag; prune knows
-# only dangling/all), so "prune the source reference" cannot be expressed
-# against this daemon. Recorded in the task report.
+# The brief's bonus (tag, remove the source reference, run from the target) IS
+# covered since M9: `satl images rm` and `DELETE /images/{name}` exist, so
+# "forget the source reference and prove the target still runs" is now
+# expressible. Step 7 below does it. Until M9 it was not: `/images/{name}`
+# served only POST .../tag, and prune knew only dangling/all.
 # ===========================================================================
 
 # bp_registry_digest — the digest the joiner's own registry serves for the
@@ -6473,6 +6473,116 @@ instance's 'startup reconciliation complete' must carry rctl_rules_purged >= 1 (
 # `satl:network:*` bridge is not a leftover), no dataset under
 # <zfs_root>/containers.
 # ===========================================================================
+# ===========================================================================
+# scenario images_rm — `satl images rm` on a real cluster.
+#
+# Two things only a cluster can show, and both are the point:
+#
+#   1. **the refusal is cluster-aware, and it is not a 503 on a worker.** The
+#      claim set comes from the Raft store on a manager and from the local task
+#      DB on a worker, so a worker answers the removal rather than refusing to
+#      look (api-compat 161) -- the opposite of `satl node ps`, which is cluster
+#      state and does 503.
+#   2. **removal is node-local.** Forgetting an image on one node must leave the
+#      other nodes' stores untouched (api-compat 130). A prune has always been
+#      node-local; a targeted removal is the verb an operator will reach for
+#      first, and getting this wrong would quietly empty a cluster.
+# ===========================================================================
+
+IRM=satl_images_rm
+# A private tag of the suite image: the scenario removes it, and removing a
+# reference every other scenario depends on would be a booby trap.
+IRM_TAG="127.0.0.1:$REG_PORT/$REG_NS/satl-images-rm:v1"
+
+# irm_lists <node> — does this node's store still list IRM_TAG?
+irm_lists() {
+	node_ssh "$1" "satl images" 2>/dev/null | grep -q "satl-images-rm"
+}
+
+scenario_images_rm() {
+	m4_prelude
+	svc_rm_audited "$IRM"
+
+	_irm_a=$(bootstrap_node)
+	_irm_b=""
+	for _n in $(cluster_nodes); do
+		[ "$_n" = "$_irm_a" ] || { _irm_b=$_n; break; }
+	done
+	[ -n "$_irm_b" ] || fail "images_rm needs a second node"
+
+	# --- 1. a private tag on one node only ----------------------------------
+	info "satl tag on $_irm_a: $IMAGE -> $IRM_TAG"
+	node_ssh "$_irm_a" "satl tag $IMAGE $IRM_TAG" >"$TMPD/irm.tag" 2>&1 || {
+		show "$TMPD/irm.tag"
+		fail "satl tag failed on $_irm_a"
+	}
+	irm_lists "$_irm_a" || fail "$_irm_a does not list the tag it just created"
+	irm_lists "$_irm_b" &&
+	    fail "$_irm_b lists a tag created on $_irm_a: tagging is node-local (api-compat 130)"
+	info "the tag exists on $_irm_a and nowhere else"
+
+	# --- 2. a service holding it cannot be removed, forced or not -----------
+	info "satl service create --name $IRM --replicas 1 $IRM_TAG (constrained to $_irm_a)"
+	_irm_host=$(host_of "$_irm_a")
+	node_ssh "$_irm_a" "satl service create --name $IRM --replicas 1 \
+	    --constraint node.hostname==$_irm_host $IRM_TAG" >"$TMPD/irm.create" 2>&1 || {
+		show "$TMPD/irm.create"
+		fail "satl service create $IRM failed on $_irm_a"
+	}
+	wait_until "$T_CONVERGE" "$IRM running on $_irm_host" \
+	    'tasks_fetch "$IRM" && [ "$(tasks_live_total)" = "1" ]'
+
+	for _irm_flag in "" "--force"; do
+		if node_ssh "$_irm_a" "satl images rm $_irm_flag $IRM_TAG" >"$TMPD/irm.refused" 2>&1; then
+			show "$TMPD/irm.refused"
+			fail "satl images rm $_irm_flag succeeded while a service still names the image: \
+a live claim is not forceable (api-compat 161)"
+		fi
+		grep -q "cannot be forced" "$TMPD/irm.refused" || {
+			show "$TMPD/irm.refused"
+			fail "the refusal must say 'cannot be forced', not just fail"
+		}
+	done
+	irm_lists "$_irm_a" || fail "the refused removal forgot the record anyway"
+	info "refused with 'cannot be forced' both with and without --force, record intact"
+
+	# --- 3. the worker answers rather than 503-ing --------------------------
+	# Same verb on a node that is not the leader: image removal reads the local
+	# task DB when there is no manager to ask, so it must produce a real answer.
+	if node_ssh "$_irm_b" "satl images rm $IRM_TAG" >"$TMPD/irm.worker" 2>&1; then
+		fail "$_irm_b removed an image it does not have"
+	fi
+	grep -q "No such image" "$TMPD/irm.worker" || {
+		show "$TMPD/irm.worker"
+		fail "$_irm_b must answer 'No such image' for a reference it does not hold -- \
+not a 503: image removal is node-local and never needs a manager (api-compat 161)"
+	}
+	info "$_irm_b answered 'No such image' rather than refusing to look"
+
+	# --- 4. remove it for real ----------------------------------------------
+	svc_rm_audited "$IRM"
+	wait_until "$T_CLEAN" "no jails, task epairs, container datasets or mounts left anywhere" \
+	    'leftovers_gone'
+
+	info "satl images rm $IRM_TAG on $_irm_a"
+	node_ssh "$_irm_a" "satl images rm $IRM_TAG" >"$TMPD/irm.rm" 2>&1 || {
+		show "$TMPD/irm.rm"
+		fail "satl images rm failed once nothing referenced the image"
+	}
+	grep -q "^Untagged: " "$TMPD/irm.rm" || {
+		show "$TMPD/irm.rm"
+		fail "the removal must report the reference it forgot"
+	}
+	irm_lists "$_irm_a" && fail "$_irm_a still lists the removed tag"
+
+	# The base image is untouched: removing one reference of a shared image
+	# must not take the others with it.
+	node_ssh "$_irm_a" "satl images" 2>/dev/null | grep -q "freebsd-nginx" ||
+	    fail "removing $IRM_TAG also removed $IMAGE: a tag is one reference, not the image"
+	info "the tag is gone on $_irm_a, the base image it shared layers with is not"
+	log_evidence "targeted image removal, node-local"
+}
+
 scenario_cleanup() {
 	require_swarm
 	if service_present; then

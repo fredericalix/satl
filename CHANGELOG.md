@@ -12,9 +12,31 @@ name/version separator.
 
 ### Added
 
+- **`satl images rm`** (and `satl rmi`), plus `DELETE /images/{name}` — there was
+  no way to delete a single image, from the CLI or from a Docker client. It runs
+  the same two-agreeing-passes layer reclamation `satl system prune` runs, so
+  budget about 1.5 s per image; `--no-prune` skips the sweep for a batch. A
+  running task or any service spec referencing the image is a refusal `--force`
+  does not override.
+- **`satl images` is now a noun**: `ls`, `rm`, `prune`, `inspect`. Bare
+  `satl images` is unchanged.
+- **`satl events`** — the daemon has streamed `GET /events` since M1 and nothing
+  reached it. `--filter` is applied client-side; `--since` is sent with a warning
+  that SatL keeps no history.
+- **`satl info`**, **`satl volume inspect`**, **`satl node ps`**, and
+  `satl images|container|network|volume prune` — all endpoints that existed and
+  had no verb.
+- **`GET /images/{name}/json`** and `satl images inspect`.
 - `make package` writes `dist/CHECKSUM.SHA512` next to the package, in
   sha512sum(1) format: `sha512sum -c CHECKSUM.SHA512` from inside `dist/`
   verifies a `.pkg` distributed out of band.
+
+### Fixed
+
+- `GET /images/json`'s `Containers` count read 0 for exactly the images most
+  likely to be in use: it compared a task spec's raw image string against the
+  store's canonical reference, so a service saying `alpine` never matched
+  `docker.io/library/alpine:latest`.
 
 ## [0.1.0-beta] - 2026-08-17
 

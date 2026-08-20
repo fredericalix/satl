@@ -14,9 +14,10 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Docker error envelope: every non-2xx response body is `{"message": "..."}`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorBody {
     /// Human-readable error message.
     pub message: String,
@@ -34,7 +35,7 @@ pub(crate) fn error_response(status: StatusCode, message: impl Into<String>) -> 
 }
 
 /// `GET /version` response body (Docker `SystemVersion`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct VersionResponse {
     /// Product platform (`{"Name": "SatL"}`).
@@ -61,7 +62,7 @@ pub struct VersionResponse {
 }
 
 /// `Platform` section of [`VersionResponse`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct PlatformInfo {
     /// Product name (`SatL`).
@@ -69,7 +70,7 @@ pub struct PlatformInfo {
 }
 
 /// One entry of the `Components` list in [`VersionResponse`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ComponentVersion {
     /// Component name (`Engine`).
@@ -81,7 +82,7 @@ pub struct ComponentVersion {
 }
 
 /// `Details` section of the `Engine` component in [`VersionResponse`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct EngineDetails {
     /// Docker Engine API version implemented.
@@ -107,7 +108,7 @@ pub struct EngineDetails {
 /// Container/image counts are hard zeros until the container and image stores
 /// exist (M1), and [`InfoResponse::swarm`] is a static "inactive" placeholder
 /// until it is wired to the real cluster state in a later M0 step.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct InfoResponse {
     /// Unique daemon/node identifier.
@@ -158,7 +159,7 @@ pub struct InfoResponse {
 /// ([`Backend::swarm_status`](crate::Backend::swarm_status)) or from the
 /// static [`SwarmInfo`] the daemon injected at startup. `Nodes`/`Managers`
 /// are Docker's manager-only counters and are omitted when zero.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct SwarmInfoResponse {
     /// Node identifier within the cluster.
@@ -183,7 +184,7 @@ pub struct SwarmInfoResponse {
 }
 
 /// One entry of `Swarm.RemoteManagers`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct RemoteManagerWire {
     /// Manager node ID.
@@ -199,7 +200,7 @@ pub struct RemoteManagerWire {
 /// It is what `GET /info` serves until the daemon's backend can report live
 /// cluster state; from then on the live
 /// [`SwarmStatus`](crate::model::SwarmStatus) wins.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct SwarmInfo {
     /// Node identifier within the cluster.
@@ -239,7 +240,7 @@ impl SwarmInfo {
 
 /// A Docker `StrSlice`: JSON accepts either a single string or an array of
 /// strings for `Cmd` and `Entrypoint`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum StringOrList {
     /// A bare string — a shell-style single argument.
@@ -265,7 +266,7 @@ impl StringOrList {
 /// ignores what it cannot honour (rejecting only the options whose silent
 /// omission would change the container's security or resource behaviour —
 /// see `crate::convert`).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ContainerCreateBody {
     /// Hostname inside the container.
@@ -305,7 +306,7 @@ pub struct ContainerCreateBody {
 }
 
 /// `HostConfig` section of [`ContainerCreateBody`].
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct HostConfigBody {
     /// `src:dst[:ro]` bind/volume mounts.
@@ -367,7 +368,7 @@ pub struct HostConfigBody {
 }
 
 /// One host binding inside `HostConfig.PortBindings`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct PortBindingBody {
     /// Host address to bind on; empty means every address.
@@ -378,7 +379,7 @@ pub struct PortBindingBody {
 }
 
 /// `HostConfig.RestartPolicy`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct RestartPolicyBody {
     /// `""`/`no`, `always`, `unless-stopped` or `on-failure`.
@@ -390,7 +391,7 @@ pub struct RestartPolicyBody {
 /// `POST /containers/{id}/exec` body.
 // Docker's exec config is a bag of independent attach flags.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ExecCreateBody {
     /// Command and arguments.
@@ -416,7 +417,7 @@ pub struct ExecCreateBody {
 }
 
 /// `POST /exec/{id}/start` body.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ExecStartBody {
     /// Run without streaming output back (rejected in M1).
@@ -448,7 +449,7 @@ where
 /// of a silently different network.
 // Docker's field names one-for-one; grouping the flags would break the shape.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NetworkCreateBody {
     /// Network name.
@@ -489,7 +490,7 @@ pub struct NetworkCreateBody {
 }
 
 /// `POST /networks/{id}/connect` body.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NetworkConnectBody {
     /// Container to attach.
@@ -499,7 +500,7 @@ pub struct NetworkConnectBody {
 }
 
 /// `EndpointConfig` of a connect body.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct EndpointConfigWire {
     /// Extra DNS names on the network.
@@ -517,7 +518,7 @@ pub struct EndpointConfigWire {
 }
 
 /// `POST /networks/{id}/disconnect` body.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NetworkDisconnectBody {
     /// Container to detach.
@@ -528,7 +529,7 @@ pub struct NetworkDisconnectBody {
 }
 
 /// `POST /volumes/create` body.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct VolumeCreateBody {
     /// Volume name; empty asks the daemon to generate one.
@@ -546,7 +547,7 @@ pub struct VolumeCreateBody {
 // ---------------------------------------------------------------------------
 
 /// `POST /containers/create` response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ContainerCreateResponse {
     /// New container ID (= Task ID).
@@ -556,7 +557,7 @@ pub struct ContainerCreateResponse {
 }
 
 /// One entry of `GET /containers/json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ContainerSummaryResponse {
     /// Container ID.
@@ -591,7 +592,7 @@ pub struct ContainerSummaryResponse {
 }
 
 /// `Ports` entry of a container summary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct PortSummary {
     /// Host address the port is bound on.
@@ -608,7 +609,7 @@ pub struct PortSummary {
 }
 
 /// `HostConfig` subset of a container summary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct SummaryHostConfig {
     /// Network mode.
@@ -616,7 +617,7 @@ pub struct SummaryHostConfig {
 }
 
 /// `NetworkSettings` subset of a container summary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct SummaryNetworkSettings {
     /// Network name → endpoint.
@@ -624,7 +625,7 @@ pub struct SummaryNetworkSettings {
 }
 
 /// One network attachment of a container.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct EndpointSettings {
     /// Network ID.
@@ -643,7 +644,7 @@ pub struct EndpointSettings {
 }
 
 /// One `Mounts` entry (summary and inspect share this shape).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct MountPoint {
     /// `bind`, `volume` or `tmpfs`.
@@ -666,7 +667,7 @@ pub struct MountPoint {
 }
 
 /// `GET /containers/{id}/json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ContainerInspectResponse {
     /// Container ID.
@@ -706,7 +707,7 @@ pub struct ContainerInspectResponse {
 /// `State` section of a container inspect document.
 // Docker's container state document is a bag of independent flags.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ContainerStateResponse {
     /// Docker state name.
@@ -740,7 +741,7 @@ pub struct ContainerStateResponse {
 }
 
 /// `State.Health` of a container inspect document (Docker's `Health`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ContainerHealthResponse {
     /// `starting`, `healthy` or `unhealthy`.
@@ -752,7 +753,7 @@ pub struct ContainerHealthResponse {
 }
 
 /// One `State.Health.Log` entry (Docker's `HealthcheckResult`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct HealthLogEntryResponse {
     /// When the probe started, RFC 3339 nanoseconds.
@@ -766,7 +767,7 @@ pub struct HealthLogEntryResponse {
 }
 
 /// `Config` section of a container inspect document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct InspectConfig {
     /// Hostname inside the jail.
@@ -794,7 +795,7 @@ pub struct InspectConfig {
 }
 
 /// `HostConfig` section of a container inspect document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct InspectHostConfig {
     /// Binds as written by the client.
@@ -816,7 +817,7 @@ pub struct InspectHostConfig {
 }
 
 /// `RestartPolicy` as served back by inspect.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct RestartPolicyResponse {
     /// Policy name.
@@ -826,7 +827,7 @@ pub struct RestartPolicyResponse {
 }
 
 /// `NetworkSettings` section of a container inspect document.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct InspectNetworkSettings {
     /// Bridge name — empty (SatL names its bridge per network).
@@ -848,7 +849,7 @@ pub struct InspectNetworkSettings {
 }
 
 /// `POST /containers/{id}/wait` response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct WaitResponse {
     /// Exit code of the container's main process.
@@ -858,7 +859,7 @@ pub struct WaitResponse {
 }
 
 /// `Error` member of a [`WaitResponse`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct WaitError {
     /// Failure detail.
@@ -866,7 +867,7 @@ pub struct WaitError {
 }
 
 /// One entry of `GET /images/json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ImageSummaryResponse {
     /// Image ID (`sha256:…`).
@@ -893,9 +894,122 @@ pub struct ImageSummaryResponse {
     pub platform: Option<String>,
 }
 
+/// `GET /images/{name}/json` — Docker's `ImageInspect`.
+///
+/// Aggregated by image ID, where [`ImageSummaryResponse`] is one row per
+/// stored reference (api-compat 160). Several fields are structurally empty
+/// rather than absent, because Docker clients read them positionally:
+/// `Parent`, `Comment`, `Author` and `DockerVersion` have no source in an OCI
+/// pull (api-compat #41), and `Config.Labels` is `null` because the image
+/// config parser does not read a `Labels` block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageInspectResponse {
+    /// Image ID (`sha256:…`) — SatL's is the manifest digest.
+    pub id: String,
+    /// Every `repository:tag` resolving to this image.
+    pub repo_tags: Vec<String>,
+    /// Every `repository@digest` resolving to this image.
+    pub repo_digests: Vec<String>,
+    /// Parent image ID; always empty (api-compat #41).
+    pub parent: String,
+    /// Always empty.
+    pub comment: String,
+    /// Creation time, RFC 3339 with nanoseconds; the zero time when the image
+    /// config carried none.
+    pub created: String,
+    /// Always empty.
+    pub author: String,
+    /// The runnable configuration.
+    pub config: ImageInspectConfig,
+    /// Architecture (`amd64`).
+    pub architecture: String,
+    /// Operating system (`freebsd`).
+    pub os: String,
+    /// Total size in bytes — the sum of the manifest's **compressed** layer
+    /// sizes, where Docker reports the uncompressed rootfs.
+    pub size: i64,
+    /// Deprecated alias of `Size`, kept for older clients.
+    pub virtual_size: i64,
+    /// Storage driver block; always the ZFS driver with no data.
+    pub graph_driver: ImageGraphDriver,
+    /// The rootfs layer list. Docker spells this `RootFS`, which `PascalCase`
+    /// would render `RootFs`, so it is renamed explicitly — the same class of
+    /// irregular spelling as `ImageID` and `OSType` elsewhere in this file.
+    #[serde(rename = "RootFS")]
+    pub root_fs: ImageRootFs,
+    /// Image platform, `os/arch` — **SatL extension**, as on the summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+}
+
+/// The `Config` block of an [`ImageInspectResponse`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageInspectConfig {
+    /// User the image asks to run as.
+    pub user: String,
+    /// Ports the image declares, as Docker's `{"80/tcp": {}}` set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exposed_ports: Option<BTreeMap<String, serde_json::Value>>,
+    /// `KEY=VALUE` environment entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<Vec<String>>,
+    /// Default command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<Vec<String>>,
+    /// Entrypoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+    /// Working directory.
+    pub working_dir: String,
+    /// Always `null`: the config parser does not read a `Labels` block, and an
+    /// empty map would claim the image declares none.
+    pub labels: Option<BTreeMap<String, String>>,
+}
+
+/// The `GraphDriver` block of an [`ImageInspectResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageGraphDriver {
+    /// Always `zfs` (invariant #5).
+    pub name: String,
+    /// Always `null`.
+    pub data: Option<BTreeMap<String, String>>,
+}
+
+impl Default for ImageGraphDriver {
+    fn default() -> Self {
+        Self {
+            name: "zfs".to_owned(),
+            data: None,
+        }
+    }
+}
+
+/// The `RootFS` block of an [`ImageInspectResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageRootFs {
+    /// Always `layers`.
+    #[serde(rename = "Type")]
+    pub kind: String,
+    /// The diff IDs, base first.
+    pub layers: Vec<String>,
+}
+
+impl Default for ImageRootFs {
+    fn default() -> Self {
+        Self {
+            kind: "layers".to_owned(),
+            layers: Vec::new(),
+        }
+    }
+}
+
 /// One line of a `POST /images/create` progress stream (Docker's
 /// `JSONMessage`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct JsonMessage {
     /// Human-readable status.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -918,7 +1032,7 @@ pub struct JsonMessage {
 }
 
 /// `progressDetail` of a [`JsonMessage`].
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
 pub struct JsonProgressDetail {
     /// Bytes transferred.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -929,14 +1043,14 @@ pub struct JsonProgressDetail {
 }
 
 /// `errorDetail` of a [`JsonMessage`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct JsonErrorDetail {
     /// Failure detail.
     pub message: String,
 }
 
 /// `POST /containers/{id}/exec` response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ExecCreateResponse {
     /// Exec instance ID.
@@ -946,7 +1060,7 @@ pub struct ExecCreateResponse {
 /// `GET /exec/{id}/json`.
 // Mirrors Docker's ExecInspect, which is likewise flag-heavy.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ExecInspectResponse {
     /// Exec instance ID.
@@ -977,7 +1091,7 @@ pub struct ExecInspectResponse {
 
 /// `ProcessConfig` of an exec inspect document (lower-case keys, as Docker
 /// serializes them).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProcessConfig {
     /// Whether a TTY was requested.
     pub tty: bool,
@@ -992,7 +1106,7 @@ pub struct ProcessConfig {
 }
 
 /// One volume, as served by create/inspect and inside a volume list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct VolumeResponse {
     /// Volume name.
@@ -1017,7 +1131,7 @@ pub struct VolumeResponse {
 /// `POST /networks/create`'s inspect-shaped siblings).
 // Docker's flags one-for-one; folding them into enums would break the shape.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NetworkResponse {
     /// Network name.
@@ -1062,7 +1176,7 @@ pub struct NetworkResponse {
 }
 
 /// `IPAM` of a network document, and the `IPAM` member of a create body.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct IpamWire {
     /// IPAM driver; SatL has one, `default`.
@@ -1076,7 +1190,7 @@ pub struct IpamWire {
 }
 
 /// One entry of `IPAM.Config`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct IpamConfigWire {
     /// Subnet in CIDR form.
@@ -1092,7 +1206,7 @@ pub struct IpamConfigWire {
 }
 
 /// `ConfigFrom` of a network document.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NetworkConfigFromWire {
     /// Name of the network the configuration comes from.
@@ -1100,7 +1214,7 @@ pub struct NetworkConfigFromWire {
 }
 
 /// One entry of a network document's `Containers` map.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NetworkContainerWire {
     /// Container (= task) name.
@@ -1120,7 +1234,7 @@ pub struct NetworkContainerWire {
 }
 
 /// `POST /networks/create` response.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct NetworkCreateResponse {
     /// The new network's ID.
@@ -1131,7 +1245,7 @@ pub struct NetworkCreateResponse {
 }
 
 /// `GET /volumes`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct VolumeListResponse {
     /// The volumes.
@@ -1141,7 +1255,7 @@ pub struct VolumeListResponse {
 }
 
 /// `POST /containers/prune` response.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ContainersPruneResponse {
     /// IDs of the containers removed.
@@ -1152,7 +1266,7 @@ pub struct ContainersPruneResponse {
 
 /// One entry of `ImagesDeleted`. Exactly one field is ever set, which is
 /// Docker's shape.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ImageDeleteResponseItem {
     /// A reference that stopped pointing at an image.
@@ -1168,7 +1282,7 @@ pub struct ImageDeleteResponseItem {
 /// `Deferred` is SatL's addition (api-compat 131): layer chains that looked
 /// unreferenced on this pass but had not on the previous one, so nothing was
 /// done to them. Docker has no equivalent because it has no two-pass rule.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ImagesPruneResponse {
     /// What was untagged and what was deleted.
@@ -1181,7 +1295,7 @@ pub struct ImagesPruneResponse {
 }
 
 /// `POST /networks/prune` response.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct NetworksPruneResponse {
     /// Names of the networks removed.
@@ -1189,7 +1303,7 @@ pub struct NetworksPruneResponse {
 }
 
 /// `POST /volumes/prune` response.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct VolumesPruneResponse {
     /// Names of the volumes removed.
@@ -1199,7 +1313,7 @@ pub struct VolumesPruneResponse {
 }
 
 /// One `GET /events` message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct EventResponse {
     /// Object kind (`container`, `image`, `volume`, `network`).
@@ -1221,7 +1335,7 @@ pub struct EventResponse {
 }
 
 /// `Actor` of an [`EventResponse`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct EventActorResponse {
     /// Object ID.
@@ -1243,7 +1357,7 @@ pub struct EventActorResponse {
 
 /// Object version envelope (`{"Index": 42}`), Docker's optimistic-concurrency
 /// token.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ObjectVersionWire {
     /// Store version of the object.
@@ -1251,7 +1365,7 @@ pub struct ObjectVersionWire {
 }
 
 /// `POST /swarm/init` body.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SwarmInitBody {
     /// Address the control plane binds (`0.0.0.0:2377`).
@@ -1277,7 +1391,7 @@ pub struct SwarmInitBody {
 }
 
 /// `POST /swarm/join` body.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SwarmJoinBody {
     /// Address the control plane binds.
@@ -1297,7 +1411,7 @@ pub struct SwarmJoinBody {
 /// `POST /swarm/update` body: the full cluster spec, as Docker's clients
 /// read-modify-write it. SatL accepts it and applies only the token rotations
 /// requested in the query string.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SwarmSpecBody {
     /// Cluster name (always `default` in SatL).
@@ -1313,7 +1427,7 @@ pub struct SwarmSpecBody {
 }
 
 /// `EncryptionConfig` of a cluster spec.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct EncryptionConfigWire {
     /// Whether manager keys are locked at rest.
@@ -1321,7 +1435,7 @@ pub struct EncryptionConfigWire {
 }
 
 /// `POST /swarm/unlock` body — the only call a locked manager answers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct UnlockKeyBody {
     /// The base64 unlock key.
@@ -1329,7 +1443,7 @@ pub struct UnlockKeyBody {
 }
 
 /// `GET /swarm/unlockkey` response.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct UnlockKeyResponse {
     /// The current unlock key, base64; empty while autolock is off.
@@ -1338,7 +1452,7 @@ pub struct UnlockKeyResponse {
 }
 
 /// `GET /swarm` — Docker's `Swarm` document.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SwarmResponse {
     /// Cluster object ID.
@@ -1368,7 +1482,7 @@ pub struct SwarmResponse {
 }
 
 /// `Spec` of a [`SwarmResponse`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SwarmSpecWire {
     /// Cluster name.
@@ -1391,7 +1505,7 @@ pub struct SwarmSpecWire {
 }
 
 /// `Orchestration` of a cluster spec.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct OrchestrationConfigWire {
     /// Terminated tasks kept per slot.
@@ -1399,7 +1513,7 @@ pub struct OrchestrationConfigWire {
 }
 
 /// `Raft` of a cluster spec.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct RaftConfigWire {
     /// Snapshot every this many applied entries.
@@ -1413,7 +1527,7 @@ pub struct RaftConfigWire {
 }
 
 /// `Dispatcher` of a cluster spec.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DispatcherConfigWire {
     /// Heartbeat period dictated to agents, in nanoseconds.
@@ -1421,7 +1535,7 @@ pub struct DispatcherConfigWire {
 }
 
 /// `CAConfig` of a cluster spec.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct CaConfigWire {
     /// Validity of issued node certificates, in nanoseconds.
@@ -1434,13 +1548,13 @@ pub struct CaConfigWire {
 
 /// `TaskDefaults` of a cluster spec — empty in v1 (SwarmKit's only member is
 /// the default log driver, which lands with the log broker).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TaskDefaultsWire {}
 
 /// Root CA material. SatL fills `TrustRoot` only — the issuer members are
 /// DER blobs SatL has no use for (deviation in `docs/api-compat.md`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TlsInfoWire {
     /// Root CA certificate, PEM-encoded.
@@ -1449,7 +1563,7 @@ pub struct TlsInfoWire {
 }
 
 /// The two join tokens.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct JoinTokensWire {
     /// Token that joins a node as a worker.
@@ -1463,7 +1577,7 @@ pub struct JoinTokensWire {
 // ---------------------------------------------------------------------------
 
 /// Docker's `Node` document (`GET /nodes`, `GET /nodes/{id}`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NodeResponse {
     /// Node ID.
@@ -1487,7 +1601,7 @@ pub struct NodeResponse {
 }
 
 /// `Spec` of a node — also the `POST /nodes/{id}/update` body.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NodeSpecWire {
     /// Operator-assigned name.
@@ -1502,7 +1616,7 @@ pub struct NodeSpecWire {
 }
 
 /// `Description` of a node.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NodeDescriptionWire {
     /// Kernel hostname.
@@ -1516,7 +1630,7 @@ pub struct NodeDescriptionWire {
 }
 
 /// An `os/arch` pair, in Docker's spelling.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct PlatformWire {
     /// CPU architecture (`amd64`, `arm64`).
@@ -1527,7 +1641,7 @@ pub struct PlatformWire {
 }
 
 /// Compute/memory quantities (node capacity, task limits and reservations).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ResourcesWire {
     /// CPU in billionths of a core.
@@ -1538,7 +1652,7 @@ pub struct ResourcesWire {
 }
 
 /// `Engine` of a node description.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct EngineDescriptionWire {
     /// `satld` version.
@@ -1550,7 +1664,7 @@ pub struct EngineDescriptionWire {
 }
 
 /// `Status` of a node.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NodeStatusWire {
     /// `unknown`, `down`, `ready` or `disconnected`.
@@ -1562,7 +1676,7 @@ pub struct NodeStatusWire {
 }
 
 /// `ManagerStatus` of a manager node.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ManagerStatusWire {
     /// Whether this member currently leads.
@@ -1578,7 +1692,7 @@ pub struct ManagerStatusWire {
 // ---------------------------------------------------------------------------
 
 /// Docker's `Service` document.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ServiceResponse {
     /// Service ID.
@@ -1608,7 +1722,7 @@ pub struct ServiceResponse {
 /// `ServiceStatus`: the numbers behind `satl service ls`' `REPLICAS` column.
 // The shared `Tasks` suffix is Docker's wire spelling, not a naming slip.
 #[allow(clippy::struct_field_names)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ServiceStatusWire {
     /// Tasks currently running.
@@ -1620,7 +1734,7 @@ pub struct ServiceStatusWire {
 }
 
 /// `UpdateStatus` of a service.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct UpdateStatusWire {
     /// `updating`, `paused`, `completed`, `rollback_started`, …
@@ -1637,7 +1751,7 @@ pub struct UpdateStatusWire {
 
 /// `POST /services/create` and `POST /services/{id}/update` body — also the
 /// `Spec` of a rendered service.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ServiceSpecWire {
     /// Service name.
@@ -1663,7 +1777,7 @@ pub struct ServiceSpecWire {
 }
 
 /// `TaskTemplate` of a service spec.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TaskTemplateWire {
     /// What runs inside the jail.
@@ -1693,7 +1807,7 @@ pub struct TaskTemplateWire {
 /// `ContainerSpec` of a task template.
 // Docker's container spec genuinely is a bag of independent flags.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ContainerSpecWire {
     /// Image reference.
@@ -1782,7 +1896,7 @@ fn is_zero_i64(value: &i64) -> bool {
 }
 
 /// One `Mounts` entry of a container spec.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct MountWire {
     /// `bind`, `volume` or `tmpfs`.
@@ -1810,7 +1924,7 @@ pub struct MountWire {
 }
 
 /// `Healthcheck` of a container spec.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct HealthcheckWire {
     /// Probe command (`["CMD", …]` or `["CMD-SHELL", …]`).
@@ -1826,7 +1940,7 @@ pub struct HealthcheckWire {
 }
 
 /// `DNSConfig` of a container spec.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DnsConfigWire {
     /// Nameserver addresses.
@@ -1841,7 +1955,7 @@ pub struct DnsConfigWire {
 }
 
 /// `Resources` of a task template.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ResourceRequirementsWire {
     /// Hard caps, enforced via rctl(8).
@@ -1853,7 +1967,7 @@ pub struct ResourceRequirementsWire {
 }
 
 /// `Limits` of a task template: [`ResourcesWire`] plus Docker's `Pids` cap.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct LimitWire {
     /// CPU in billionths of a core.
@@ -1868,7 +1982,7 @@ pub struct LimitWire {
 
 /// `RestartPolicy` of a task template (nanosecond durations, unlike the
 /// container `HostConfig.RestartPolicy`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TaskRestartPolicyWire {
     /// `none`, `on-failure` or `any`.
@@ -1882,7 +1996,7 @@ pub struct TaskRestartPolicyWire {
 }
 
 /// `Placement` of a task template.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct PlacementWire {
     /// Constraint expressions.
@@ -1900,7 +2014,7 @@ pub struct PlacementWire {
 }
 
 /// One `Placement.Preferences` entry. Only `Spread` is honoured.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct PlacementPreferenceWire {
     /// Spread across a descriptor's values.
@@ -1909,7 +2023,7 @@ pub struct PlacementPreferenceWire {
 }
 
 /// `Spread`: balance the service's tasks across this descriptor's values.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SpreadPreferenceWire {
     /// `node.id`, `node.hostname`, `node.labels.<key>` or `engine.labels.<key>`.
@@ -1917,7 +2031,7 @@ pub struct SpreadPreferenceWire {
 }
 
 /// One `Networks` entry of a task template.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NetworkAttachmentConfigWire {
     /// Network name or ID.
@@ -1928,7 +2042,7 @@ pub struct NetworkAttachmentConfigWire {
 }
 
 /// `Mode` of a service spec: exactly one member is set.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ServiceModeWire {
     /// A fixed number of replicas.
@@ -1946,7 +2060,7 @@ pub struct ServiceModeWire {
 }
 
 /// `Replicated` of a service mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ReplicatedModeWire {
     /// Desired replica count; `null` means 1 (Docker's default).
@@ -1955,7 +2069,7 @@ pub struct ReplicatedModeWire {
 }
 
 /// `ReplicatedJob` of a service mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ReplicatedJobModeWire {
     /// Upper bound on simultaneously live tasks; `null` means 1.
@@ -1967,12 +2081,12 @@ pub struct ReplicatedJobModeWire {
 }
 
 /// `Global` of a service mode — Docker's empty object.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct GlobalModeWire {}
 
 /// `UpdateConfig` / `RollbackConfig` of a service spec.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct UpdateConfigWire {
     /// Slots updated concurrently; 0 means unlimited.
@@ -1990,7 +2104,7 @@ pub struct UpdateConfigWire {
 }
 
 /// `EndpointSpec` of a service spec.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct EndpointSpecWire {
     /// `vip` (rejected) or `dnsrr`.
@@ -2002,7 +2116,7 @@ pub struct EndpointSpecWire {
 }
 
 /// Allocator-written `Endpoint` of a service.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct EndpointWire {
     /// The spec this endpoint was allocated from.
@@ -2016,7 +2130,7 @@ pub struct EndpointWire {
 }
 
 /// One published port.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct PortConfigWire {
     /// Optional user-facing name.
@@ -2033,7 +2147,7 @@ pub struct PortConfigWire {
 }
 
 /// `POST /services/create` response.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ServiceCreateResponse {
     /// The new service ID.
@@ -2044,7 +2158,7 @@ pub struct ServiceCreateResponse {
 }
 
 /// `POST /services/{id}/update` response.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ServiceUpdateResponse {
     /// Non-fatal notes.
@@ -2056,7 +2170,7 @@ pub struct ServiceUpdateResponse {
 // ---------------------------------------------------------------------------
 
 /// Docker's `Task` document.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TaskResponse {
     /// Task ID — also the jail name.
@@ -2092,7 +2206,7 @@ pub struct TaskResponse {
 }
 
 /// `Status` of a task.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TaskStatusWire {
     /// When this status was produced, RFC 3339 nanoseconds.
@@ -2112,7 +2226,7 @@ pub struct TaskStatusWire {
 }
 
 /// `ContainerStatus` of a task status.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TaskContainerStatusWire {
     /// The jail name — SatL's equivalent of Docker's container ID.
@@ -2126,7 +2240,7 @@ pub struct TaskContainerStatusWire {
 }
 
 /// `PortStatus` of a task status.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TaskPortStatusWire {
     /// Bound ports.
@@ -2135,7 +2249,7 @@ pub struct TaskPortStatusWire {
 }
 
 /// One allocated network attachment of a task.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NetworkAttachmentWire {
     /// The attached network.
@@ -2146,7 +2260,7 @@ pub struct NetworkAttachmentWire {
 }
 
 /// The `Network` member of a task's attachment — SatL fills the ID only.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct NetworkRefWire {
     /// Network ID.
@@ -2171,7 +2285,7 @@ pub struct NetworkRefWire {
 
 /// `SecretSpec`: the document `POST /secrets/create` takes and every secret
 /// response echoes back — minus `Data`, which is never rendered.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SecretSpecWire {
     /// Secret name (unique across the cluster).
@@ -2192,7 +2306,7 @@ pub struct SecretSpecWire {
 
 /// `ConfigSpec`: like [`SecretSpecWire`] without `Driver` — Docker's config
 /// object has `Templating` but no driver plugins.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ConfigSpecWire {
     /// Config name (unique across the cluster).
@@ -2209,7 +2323,7 @@ pub struct ConfigSpecWire {
 }
 
 /// Docker's `Secret` document (`GET /secrets`, `GET /secrets/{id}`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SecretResponse {
     /// Secret ID.
@@ -2226,7 +2340,7 @@ pub struct SecretResponse {
 }
 
 /// Docker's `Config` document (`GET /configs`, `GET /configs/{id}`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ConfigResponse {
     /// Config ID.
@@ -2244,7 +2358,7 @@ pub struct ConfigResponse {
 
 /// Docker's `IDResponse`: the answer to `POST /secrets/create` and `POST
 /// /configs/create`. Spelled `ID`, like [`ServiceCreateResponse`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct IdResponse {
     /// The new object's ID.
@@ -2253,7 +2367,7 @@ pub struct IdResponse {
 }
 
 /// One `Secrets` entry of a container spec.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SecretReferenceWire {
     /// Where and how the payload is materialized. Docker's CLI omits it on
@@ -2269,7 +2383,7 @@ pub struct SecretReferenceWire {
 }
 
 /// One `Configs` entry of a container spec.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ConfigReferenceWire {
     /// Where and how the payload is materialized.
@@ -2287,7 +2401,7 @@ pub struct ConfigReferenceWire {
 ///
 /// `Mode` is a Go `os.FileMode`, i.e. a **decimal** integer on the wire: the
 /// default `0o444` is sent and rendered as `292`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct FileTargetWire {
     /// File name, relative for a secret (under `/run/secrets`), absolute or

@@ -622,6 +622,53 @@ pub struct ImageSummary {
     pub platform: Option<Platform>,
 }
 
+/// One image's full inspect document (`GET /images/{name}/json`).
+///
+/// Aggregated by image ID, unlike [`ImageSummary`]: the store is keyed by
+/// reference, so two tags of one image are two summaries sharing an `id` but
+/// exactly one of these, listing both under `repo_tags` (api-compat 160).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageInspect {
+    /// Image ID (`sha256:…`) — SatL's is the manifest digest.
+    pub id: String,
+    /// Every `repository:tag` resolving to this image.
+    pub repo_tags: Vec<String>,
+    /// Every `repository@digest` resolving to this image.
+    pub repo_digests: Vec<String>,
+    /// Creation timestamp from the image config, when the builder set one.
+    pub created: Option<SystemTime>,
+    /// Total size in bytes: the sum of the manifest's compressed layer sizes,
+    /// the same figure [`ImageSummary::size`] reports.
+    pub size: i64,
+    /// The runnable configuration the image carries.
+    pub config: ImageConfigDoc,
+    /// The rootfs diff IDs, base first.
+    pub rootfs_layers: Vec<String>,
+    /// Image platform — a SatL extension, as on the summary.
+    pub platform: Option<Platform>,
+}
+
+/// The `Config` block of an [`ImageInspect`].
+///
+/// `Labels` is deliberately absent: the image config parser does not read a
+/// `Labels` block, so there is nothing to report and inventing an empty map
+/// would claim the image has none (api-compat 15, 160).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageConfigDoc {
+    /// `KEY=VALUE` environment entries.
+    pub env: Vec<String>,
+    /// Entrypoint, if the image sets one.
+    pub entrypoint: Vec<String>,
+    /// Default command, if the image sets one.
+    pub cmd: Vec<String>,
+    /// Working directory.
+    pub working_dir: String,
+    /// User the image asks to run as.
+    pub user: String,
+    /// Ports the image declares, as `port/proto` strings.
+    pub exposed_ports: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Exec
 // ---------------------------------------------------------------------------
