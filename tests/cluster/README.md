@@ -19,10 +19,10 @@ Re-created a VM? Edit that file, nothing else.
 | | |
 |---|---|
 | public NIC | `vtnet0`, public IP — SSH from the dev host, container egress NAT |
-| private NIC | `vtnet1`, **10.2.0.0/16** — the cluster underlay |
+| private NIC | `vtnet1`, **10.0.0.0/24** — the cluster underlay |
 
 **The private-network assumption:** Raft, the dispatcher and (from M3) the
-VXLAN overlay run over 10.2.0.0/16, never over the public addresses. `run.sh`
+VXLAN overlay run over 10.0.0.0/24, never over the public addresses. `run.sh`
 proves it every run by pinging each node's peers from each node. The dev host
 (alpha) is *not* on that network — it reaches the VMs over SSH on their public
 addresses only, which is why images get to the VMs the way they do (below).
@@ -108,15 +108,19 @@ The integration images live in the dev host's registry on `127.0.0.1:5000`:
 unauthenticated, plain HTTP, loopback only, by design
 (`docs/image-sources.md` §2). The VMs cannot reach it.
 
-Measured, not assumed (2026-08-10):
+Measured, not assumed (2026-08-10; re-measured 2026-08-19 on the replacement
+VMs, where all three still hold):
 
-- alpha has **no address on 10.2.0.0/16** — its second NIC (`ice1`) is up but
+- alpha has **no address on 10.0.0.0/24** — its second NIC (`ice1`) is up but
   carries no IPv4 — so "bind the existing registry on the private interface",
-  the cheapest option on paper, is not available at all;
+  the cheapest option on paper, is not available at all. Pinging a node's
+  underlay address from alpha loses 100% of packets; that is the check to
+  re-run, rather than trusting this sentence;
 - the VMs *can* reach alpha's public IP, but publishing an unauthenticated
   read-write registry on a public address is not something a test harness gets
   to do;
-- the VMs reach each other over the underlay at sub-millisecond latency.
+- the VMs reach each other over the underlay at sub-millisecond latency
+  (0.76 ms and 0.86 ms average over 30 packets, no loss).
 
 **Chosen: one loopback-only registry per VM, seeded from the dev host over an
 `ssh -R` reverse tunnel** (`images.sh`). Each node runs the same
