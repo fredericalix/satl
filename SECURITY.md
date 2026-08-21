@@ -8,7 +8,7 @@ worth reporting, and this page says where to send them.
 ## Reporting a vulnerability
 
 **Email `security@satl.cc`.** Please do not open a public issue, a discussion or a
-pull request for anything security-relevant until a fix is available — a patch on
+pull request for anything security-relevant until a fix is available, a patch on
 a public branch is a disclosure.
 
 Reports in English or French are both fine. What helps most, in rough order:
@@ -19,7 +19,7 @@ Reports in English or French are both fine. What helps most, in rough order:
 - the relevant part of `satld.toml`, with secrets stripped;
 - what an attacker needs to start with (a jail on the cluster? the `satl` unix
   group? the underlay network? a valid join token?) and what they end up with;
-- a reproduction, even a rough one, and the log lines around it — `grep -a` on
+- a reproduction, even a rough one, and the log lines around it, `grep -a` on
   `/var/log/messages`, since a single non-ASCII byte makes plain `grep` silently
   print nothing.
 
@@ -39,15 +39,15 @@ service-level agreement:
 
 You will be credited in the advisory and in `CHANGELOG.md` unless you would
 rather not be. If the report turns out to describe one of the deliberate design
-choices listed below, you will get the reasoning rather than a patch — and if the
+choices listed below, you will get the reasoning rather than a patch, and if the
 reasoning does not hold up, that is a finding too.
 
 ## Supported versions
 
 | Version | Supported |
 | --- | --- |
-| `v0.1.0-beta` (tip of `main`) | Yes — fixes land on `main` |
-| Any earlier build from `main` | No — rebuild from the tip |
+| `v0.1.0-beta` (tip of `main`) | Yes, fixes land on `main` |
+| Any earlier build from `main` | No, rebuild from the tip |
 
 There are no maintenance branches and no backports: the fix for a reported issue
 goes to the tip of `main` and into the next tag. Upgrading means rebuilding, or
@@ -60,7 +60,7 @@ run untrusted or hostile multi-tenant workloads on it.
 
 ## Scope
 
-In scope — the daemon (`satld`) and the CLI (`satl`) in this repository:
+In scope, the daemon (`satld`) and the CLI (`satl`) in this repository:
 
 - the cluster CA, node identity, certificate issuance, renewal, root rotation and
   the removed-node blacklist;
@@ -78,17 +78,17 @@ In scope — the daemon (`satld`) and the CLI (`satl`) in this repository:
 - the OCI bundle and jail/VNET configuration SatL produces, where the bug is in
   what SatL configured.
 
-Out of scope here — report these to their own maintainers:
+Out of scope here, report these to their own maintainers:
 
 - the FreeBSD base system, its kernel, jail, pf, ZFS and the linuxulator;
-- `ocijail` itself — SatL never implements a runtime, it drives one;
+- `ocijail` itself, SatL never implements a runtime, it drives one;
 - container images built or pulled by a user, and what runs inside them;
 - the deliberate design choices below.
 
 ## Deliberate design choices, not vulnerabilities
 
 Each of these looks like a finding and is not. If you disagree with the
-reasoning, that argument is welcome — send it to the same address.
+reasoning, that argument is welcome, send it to the same address.
 
 - **Port 2378 is unauthenticated.** A node that has never joined has no
   certificate, so the bootstrap listener cannot require one. It serves the root
@@ -104,7 +104,7 @@ reasoning, that argument is welcome — send it to the same address.
   loading pf anchors and manipulating ZFS all require it.
 - **`/metrics` is unauthenticated.** It is off by default and binds only where
   the operator points it, matching dockerd's posture for the same endpoint. It
-  exposes node, task and certificate-expiry series — do not put it on a public
+  exposes node, task and certificate-expiry series, do not put it on a public
   interface.
 - **Published ports are not reachable from the publishing host through
   `localhost`.** A pf property: the redirect applies to traffic arriving on an
@@ -129,7 +129,7 @@ project's architecture document, section 12.
 - **Joining.** Token format `SATL-1-<digest>-<secret>`: the digest is a base36
   SHA-256 of the root CA bundle and pins it against a first-contact MITM; the
   secret is 16 random bytes, compared in constant time. There are two tokens, and
-  the one used decides the role. The CA controls the subject and SANs — only the
+  the one used decides the role. The CA controls the subject and SANs, only the
   public key comes from the CSR.
 - **Certificate lifecycle.** 90-day leaves, renewed at a random point between 50%
   and 80% of their life. Renewal is live across every TLS surface. Root rotation
@@ -145,7 +145,7 @@ project's architecture document, section 12.
   and `POST /swarm/unlock`.
 - **Secrets on workers.** Payloads arrive over the mTLS dispatcher stream, live in
   agent memory, and are written into a per-task tmpfs sized to the payloads inside
-  the jail — gone when the jail dies. The agent's local task database stores
+  the jail, gone when the jail dies. The agent's local task database stores
   references, never payloads. Error messages and logs name the object, never its
   contents.
 - **Overlay data plane.** An `encrypted` overlay wraps its VXLAN datagrams in

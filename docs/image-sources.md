@@ -6,8 +6,8 @@ images for tests come from?*
 **Decision:** use the FreeBSD project's official OCI images from Docker Hub
 (`docker.io/freebsd/*`), mirrored into a **local, loopback-only registry** on
 the dev machine, plus one locally built `freebsd-nginx` image on top of
-`freebsd-runtime`. Integration tests reference `127.0.0.1:5000` only — never
-Docker Hub — so they are immune to Hub outages, rate limits, and upstream tag
+`freebsd-runtime`. Integration tests reference `127.0.0.1:5000` only, never
+Docker Hub, so they are immune to Hub outages, rate limits, and upstream tag
 churn.
 
 Surveyed / seeded on 2026-08-09 on the FreeBSD 15.1-RELEASE-p2 dev host.
@@ -25,16 +25,16 @@ repositories are):
 | `freebsd/freebsd-dynamic` | Minimal image for dynamically linked binaries (clibs only) | `15.1`, `14.3`, … |
 | `freebsd/freebsd-notoolchain` | Larger userland without compiler | `15.1`, … |
 | `freebsd/freebsd-toolchain` | Userland + toolchain (big) | `15.1`, … |
-| `freebsd/freebsd` | Empty placeholder, **no tags** | — |
+| `freebsd/freebsd` | Empty placeholder, **no tags** | - |
 
-**Chosen tag: `freebsd-runtime:15.1`** — exact userland match for our 15.1
-hosts. (A 14.x userland in a jail on a 15.1 kernel is also supported — older
-userland on a newer kernel is the supported direction — so `14.3` is a valid
+**Chosen tag: `freebsd-runtime:15.1`**, exact userland match for our 15.1
+hosts. (A 14.x userland in a jail on a 15.1 kernel is also supported, older
+userland on a newer kernel is the supported direction, so `14.3` is a valid
 fallback and useful for version-skew testing, but with `15.1` published there
 is no reason to default to it.)
 
-Digests as observed 2026-08-09 (upstream tags are mutable — rebuilt for patch
-releases — so these pin what we mirrored, they are not eternal):
+Digests as observed 2026-08-09 (upstream tags are mutable, rebuilt for patch
+releases, so these pin what we mirrored, they are not eternal):
 
 ```
 docker.io/freebsd/freebsd-runtime:15.1
@@ -55,7 +55,7 @@ docker.io/library/debian:stable-slim   (linux/amd64 + 7 other platforms)
 ```
 
 Notes:
-- `platform."os.version"` is **not set** in the freebsd indexes or configs —
+- `platform."os.version"` is **not set** in the freebsd indexes or configs,
   platform selection can only match on `os`/`architecture`.
 - The freebsd images are plain two-entry OCI indexes; alpine/debian indexes
   also carry `unknown/unknown` attestation manifests (kept by our mirror since
@@ -72,13 +72,13 @@ copying. Quirks of the FreeBSD package worth knowing:
   reports "registry is running".
 - Config knob: `docker_registry_config`, default
   `/usr/local/etc/docker-registry/config.yml` (a `.sample` ships with
-  htpasswd auth enabled — we do not use it).
+  htpasswd auth enabled, we do not use it).
 - Log: `docker_registry_logfile`, default `/var/log/docker-registry.log`.
   Runs under daemon(8), pidfile `/var/run/docker-registry.pid`.
 
 Our `/usr/local/etc/docker-registry/config.yml`: listens on
 **`127.0.0.1:5000`** (loopback only), filesystem storage rooted at
-**`/var/db/satl-test-registry`** (deliberately *not* under `zroot/satl` —
+**`/var/db/satl-test-registry`** (deliberately *not* under `zroot/satl`,
 this is test infrastructure, not satld state), blob deletion enabled, **no
 auth, no TLS**. Because it is plain HTTP, every skopeo command against it
 needs `--src-tls-verify=false` / `--dest-tls-verify=false`, and satld/tests
@@ -106,7 +106,7 @@ sudo service docker_registry start
 ## 3. Seeding (mirror upstream → local)
 
 `skopeo copy --all` copies the *entire* index (all platforms + attestation
-manifests), so the local top-level digest is byte-identical to upstream —
+manifests), so the local top-level digest is byte-identical to upstream,
 verified for all three mirrored images.
 
 ```sh
@@ -143,7 +143,7 @@ with hand-built OCI config/manifest (os=freebsd, architecture=amd64,
 Findings / quirks (learned once, don't relearn):
 
 - **`pkg --rootdir` just works** with the host's pkg (2.7.5): no need to copy
-  `/usr/share/keys` into the rootfs, no `-o REPOS_DIR` — host repo config and
+  `/usr/share/keys` into the rootfs, no `-o REPOS_DIR`, host repo config and
   trust anchors are used; `-o ABI=` pins the target ABI. It resolves deps
   (pcre2) and reuses the `www` user already present in the base image's
   `/etc/passwd`. First run needs network to the FreeBSD pkg mirror; repo
@@ -162,7 +162,7 @@ Findings / quirks (learned once, don't relearn):
   `chflags -R noschg`. Relevant to satl-storage too whenever it removes
   unpacked files with rm (`zfs destroy` of a clone is unaffected).
 - **Not bit-reproducible:** the layer embeds a build timestamp and floating
-  package versions (nginx 1.30.4, pcre2 10.47 at time of writing) —
+  package versions (nginx 1.30.4, pcre2 10.47 at time of writing),
   reference this image **by tag**, never by pinned digest.
 
 Env overrides: `SATL_TEST_REGISTRY`, `SATL_BASE_REF`, `SATL_DEST_REF`,
@@ -175,17 +175,17 @@ Env overrides: `SATL_TEST_REGISTRY`, `SATL_BASE_REF`, `SATL_DEST_REF`,
 | `127.0.0.1:5000/satl-test/freebsd-runtime:15.1` | freebsd/amd64, freebsd/arm64 (index) | base FreeBSD image; manifest-list platform selection; `satl run … /bin/sh` |
 | `127.0.0.1:5000/satl-test/freebsd-nginx:latest` | freebsd/amd64 (single manifest) | M1 DoD: `satl run -d -p 8080:80 …` then `curl` → body `satl-test-ok` |
 | `127.0.0.1:5000/satl-test/alpine:latest` | linux/amd64 + others (index) | linuxulator; linux/amd64 fallback selection from a manifest list |
-| `127.0.0.1:5000/satl-test/debian:stable-slim` | linux/amd64 + others (index) | linuxulator, glibc-based (alpine is musl — exercise both) |
+| `127.0.0.1:5000/satl-test/debian:stable-slim` | linux/amd64 + others (index) | linuxulator, glibc-based (alpine is musl, exercise both) |
 
 Scope: this covers the single-node dev machine. The three OVH cluster VMs
-(`tests/cluster/inventory.toml`) will need the same seeding — same packages,
-same steps — when M3 cluster tests start pulling images; that wiring is out of
+(`tests/cluster/inventory.toml`) will need the same seeding, same packages,
+same steps, when M3 cluster tests start pulling images; that wiring is out of
 scope here.
 
 ## 6. `satl build` (M6f): images without the hand-written scripts
 
 The `hack/images/build-*.sh` scripts are replaced by `satl build`, which reads
-a `Satlfile` — the pkg-shaped subset of Dockerfile verbs:
+a `Satlfile`, the pkg-shaped subset of Dockerfile verbs:
 
 ```text
 FROM 127.0.0.1:5000/satl-test/freebsd-runtime:15.1
@@ -195,17 +195,17 @@ ENTRYPOINT ["/usr/local/bin/postgres", "-D", "/var/db/postgres/data"]
 ```
 
 `FROM` (one, mandatory), `PKG`, `COPY`, `RUN`, `ENV`, `LABEL`, `WORKDIR`,
-`EXPOSE`, `ENTRYPOINT`/`CMD` (JSON exec form only — the shell form would
+`EXPOSE`, `ENTRYPOINT`/`CMD` (JSON exec form only, the shell form would
 promise a shell the image may not have).
 
 `COPY` and `RUN` arrived in M7b, with two deliberate shapes:
 
-- the **build context is the Satlfile's own directory** — no positional
+- the **build context is the Satlfile's own directory**, no positional
   `PATH` argument. Sources are context-relative; `..`, absolute paths and
   symlink escapes are refused, and a directory source copies its *contents*,
   as Docker's COPY does. A relative destination resolves against `WORKDIR`.
 - **`RUN` executes in a `chroot` of the assembled rootfs**, on the build
-  host's kernel — `/bin/sh -c` with the Satlfile's `ENV` and `WORKDIR`, and
+  host's kernel, `/bin/sh -c` with the Satlfile's `ENV` and `WORKDIR`, and
   the host's `resolv.conf` if the image has none (the controller rewrites it
   per container at start anyway). Build on the FreeBSD major you deploy.
 
@@ -219,26 +219,26 @@ rootfs (`satl-storage`'s unpacker, diff IDs verified), `chflags -R noschg`
 (the base layer carries schg flags), `pkg -o ABI=... --rootdir install`,
 drop the pkg residue (repo catalogs and cache; `local.sqlite` stays so
 `pkg info` works), bake `/var/run/ld-elf.so.hints` with `chroot ldconfig`
-(no rc in a jail — without the hints, pkg-installed binaries die on missing
+(no rc in a jail, without the hints, pkg-installed binaries die on missing
 shared objects), run the COPY/RUN steps, and repack.
 
 Since M8b the repack is **multi-layer with an incremental cache**: the image
 is the base's layers plus one layer per mutating step (the PKG group, each
 COPY, each RUN), diffed from the rootfs between steps with OCI whiteouts
 for deletions. Each step's layer is content-addressed in
-`/var/db/satl/build-cache/` — key = the parent chain ID plus the step's
+`/var/db/satl/build-cache/`, key = the parent chain ID plus the step's
 inputs (sorted packages, COPY source content hashes, the RUN command and
-env) — so a rebuild with no changed input executes nothing at all, and a
+env), so a rebuild with no changed input executes nothing at all, and a
 changed file only re-runs the steps *after* it. A cache hit still applies
 the cached layer to the rootfs (a later miss needs the real tree), and the
 unpacker verifies its diff ID, so a corrupt blob is a loud error, not a
 poisoned image. `--no-cache` disables it; `--cache-dir` relocates it. The
 cache's honesty caveat is Docker's own: a step's outputs are assumed to
-depend only on its inputs — a `RUN` that reads the network is cached on
+depend only on its inputs, a `RUN` that reads the network is cached on
 the command string, and `--no-cache` is how you say "not this time".
 
 M8c adds **`FROM scratch` and multi-stage builds**. `FROM scratch` is the
-empty base — the image is exactly its step layers, nothing else. Several
+empty base, the image is exactly its step layers, nothing else. Several
 `FROM` lines define several stages, named with `AS`:
 
 ```text
@@ -253,13 +253,13 @@ ENTRYPOINT ["/usr/local/bin/out"]
 ```
 
 Every stage builds fully (a failure in any stage fails the build), and only
-the last one is repacked — which is the whole point: the toolchain stays in
+the last one is repacked, which is the whole point: the toolchain stays in
 the builder stage. `COPY --from=<stage>` reads the earlier stage's finished
 rootfs, by alias or by index (`--from=0`), case-insensitive; `..` and
 symlink escapes are refused the same as context sources, a directory copies
 its contents, and a cross-stage copy is cache-keyed on the copied content,
 so a changed builder output invalidates the final stage. Copying out of an
-*image* (`COPY --from=registry/x:1`) is refused plainly — name or index a
+*image* (`COPY --from=registry/x:1`) is refused plainly, name or index a
 stage instead.
 
 ```sh
@@ -269,11 +269,11 @@ sudo satl build -t 127.0.0.1:5000/satl-test/freebsd-postgres:latest
 Notes:
 
 - it runs **on the daemon's host**, client-side, against the local content
-  store (`--store` to point elsewhere) — and it needs root (pkg's rootdir,
+  store (`--store` to point elsewhere), and it needs root (pkg's rootdir,
   the ldconfig chroot, the store itself);
 - the image lands in *that node's* store. For several nodes, build on each,
   or tag the result for a shared registry and push it (`satl tag` +
-  `satl push` — pushing needs the reference to name the target registry),
+  `satl push`, pushing needs the reference to name the target registry),
   then pull normally on the other nodes;
 - this is not Docker's `POST /build`: a Satlfile is not a Dockerfile and
   the build does not happen in the daemon (docs/api-compat.md).

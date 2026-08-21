@@ -1,4 +1,4 @@
-# ocijail 0.6.0 — ground truth for `satl-runtime`
+# ocijail 0.6.0, ground truth for `satl-runtime`
 
 Resolves `docs/architecture.md` §17 open question #3 (exact ocijail jail
 parameters / OCI FreeBSD platform spec fields).
@@ -16,8 +16,8 @@ Executive summary:
 
 - **config.json contract**: ocijail consumes `ociVersion`, `process`
   (terminal/user/args/env/cwd), `root.path|readonly`, `mounts`, `hostname`,
-  `hooks`, `annotations`. Everything else — including the entire `linux`
-  section and any `os`/`platform` field — is silently ignored. There is **no
+  `hooks`, `annotations`. Everything else, including the entire `linux`
+  section and any `os`/`platform` field, is silently ignored. There is **no
   `freebsd` platform section**; all FreeBSD knobs are annotations.
 - **VNET**: request with annotation `"org.freebsd.jail.vnet": "new"`. ocijail
   only creates the isolated stack; satl-net creates the epair and pushes one
@@ -52,7 +52,7 @@ Executive summary:
   <root>/<id>/readonly_root # only when root.readonly=true (nullfs ro alias)
   ```
 
-  `state.json` is an implementation detail — parse only the `state`
+  `state.json` is an implementation detail, parse only the `state`
   subcommand's stdout.
 
 ### 1.2 Status model
@@ -70,27 +70,27 @@ Executive summary:
 ### 1.3 `create` mechanics (create.cpp:97-606)
 
 `ocijail --root R create -b <bundle> [--pid-file P] [--console-socket S]
-[--preserve-fds N] <id>` — `<id>` is also the **jail name**, so it must be a
+[--preserve-fds N] <id>`, `<id>` is also the **jail name**, so it must be a
 valid jail name (SatL generates safe ids; avoid dots, which mean jail
 hierarchy).
 
 1. Rejects duplicate id (`container <id> exists`).
 2. Parses/validates config.json, builds the jail parameter set (§2.4).
-3. Creates the state dir, performs **all mounts** (§2.3) — mounts exist from
+3. Creates the state dir, performs **all mounts** (§2.3), mounts exist from
    `create` time, not `start`.
-4. Creates the jail via **jail_set(2)** directly (`jail.cpp:35-44`) — not
+4. Creates the jail via **jail_set(2)** directly (`jail.cpp:35-44`), not
    jail(8).
 5. Creates the `start_wait` fifo, then **forks**. The child is the future
    container process: it performs the console-socket handoff (tty case) or
    `setsid()` (non-tty), chdirs to the rootfs, runs `createContainer` hooks,
    **jail_attach(2)**es, and validates that `process.args[0]` exists and is
-   executable (absolute path, `$PATH` from `process.env`, or cwd-relative —
+   executable (absolute path, `$PATH` from `process.env`, or cwd-relative,
    `process.cpp:165-206`). It then blocks reading the fifo.
 6. The parent writes `--pid-file`, saves state (pid + jid), runs
    `createRuntime` hooks, waits for the child's validation verdict over a
    socketpair and exits with it. On validation failure everything is rolled
    back: jail removed, mounts unmounted, state deleted (`create.cpp:509-524`,
-   proven in capture 06 §2 — no leaks).
+   proven in capture 06 §2, no leaks).
 
 The reported container pid (`--pid-file`, `state`) is that forked child; it is
 reparented to pid 1 once `ocijail create` exits (capture 01: `PPID 1`).
@@ -100,7 +100,7 @@ reparented to pid 1 once `ocijail create` exits (capture 01: `PPID 1`).
 Requires `status == created` (else
 `start: container not in "created" state (currently "...")`). Runs `prestart`
 hooks, writes one byte to the fifo, runs `poststart` hooks, returns
-immediately — it does **not** wait for the exec. In the container the child
+immediately, it does **not** wait for the exec. In the container the child
 runs `startContainer` hooks inside the jail, then `execvp`s the workload with
 the fds described in §3. Same pid before and after (capture 01).
 
@@ -128,10 +128,10 @@ NOTE_EXIT watch at create time, from `--pid-file`.
 - No exit code, no timestamps.
 
 `list -f json` prints `[{"bundle":…,"id":…,"pid":…,"status":…}]` (pid 0 when
-stopped); no annotations, and **no trailing newline** — `list.cpp` ends with a
+stopped); no annotations, and **no trailing newline**, `list.cpp` ends with a
 bare `std::cout << res`.
 
-**An empty state db prints the JSON literal `null`, not `[]`** — four bytes,
+**An empty state db prints the JSON literal `null`, not `[]`**, four bytes,
 exit 0 (measured on 0.6.0). `list::run` default-constructs `json res`, which is
 of type *null* until the first `push_back` makes it an array, and prints it
 however it stands. Two distinct cases produce it: a state root that exists and
@@ -141,13 +141,13 @@ that does **not** exist is different again: `fs::directory_iterator` throws, so
 the command *fails* with `filesystem error: in
 directory_iterator::directory_iterator(...): No such file or directory` on
 stderr. So "no containers" has two shapes, one of them an error exit, and
-neither is a real failure — `satl_runtime::Ocijail::list` maps both to an empty
+neither is a real failure, `satl_runtime::Ocijail::list` maps both to an empty
 list (fixtures `ocijail_list_empty.json` and `ocijail_err_list_no_statedb.txt`).
 Treating the `null` as a parse error is what put a false ERROR in
 `/var/log/messages` on every clean startup.
 
 `features` prints hooks + mount options and claims
-`ociVersionMax 1.2.0` (`features.cpp:75`) even though `create` accepts 1.3.x —
+`ociVersionMax 1.2.0` (`features.cpp:75`) even though `create` accepts 1.3.x,
 don't gate on `features`.
 
 ### 1.6 Exit-code retrieval (satl-agent `wait`)
@@ -172,7 +172,7 @@ exited and only `status=stopped` (no code) is recoverable. Polling
 | `ociVersion` | required; `1.0.x`–`1.3.x`, `-rc.N`/`-dev` suffixes ok (`create.cpp:119-130`) |
 | `process` | required object (`create.cpp:132`, `process.cpp:19-132`) |
 | `process.terminal` | bool, default false; governs §3 |
-| `process.user` | optional; `uid`+`gid` required numbers when present (default 0/0); `additionalGids` array; **`umask` is parsed but never applied** — dead assignment after throw (`process.cpp:70-73`), effective umask is always 077 (`process.h:76`) |
+| `process.user` | optional; `uid`+`gid` required numbers when present (default 0/0); `additionalGids` array; **`umask` is parsed but never applied**, dead assignment after throw (`process.cpp:70-73`), effective umask is always 077 (`process.h:76`) |
 | `process.args` | required non-empty array of strings; `args[0]` resolution per §1.3 |
 | `process.env` | optional array `"K=V"`; `HOME` forced to `/` if unset/empty (`process.cpp:268-272`); `PATH` used for args[0] lookup |
 | `process.cwd` | **required** string; chdir inside the jail before exec |
@@ -180,10 +180,10 @@ exited and only `status=stopped` (no code) is recoverable. Polling
 | `root.readonly` | optional; remounts the rootfs read-only via a nullfs alias under the state dir (`create.cpp:425-442`) |
 | `mounts` | optional array, §2.3 |
 | `hostname` | optional; sets `host=new` + `host.hostname`; absent ⇒ `host=inherit` (`create.cpp:394-399`) |
-| `hooks` | `prestart`, `createRuntime`, `createContainer`, `startContainer`, `poststart`, `poststop` (`create.cpp:199-212`); state JSON on hook stdin; `path` must be absolute (execve, no PATH — `hook.cpp:165-166`); `timeout` parsed but **not enforced** (`hook.cpp:144`) |
+| `hooks` | `prestart`, `createRuntime`, `createContainer`, `startContainer`, `poststart`, `poststop` (`create.cpp:199-212`); state JSON on hook stdin; `path` must be absolute (execve, no PATH, `hook.cpp:165-166`); `timeout` parsed but **not enforced** (`hook.cpp:144`) |
 | `annotations` | echoed into `state`; FreeBSD extensions per §2.2 |
 
-### 2.2 FreeBSD extensions — annotations only
+### 2.2 FreeBSD extensions, annotations only
 
 There is **no `freebsd` platform section** and no `os`/`platform` check
 anywhere in the source. The only platform knobs are annotations
@@ -203,7 +203,7 @@ does nothing else. satl-net must: `ifconfig epair create`, `ifconfig epairXb
 vnet <jail-name-or-jid>`, configure addresses either from the host via
 `ifconfig -j <jail> …` or via an in-container process. Verified: ping across
 the epair works; **when the jail is removed the in-jail end returns to the
-host vnet automatically** (capture 05) — reconciliation can find and destroy
+host vnet automatically** (capture 05), reconciliation can find and destroy
 returned `epairXb` orphans by name.
 
 ### 2.3 Mounts (mount.cpp)
@@ -213,10 +213,10 @@ Shape: `{"destination": "<abs path in container>", "type": "<fstype>",
 
 - `type` defaults to `nullfs`; `"bind"` is aliased to `nullfs`
   (`mount.cpp:362-367`). `source` is the nullfs target. Everything goes
-  through nmount(2) **from the host at create time** — in-jail mount
+  through nmount(2) **from the host at create time**, in-jail mount
   permissions (`allow.mount.*`) are irrelevant.
 - Proven fstypes (capture 01): `nullfs` (with `ro`), `tmpfs` (with
-  `size=1m` — perfect for the secrets tmpfs, invariant #7), `devfs` (with
+  `size=1m`, perfect for the secrets tmpfs, invariant #7), `devfs` (with
   `ruleset=4`; `ls /dev` shows the jail-safe device set). linprocfs/linsysfs
   work the same way (see `hack/experiments/linuxulator/`).
 - `destination` is resolved inside the rootfs with symlink-escape protection
@@ -245,7 +245,7 @@ capture 01:
 | Param | Value |
 |---|---|
 | `name` | `<id>` (or `<parent>.<id>`) |
-| `persist` | set — the jail outlives its processes until `delete` |
+| `persist` | set, the jail outlives its processes until `delete` |
 | `enforce_statfs` | `1` |
 | `allow.raw_sockets` | true (ping works by default) |
 | `allow.chflags` | true (unless a parentJail has it off) |
@@ -253,12 +253,12 @@ capture 01:
 | `host` | `new` + `host.hostname` when config has `hostname`, else `inherit` |
 | network | `vnet=new` **or** `ip4=inherit`,`ip6=inherit` (+ `ip4.addr`/`ip6.addr` lists) |
 
-Not set (kernel defaults apply — capture 01): `devfs_ruleset=0` (device
+Not set (kernel defaults apply, capture 01): `devfs_ruleset=0` (device
 visibility comes from the devfs **mount's** `ruleset=` option, not the jail
 param), `children.max=0` (no nested jails), all `allow.mount.*` off,
 `sysv*=disable`, no rctl/racct coupling, no `linux.*` params. There is **no
 way to set arbitrary jail parameters** through ocijail 0.6.0 beyond the
-whitelisted `allow.*` annotations — if SatL ever needs e.g. `linux.osname` or
+whitelisted `allow.*` annotations, if SatL ever needs e.g. `linux.osname` or
 `devfs_ruleset`, that requires an ocijail patch or `jail_set(JAIL_UPDATE)`
 after create (avoid: invariant #6 says drive the runtime, and out-of-band
 tampering fights its state model).
@@ -274,7 +274,7 @@ therefore enforce its own resource limits (rctl) and must not assume any
 seccomp/capability semantics.
 
 **Rejected** (`malformed_config`, exit 1): structural violations of the
-consumed fields — missing `process`, missing `process.cwd`, empty
+consumed fields, missing `process`, missing `process.cwd`, empty
 `process.args`, wrong JSON types, malformed/unsupported `ociVersion`,
 `hostname`-less configs are fine. Full texts in capture 06.
 
@@ -295,7 +295,7 @@ Proven in capture 02 (`procstat -f` + late-write test):
   multiplexer), spawn `ocijail create` with `stdin=/dev/null`,
   `stdout/stderr=sinks`, keep reading. Nothing else is needed. No fd is ever
   passed *to* a running ocijail; `--preserve-fds N` additionally keeps fds
-  `3..3+N-1` open into the container (runc convention) — everything else is
+  `3..3+N-1` open into the container (runc convention), everything else is
   closed via `close_range(…, CLOSE_RANGE_CLOEXEC)` (`process.cpp:310`).
 
 - **terminal:true**: `create` requires `--console-socket <path>` pointing at
@@ -307,7 +307,7 @@ Proven in capture 02 (`procstat -f` + late-write test):
   `satl run -t` / `satl exec -t`.
 
 - **stderr pollution**: create-time validation errors from the forked child
-  are written raw to inherited fd 2 (`create.cpp:573-574`) — i.e. into the
+  are written raw to inherited fd 2 (`create.cpp:573-574`), i.e. into the
   container's stderr sink. On non-zero `create` exit, satld should treat the
   stderr sink's content as runtime error text, not container output.
 
@@ -325,7 +325,7 @@ ocijail --root R exec <id> --process <process.json> [--tty|-t] [--detach|-d]
 - `--process` is **required**; the file has exactly the schema of
   `config.json`'s `process` object. There is no inline-args form (capture 04:
   CLI11 error, exit 106).
-- Non-detached: the ocijail process itself `jail_attach`es and `execvp`s —
+- Non-detached: the ocijail process itself `jail_attach`es and `execvp`s,
   its stdio is the exec's stdio and **its exit code is the process's exit
   code** (proven: exit 7). This is the `satl exec` streaming pattern: hold
   the pipes on the ocijail child.
@@ -334,7 +334,7 @@ ocijail --root R exec <id> --process <process.json> [--tty|-t] [--detach|-d]
   form **healthcheck probes use** (`satl_agent::health`), and the pid is the
   reason: a non-detached exec's exit code is ocijail's own, which is simpler,
   but the process is then only reachable through the `tokio::process::Child`
-  handle — and dropping that handle on a timeout does **not** kill the child
+  handle, and dropping that handle on a timeout does **not** kill the child
   (`kill_on_drop` is false by default), so an abandoned probe would keep
   running inside the jail. With `--detach` + `--pid-file` the prober owns a
   pid it can `kill(2)` when the timeout fires (`satl_runtime::procs`), and it
@@ -347,7 +347,7 @@ ocijail --root R exec <id> --process <process.json> [--tty|-t] [--detach|-d]
   `created` and even `stopped` state while the persist jail exists (proven).
   After `delete` it fails with the state-lock error (§6). **Consequence for
   healthchecks**: a probe against a container whose workload has already died
-  still runs — `jail_attach` + `execvp` in an empty prison — so a probe can
+  still runs, `jail_attach` + `execvp` in an empty prison, so a probe can
   even *succeed* on a dead container. Health is therefore never the liveness
   signal (that is the exit watch), and the prober is stopped by the controller
   as soon as the task shuts down or is removed.
@@ -362,7 +362,7 @@ ocijail --root R exec <id> --process <process.json> [--tty|-t] [--detach|-d]
 ### 4.2 kill (kill.cpp:32-73)
 
 - Sends the signal **to the container init pid only**. `--all`/`-a` and
-  `--pid`/`-p` are parsed in 0.6.0 but never read by `kill::run()` — verified
+  `--pid`/`-p` are parsed in 0.6.0 but never read by `kill::run()`, verified
   live: with `--all`, a grandchild survived init's SIGTERM exit (capture 03).
   Orphaned processes keep running in the persist jail until `delete`.
 - Signal argument: number, or **uppercase** FreeBSD `sys_signame` name
@@ -373,7 +373,7 @@ ocijail --root R exec <id> --process <process.json> [--tty|-t] [--detach|-d]
   (exit 0)**; unknown id ⇒ state-lock error, exit 1. ESRCH is swallowed.
 - Task-shutdown recipe (architecture §8.2): `kill <id> 15` (or the image's
   stop_signal) → await NOTE_EXIT ≤ grace → `kill <id> 9` → `delete <id>`
-  (delete's jail_remove reaps orphaned children — always delete promptly
+  (delete's jail_remove reaps orphaned children, always delete promptly
   after observed exit).
 
 ### 4.3 delete (delete.cpp:32-98)
@@ -383,7 +383,7 @@ init, proceed; `running` ⇒ error
 `delete: container not in "stopped" or "created" state (currently "running")`
 unless `--force` (SIGKILL, proceed). Cleanup order:
 
-1. `jail_remove(2)` — kills **every** process still in the jail;
+1. `jail_remove(2)`, kills **every** process still in the jail;
 2. unmount all config mounts (MNT_FORCE; EINVAL i.e. already-unmounted
    tolerated) and remove auto-created mountpoints;
 3. unmount the read-only rootfs alias if any;
@@ -391,7 +391,7 @@ unless `--force` (SIGKILL, proceed). Cleanup order:
 5. remove the state dir.
 
 **Idempotency trap**: `delete` of an id with no state db entry returns
-**exit 0** and cleans nothing (`delete.cpp:36-41`) — "never existed",
+**exit 0** and cleans nothing (`delete.cpp:36-41`), "never existed",
 "already deleted" and "state lost but jail alive" are indistinguishable.
 Proven in capture 03: a jail whose state entry is missing survives
 `ocijail delete` untouched.
@@ -421,18 +421,18 @@ attached pairs). The experiment scripts' `std_cleanup` in
 `grep -ri linux` over the ocijail 0.6.0 source matches nothing at all:
 **ocijail has no linuxulator awareness whatsoever**. It never reads an `os`
 field; it will happily create the jail and `execvp` whatever `process.args`
-names — the kernel's ELF branding decides that a Linux binary runs under the
+names, the kernel's ELF branding decides that a Linux binary runs under the
 linuxulator ABI.
 
 Consequences for satl-runtime when the resolved platform is `linux/*`
 (architecture §8.1, open question #4):
 
 - satld must verify host prerequisites itself (`linux64.ko` et al.,
-  `sysctl compat.linux.*`) and fail the task `REJECTED` if missing —
+  `sysctl compat.linux.*`) and fail the task `REJECTED` if missing,
   ocijail will produce only a confusing exec error.
 - The bundle must carry the full emulation mount set as ordinary `mounts`
   entries (linprocfs on `/proc`, linsysfs on `/sys`, devfs on `/dev`, tmpfs
-  on `/dev/shm`) — ocijail mounts them host-side, so `allow.mount.*` being
+  on `/dev/shm`), ocijail mounts them host-side, so `allow.mount.*` being
   off is irrelevant. The working mount set lives in
   `hack/experiments/linuxulator/` (question #4's experiments).
 - `linux.*` jail parameters (per-jail uname override) **cannot** be set
@@ -445,21 +445,21 @@ Consequences for satl-runtime when the resolved platform is `linux/*`
 
 Three distinct channels (captures 00, 02, 03, 06):
 
-1. **Runtime errors** — one line on stderr, exit **1**:
+1. **Runtime errors**, one line on stderr, exit **1**:
 
    ```
    2026-08-09T19:37:44000129436Z: root directory "/nonexistent/expm1-rootfs" must be a directory
    ```
 
    Timestamp gotcha: `%Y-%m-%dT%H:%M:%S` + **9-digit zero-padded
-   microseconds** + `Z`, with no `.` separator (`main.cpp:198-207`) — do not
+   microseconds** + `Z`, with no `.` separator (`main.cpp:198-207`), do not
    feed it to an RFC3339 parser; strip everything up to `": "`.
    With `--log-format json`: single-line
-   `{"level":"error","msg":"...","time":"..."}` on stderr — **recommended for
+   `{"level":"error","msg":"...","time":"..."}` on stderr, **recommended for
    the wrapper**. With `--log FILE`: the line goes to the file and stderr
    gets `Error: <msg>` instead.
 
-2. **create-child validation errors** — raw message, no timestamp, written
+2. **create-child validation errors**, raw message, no timestamp, written
    to the *inherited* stderr (the container's stderr sink), exit 1,
    regardless of `--log-format`:
 
@@ -468,7 +468,7 @@ Three distinct channels (captures 00, 02, 03, 06):
    'no-such-binary' not found in $PATH: No such file or directory
    ```
 
-3. **CLI11 usage errors** — human text + `Run with --help for more
+3. **CLI11 usage errors**, human text + `Run with --help for more
    information.`, exit **105** (validation, e.g. `--bundle` dir missing) or
    **106** (missing required option). Any exit > 1 means the wrapper built a
    bad command line, not a runtime failure.
@@ -498,7 +498,7 @@ effectively unreachable (the lock open at `main.cpp:132-143` fails first);
 
 1. `status=running` is set before the workload execs; `stopped` is detected
    only when someone calls `state`/`list`/`delete`. Poll or watch NOTE_EXIT.
-2. No exit codes from ocijail, ever — kqueue `EVFILT_PROC`/`NOTE_EXIT` on the
+2. No exit codes from ocijail, ever, kqueue `EVFILT_PROC`/`NOTE_EXIT` on the
    `--pid-file` pid (§1.6).
 3. `kill --all` is a no-op flag in 0.6.0; only init is signalled. Orphans die
    at `delete` (jail_remove). Never leave a stopped container undeleted.
@@ -509,9 +509,9 @@ effectively unreachable (the lock open at `main.cpp:132-143` fails first);
    image or entrypoint.
 7. `features` underreports `ociVersionMax` (1.2.0 vs accepted 1.3.x).
 8. Error timestamps are not RFC3339 (9-digit micros, no dot).
-9. Mounts happen at `create` and persist while merely "created" — a create
+9. Mounts happen at `create` and persist while merely "created", a create
    that is never started still holds devfs/tmpfs/nullfs mounts until delete.
-10. The container id is the jail name — enforce SatL's id charset before it
+10. The container id is the jail name, enforce SatL's id charset before it
     reaches ocijail; ids with `.` would imply jail hierarchy.
 11. devfs visibility is controlled by the mount option `ruleset=N` (+ `rule`
     pseudo-option), not the `devfs_ruleset` jail param (stays 0).
@@ -522,16 +522,16 @@ effectively unreachable (the lock open at `main.cpp:132-143` fails first);
     connects (connectat) and sends the pty master via SCM_RIGHTS.
 14. VNET: ocijail only sets `vnet=new`. epair plumbing, addressing and
     cleanup are satl-net's job; jail removal returns in-jail epair ends to
-    the host (capture 05) — reconcile them.
+    the host (capture 05), reconcile them.
 15. `org.freebsd.jail.allow.*` values must be JSON **strings** `"true"`/`"1"`
     (a bare JSON `true` is ignored by the `value.is_string()` check,
     `create.cpp:291`).
 16. A detached `exec` is the only exec form whose process satld can signal
-    later (§4.1) — healthcheck probes need that, because a probe that outlives
+    later (§4.1), healthcheck probes need that, because a probe that outlives
     its timeout has to be killed rather than dropped.
 17. **`delete` returning is not the jail being gone.** `jail_remove(2)` leaves
     the prison `DYING` until its last reference goes, and a dying prison still
-    holds its root vnode — so the rootfs cannot be unmounted and `zfs destroy`
+    holds its root vnode, so the rootfs cannot be unmounted and `zfs destroy`
     fails with `cannot unmount …: pool or dataset is busy`. With an open TCP
     connection in the jail at that moment it stays dying for 2 x
     `net.inet.tcp.msl` (60 s by default). ocijail cannot be asked about it (the

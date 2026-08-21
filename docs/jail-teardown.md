@@ -20,24 +20,24 @@ normally reaches for shows a holder:
 
 | Tool | What it said, the whole time the dataset was busy |
 |---|---|
-| `fstat -f <rootfs>` | nothing — **zero** open files on that filesystem |
+| `fstat -f <rootfs>` | nothing, **zero** open files on that filesystem |
 | `procstat -a -f` | no process with any path under the rootfs |
 | `mount -p` | the rootfs itself and **no submount** under it |
 | `ps -axo jid` | no process in the jail |
-| `mount -v` | `vnodes: count 2` — the kernel *does* hold vnodes there |
+| `mount -v` | `vnodes: count 2`, the kernel *does* hold vnodes there |
 
 ## 1. What holds it
 
 The dying prison. `jail_remove(2)` does not destroy a prison: it moves it to
 `DYING` and it stays there until its last reference goes. A prison holds its
 root directory (`pr_root`), which is an **active vnode in the container's own
-ZFS filesystem**, so `unmount(2)` returns `EBUSY` — and `zfs destroy` unmounts
+ZFS filesystem**, so `unmount(2)` returns `EBUSY`, and `zfs destroy` unmounts
 before it destroys, which is why the error says *cannot unmount* rather than
 *cannot destroy*. That distinction is the first useful reading of the message:
 it is a VFS refusal, not a ZFS one.
 
 That reference belongs to no process and no file, which is exactly why `fstat`
-and `procstat` come up empty. The only observer is `jls`(8) — and it has to be
+and `procstat` come up empty. The only observer is `jls`(8), and it has to be
 asked properly:
 
 ```sh
@@ -80,7 +80,7 @@ same teardown:
 
 | Run (capture) | What the container did | Busy for |
 |---|---|---|
-| `e2m1v1t0` | nothing but `sleep` | **0.00 s** — destroyed on the first try |
+| `e2m1v1t0` | nothing but `sleep` | **0.00 s**, destroyed on the first try |
 | `ctl-once` | one connection, **completed and closed** before teardown | **0.00 s** |
 | `ctl-jailfirst` | one connection **still open**, jail deleted first | **57.75 s** |
 | `ctl-server` | ran nginx; the host fetched, keep-alive left open | **57.75 s** |
@@ -97,7 +97,7 @@ moved it.
 
 **It is the connection still being open that costs, not the fact that TCP was
 used.** A connection the container completed and closed beforehand leaves
-nothing to wait for — the prison is already gone by the first sample. Confirmed
+nothing to wait for, the prison is already gone by the first sample. Confirmed
 again with the real daemon: a container looping `fetch` against another
 container, removed while it was between requests, had its dataset destroyed in
 under a second.
@@ -106,7 +106,7 @@ under a second.
 open connection in a jail with a *shared* network stack costs nothing: the
 prison is `DYING` at the first sample and the destroy succeeds anyway. It is
 dismantling a network stack with live control blocks in it that takes the
-minute, which is why this only ever shows up on SatL containers — every one of
+minute, which is why this only ever shows up on SatL containers, every one of
 them is `vnet=new`.
 
 Two traps around that measurement:
@@ -116,20 +116,20 @@ Two traps around that measurement:
   from vnet0's current values. Two runs with the host's `msl` and
   `finwait2_timeout` lowered (`ctl-msl5000`, `ctl-fw2-5000`) measured *exactly*
   the same 57.75 s as the untouched run. The sysctl has to be set inside the
-  jail — the FreeBSD base image has `/sbin/sysctl`, and a VNET jail may write
+  jail, the FreeBSD base image has `/sbin/sysctl`, and a VNET jail may write
   `msl` though not `finwait2_timeout`.
 - **Destroying the epair first costs another ~19 s.** `satl-agent`'s `remove`
   destroys the task's epairs and only then deletes the jail, so the container's
   FIN has nowhere to go and the connection has to time out by retransmission
   instead of closing. Deleting the jail first (`ORDER=jail-first`) brought 76.5 s
-  down to 57.75 s — worth knowing, but not a fix: a minute is a minute.
+  down to 57.75 s, worth knowing, but not a fix: a minute is a minute.
 
 Nothing in this is specific to the overlay. The reason the M3 `cleanup`
 scenario exposed it and `make integration` did not is that the overlay
 scenario's tasks talk to each other over TCP and are killed with a connection
 open, while the single-node test's nginx only ever served a request its client
-had already closed. The earlier note in the code — "an overlay task has two
-epairs, and returning the extra one stretches the jail's death" — had the
+had already closed. The earlier note in the code, "an overlay task has two
+epairs, and returning the extra one stretches the jail's death", had the
 mechanism wrong: the second epair adds nothing measurable, and a single-epair
 task with a live connection is just as slow.
 
@@ -147,7 +147,7 @@ so it waits only a few more seconds and then reports.
 **Giving up is a deferral, not an abandonment.** The wait cannot simply be made
 long enough: a removal is applied **inline on the agent's assignment stream**
 (`satl_dispatcher::agent::apply_diff` awaits `remove_task`), so a minute spent
-here is a minute in which the node applies no other assignment — including the
+here is a minute in which the node applies no other assignment, including the
 network teardown ordered after the task in the same batch. The budget therefore
 stays at 30 s, and running out of it hands the dataset to `satld`'s **periodic
 dataset sweep** (`satld::reconcile::spawn_dataset_sweep`), which runs every 20 s
@@ -158,8 +158,8 @@ before it destroys anything, so a momentarily incomplete claim set cannot cost a
 live task its rootfs.
 
 The dataset therefore disappears within roughly one sweep interval of the jail
-finishing dying — about 60-100 s after a `service rm` in the worst measured case
-— with no restart and no operator.
+finishing dying, about 60-100 s after a `service rm` in the worst measured case,
+with no restart and no operator.
 
 ## 4. Reading it in the log
 

@@ -3,7 +3,7 @@
 Real registry responses captured with `curl` from Docker Hub
 (`registry-1.docker.io`) on 2026-08-09. Each file's sha256 matches the
 registry-reported `Docker-Content-Digest` at capture time; the JSON is
-byte-for-byte as served (do not reformat — tests verify digests).
+byte-for-byte as served (do not reformat, tests verify digests).
 
 | File | Origin | Digest (sha256 of file) |
 |---|---|---|

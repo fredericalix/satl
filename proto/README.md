@@ -1,4 +1,4 @@
-# `proto/` — SatL's internal node-to-node protocol
+# `proto/`, SatL's internal node-to-node protocol
 
 These `.proto` files define **package `satl.internal.v1`** (plus the standard
 `grpc.health.v1`), the gRPC protocol SatL nodes speak to each other over mTLS.
@@ -7,7 +7,7 @@ where each service sits in the system.
 
 | File | Package | Service | Role required | Reference |
 |---|---|---|---|---|
-| `common.proto` | `satl.internal.v1` | — (shared types) | — | architecture §3, §4 |
+| `common.proto` | `satl.internal.v1` | - (shared types) | - | architecture §3, §4 |
 | `dispatcher.proto` | `satl.internal.v1` | `Dispatcher` | worker or manager | architecture §7.1, SWK §13 |
 | `ca.proto` | `satl.internal.v1` | `NodeCA` | none (bootstrap) / any | architecture §12.2–§12.3, SWK §16.2–§16.3 |
 | `raft.proto` | `satl.internal.v1` | `Raft` | manager | architecture §6, SWK §11.7 |
@@ -34,7 +34,7 @@ package version.
   in file paths or service names.
 - **Within a version, changes are additive only.** Add fields with new numbers;
   add RPCs; add enum values. Never renumber, never change a field's type, never
-  repurpose a name, never remove a field — use `reserved` for anything retired
+  repurpose a name, never remove a field, use `reserved` for anything retired
   (there are examples in `dispatcher.proto` and `ca.proto`).
 - Anything that is not additive means a new package, `satl.internal.v2`, served
   alongside v1 for as long as a rolling upgrade needs both.
@@ -43,7 +43,7 @@ package version.
   zero values explicitly. Do not `unwrap` a `try_from` on the wire path.
 - `TaskState`'s sparse numeric values (0, 64, 192, 256, …, 832) are copied from
   SwarmKit and are shared with `satl_core::TaskState` and with the on-disk task
-  database. They are not free to change — a test in `crates/satl-proto` pins
+  database. They are not free to change, a test in `crates/satl-proto` pins
   them.
 
 ## The one design decision: opaque CBOR payloads
@@ -51,11 +51,11 @@ package version.
 Store objects and openraft messages are **not re-modelled field-by-field in
 protobuf**. Each envelope carries:
 
-- `bytes payload` — the CBOR (`ciborium`) encoding of the corresponding
+- `bytes payload`, the CBOR (`ciborium`) encoding of the corresponding
   `satl-core` or openraft Rust type. **This is the authoritative value.**
   One exception, `NetworkAssignment.payload`, encodes a *protocol* type
   (`satl_dispatcher::assignment::NetworkAssignment` = a `satl_core::Network`
-  plus the endpoint table a node needs to program its FDB — and, since M4, to
+  plus the endpoint table a node needs to program its FDB, and, since M4, to
   answer DNS without a store: each endpoint carries its service/task names,
   aliases and observed state, all `#[serde(default)]` so pre-M4 payloads still
   decode, to a state the DNS table never answers). The rule below is about not
@@ -69,7 +69,7 @@ protobuf**. Each envelope carries:
 ### Why
 
 `satl-core` already owns the domain model: its invariants, its validation, and
-its serde encoding — the same CBOR that goes into the Raft log, into snapshots,
+its serde encoding, the same CBOR that goes into the Raft log, into snapshots,
 and into the agent's on-disk task database (architecture §6.3, §7.2). A parallel
 protobuf definition of `ContainerSpec`, `Mount`, `HealthConfig`,
 `NetworkAttachment`, `TaskStatus`… would be a **second source of truth** for the
@@ -87,19 +87,19 @@ with openraft upgrades. We own the transport, not raft's internals.
 - **No cross-language clients.** A Go or Python client could parse the frames
   but not the payloads. Accepted: see "Internal only" above.
 - **No `protoc --decode` readability** of payloads. Debug tooling has to decode
-  CBOR — which is why the mirrored scalars exist and must stay populated.
+  CBOR, which is why the mirrored scalars exist and must stay populated.
 - **Version skew is serde skew.** Payload compatibility is governed by serde
   rules (add fields with `#[serde(default)]`, never repurpose a name), not by
   protobuf field numbers.
 - Changing the payload codec is a **breaking change** and requires
   `satl.internal.v2`. (If that ever becomes likely, the additive migration path
-  is a codec-tag field on the envelopes — deliberately not added now, because an
+  is a codec-tag field on the envelopes, deliberately not added now, because an
   unused tag is just another thing to get wrong.)
 
 ## Message size
 
 Every message is capped at **4 MiB** (architecture §15,
-`satl_proto::MAX_MESSAGE_SIZE`), and tonic's defaults are not that value — set
+`satl_proto::MAX_MESSAGE_SIZE`), and tonic's defaults are not that value, set
 `max_decoding_message_size` / `max_encoding_message_size` explicitly on every
 client and server. Assignment batching (100 changes / 100 ms), task-status
 batching (100 ms / 10 000 updates), store transaction limits (200 actions /
@@ -110,7 +110,7 @@ batching (100 ms / 10 000 updates), store transaction limits (200 actions /
 `crates/satl-proto/build.rs` compiles these files with
 [`protox`](https://crates.io/crates/protox), a pure-Rust protobuf compiler, and
 feeds the resulting `FileDescriptorSet` to `tonic-prost-build`. **`protoc` is
-not required** — not on the dev host, not on the cluster VMs, not in CI.
+not required**, not on the dev host, not on the cluster VMs, not in CI.
 `cargo build` is the whole toolchain.
 
 Adding a file means adding it to the explicit list in `build.rs`; a `.proto`

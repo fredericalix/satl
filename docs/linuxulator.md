@@ -7,28 +7,28 @@ hand-written OCI bundles, and verbatim outputs live in
 `hack/experiments/linuxulator/` (`captures/` for outputs; file names cited
 below are relative to that directory).
 
-## TL;DR — the minimal working recipe
+## TL;DR, the minimal working recipe
 
 * Kernel: `linux.ko` + `linux64.ko` (+ auto-dep `linux_common.ko`), plus
   `linprocfs.ko`, `linsysfs.ko`, `fdescfs.ko`, `pty.ko`;
   `kern.elf64.fallback_brand=3`. All of this is what `linux_enable="YES"`
   (`/etc/rc.d/linux`) sets up.
 * Rootfs: any Linux rootfs unpacked as the jail root. **Both musl (Alpine
-  3.24) and glibc (Ubuntu 24.04) work** on FreeBSD 15.1 — including
+  3.24) and glibc (Ubuntu 24.04) work** on FreeBSD 15.1, including
   musl-static busybox, apk, apt/dpkg/perl.
 * Mounts (in `config.json`, performed by ocijail at `create`): linprocfs on
   `/proc`, linsysfs on `/sys`, devfs on `/dev`, fdescfs (`linrdlnk`) on
   `/dev/fd`, tmpfs (`mode=1777`) on `/dev/shm` and `/tmp`.
 * No `linux` section, no `platform` field, and no other os marker is needed
-  in `config.json` — ocijail 0.6.0 ignores both. **Attribution (corrected
+  in `config.json`, ocijail 0.6.0 ignores both. **Attribution (corrected
   after the ocijail source study, `docs/ocijail.md`): ocijail's source
   never mentions linux at all; the `linux=new` / `linux.osname=Linux` /
   `linux.osrelease=5.15.0` / `linux.oss_version=198144` parameters observed
   on the jails are applied by the kernel as defaults (seeded from the global
   `compat.linux.*` sysctls) whenever the linuxulator modules are loaded.**
   Consequence: the only gate SatL controls is "are the linux modules
-  loaded" — the satl-runtime precheck.
-* A non-VNET jail defaults to `ip4=inherit`/`ip6=inherit` — a server bound
+  loaded", the satl-runtime precheck.
+* A non-VNET jail defaults to `ip4=inherit`/`ip6=inherit`, a server bound
   in the container is reachable on the host's addresses (proved with busybox
   httpd + curl, `captures/04-httpd-shared-ip.txt`).
 
@@ -70,13 +70,13 @@ path fails with `bundle directory must contain config.json`.
 |---|---|---|
 | Kernel modules | `linux.ko`, `linux64.ko`, `linux_common.ko`, `linprocfs.ko`, `linsysfs.ko`, `fdescfs.ko`, `pty.ko` | all loaded by `rc.d/linux`; no extra modules were needed for any experiment |
 | `rc.conf` | `linux_enable="YES"` | |
-| `kern.elf64.fallback_brand` | `3` (ELFOSABI_LINUX) | **required for musl/static binaries** — Alpine's busybox is an *unbranded* SYSV ELF; without the fallback brand the kernel won't run it as Linux. `rc.d/linux` sets it only if it is `-1` |
+| `kern.elf64.fallback_brand` | `3` (ELFOSABI_LINUX) | **required for musl/static binaries**, Alpine's busybox is an *unbranded* SYSV ELF; without the fallback brand the kernel won't run it as Linux. `rc.d/linux` sets it only if it is `-1` |
 | `compat.linux.osrelease` | `5.15.0` | reported by `uname -r` in containers; per-jail overridable (`linux.osrelease` jail param) since ocijail sets `linux=new` |
-| `/compat/linux` populated | `linux_base-rl9-9.7` on dev server | **NOT required for containers** — the jail root replaces it entirely (see below) |
+| `/compat/linux` populated | `linux_base-rl9-9.7` on dev server | **NOT required for containers**, the jail root replaces it entirely (see below) |
 | racct/rctl | **on** everywhere now (`kern.racct.enable=1` in `/boot/loader.conf`; the old "off on dev server" note is stale) | unrelated to linuxulator itself; resource limits are SatL's rctl problem |
 
 `satl-agent` node description should verify: modules loaded (or loadable) and
-`kern.elf64.fallback_brand=3` — that is the whole "linuxulator available"
+`kern.elf64.fallback_brand=3`, that is the whole "linuxulator available"
 check. `/compat/linux` content and the `linux_mounts_enable` host mounts are
 irrelevant to jailed containers.
 
@@ -96,7 +96,7 @@ Linux processes in the jail (`captures/expm1lx-emul.out`). Consequences:
 ## glibc vs musl
 
 Folklore says the linuxulator targets glibc and musl breaks. **Not
-reproducible on FreeBSD 15.1** — the first-choice rootfs works fine:
+reproducible on FreeBSD 15.1**, the first-choice rootfs works fine:
 
 | Rootfs | libc | Result |
 |---|---|---|
@@ -107,7 +107,7 @@ Caveats found: `apt-get update` with the full `universe` component died
 parsing the huge package list (`Error occurred while processing ... MergeList`,
 `captures/07-apt-update.txt` history); `main` alone works. systemd's dpkg
 postinst fails (see failure signatures). Alpine 3.24's default busybox lacks
-the `httpd` applet (`busybox-extras` provides it) — an image-content issue,
+the `httpd` applet (`busybox-extras` provides it), an image-content issue,
 not a linuxulator one.
 
 ## Jail parameters observed via `jls -n all` (ocijail + kernel defaults)
@@ -122,7 +122,7 @@ defaults, see above):
 `allow.suser`, `ip4=inherit`, `ip6=inherit`, `vnet=inherit`
 (full dump: `captures/03-alpine-full-mounts.txt`). Notes:
 
-* `linux=new` means each container gets its own `linux.*` attribute set —
+* `linux=new` means each container gets its own `linux.*` attribute set,
   SatL can later vary `osrelease` per container if an image needs it.
 * Containers **cannot** mount anything themselves (`allow.nomount`): all
   mounts must be in `config.json`.
@@ -136,33 +136,33 @@ defaults, see above):
    populated `linux` section (namespaces + resources), and a legacy
    `"platform": {"os": "linux"}` field are all accepted and **silently
    ignored** (`captures/expm1lx-varA/B/C.out`). In particular
-   `linux.resources.memory.limit` is *not* enforced and produces no error —
+   `linux.resources.memory.limit` is *not* enforced and produces no error,
    SatL must map resources to rctl itself and must not assume OCI-level
    enforcement.
 2. **Mount lifecycle** (`captures/05-mount-lifecycle.txt`):
    * mounts are performed at `create` time, by ocijail, in host context,
      recorded under the realpath of the rootfs;
-   * plain `mount` does **not** list them — use `mount -p` or `mount -v`;
+   * plain `mount` does **not** list them, use `mount -p` or `mount -v`;
    * **`ocijail delete` does NOT unmount them.** They leak. `satl-runtime`
      must unmount everything under the container rootfs (deepest-first,
-     from `mount -p`) after `delete` — and the startup reconciliation pass
+     from `mount -p`) after `delete`, and the startup reconciliation pass
      must do the same for orphans (extends the epair/clone gotcha in
      CLAUDE.md to mounts).
    * on a *failed* `create`, ocijail unwinds mounts but can leak nested ones
      (`/dev/fd`, `/dev/shm` under an already-unmounted `/dev` were left
-     behind once) — same cleanup pass covers this.
+     behind once), same cleanup pass covers this.
 3. **`create` validates `process.args[0]`** inside the rootfs and fails with
-   `<path>: No such file or directory` — surface this verbatim.
+   `<path>: No such file or directory`, surface this verbatim.
 4. **Bundle path must be absolute** (`-b`); relative paths fail bogusly
    ("bundle directory must contain config.json").
-5. `state` reports `status` only — **no exit code** for stopped containers;
+5. `state` reports `status` only, **no exit code** for stopped containers;
    the exit status must be reaped by the process that spawned `create`
    (satl-agent side, see the ocijail study in `hack/experiments/ocijail/`).
 
 ## /dev: the ruleset problem (`captures/10-devfs-ruleset.txt`)
 
 devfs mounted with no options (ruleset 0) exposes the **entire host device
-tree** (disks, bpf, consoles) — unacceptable default. ocijail passes mount
+tree** (disks, bpf, consoles), unacceptable default. ocijail passes mount
 options through, so `{"type": "devfs", "options": ["ruleset=4"]}` works and
 yields the classic jail set (`null zero random urandom ptmx pts fd std* zfs`).
 
@@ -202,7 +202,7 @@ cat /proc/cgroups   ->  cat: /proc/cgroups: No such file or directory (rc 1)
 /proc/filesystems   ->  no cgroup entry
 ```
 
-linsysfs provides only `bus class dev devices kernel` — there is no `/sys/fs`
+linsysfs provides only `bus class dev devices kernel`, there is no `/sys/fs`
 to even hang a mountpoint on. If a (docker-derived) config *requests* a
 cgroup mount, `ocijail create` hard-fails:
 
@@ -216,13 +216,13 @@ FreeBSD jails have no PID namespace: the entrypoint keeps its host PID and is
 never PID 1. systemd 255 (Ubuntu 24.04):
 
 * `systemd --version` → works (exit 0);
-* `systemd --system` → **exit 1 with no output at all** — the container just
+* `systemd --system` → **exit 1 with no output at all**, the container just
   dies instantly;
 * kernel log (`dmesg`): `linux: jid N pid M (systemd): unsupported prctl
   option 27|39|47` (PR_MCE_KILL / PR_GET_NO_NEW_PRIVS / PR_CAP_AMBIENT);
 * `systemd-detect-virt` → `none` (a jail is not detected as a container);
 * even installing systemd (dpkg postinst in a chroot) fails:
-  `systemd-tmpfiles` claims "/proc/ is not mounted" (statfs-magic check —
+  `systemd-tmpfiles` claims "/proc/ is not mounted" (statfs-magic check,
   linprocfs is not `PROC_SUPER_MAGIC`) and `Failed to take /etc/passwd lock:
   Invalid argument` (OFD-lock EINVAL).
 
@@ -233,12 +233,12 @@ never PID 1. systemd 255 (Ubuntu 24.04):
 2. Resolved entrypoint argv[0] is `*/systemd`, `/usr/lib/systemd/systemd`,
    or `*/init` (Docker official images: `/sbin/init` is only ever an init
    system) → reject with: *"image runs systemd/init as PID 1; FreeBSD jails
-   provide no PID namespace or cgroups, so systemd cannot run — use an image
+   provide no PID namespace or cgroups, so systemd cannot run, use an image
    with a plain foreground entrypoint"*. Runtime detection is useless here:
    systemd exits 1 with zero output.
 3. SatL always generates its own mount set; any `cgroup`/`cgroup2`/Linux
    `proc`/`sysfs`/`mqueue` mount coming from an imported config must be
-   dropped (or rejected) explicitly — otherwise create fails with a cryptic
+   dropped (or rejected) explicitly, otherwise create fails with a cryptic
    `Invalid argument`.
 4. Absence of cgroups can not be detected at runtime (apps just get ENOENT
    and may or may not degrade); it is a documented platform limit, not a
@@ -249,13 +249,13 @@ never PID 1. systemd 255 (Ubuntu 24.04):
 * **No cgroups, no systemd, no PID namespace.** Container processes see host
   PID numbers (but only the jail's own processes, thanks to jail process
   visibility rules).
-* `/proc/meminfo`/`/proc/cpuinfo` show **host** resources — JVM/Go-style
+* `/proc/meminfo`/`/proc/cpuinfo` show **host** resources, JVM/Go-style
   auto-sizing sees the whole machine until SatL wires rctl *and* something
   like an LD_PRELOAD shim (out of scope for M1; document).
 * Syscall coverage is incomplete: expect `unsupported prctl option` kernel
   logs; OFD file locks return EINVAL; anything needing netlink, cgroupfs,
   io_uring, etc. fails. `compat.linux.debug=3` (dev default) logs each
-  unimplemented syscall once — valuable in bug reports.
+  unimplemented syscall once, valuable in bug reports.
 * `uname -r` inside containers is `compat.linux.osrelease` (5.15.0), not the
   FreeBSD version; glibc keys behavior off it (do not lower it).
 * SysV IPC is off in ocijail-created jails (see jail params above).
@@ -274,12 +274,12 @@ never PID 1. systemd 255 (Ubuntu 24.04):
 2. Exit-code harvesting: `ocijail state` never reports it; agent design must
    keep the `create` child reapable (coordinate with the ocijail study).
 3. Mount cleanup after `delete` is entirely SatL's job (incl. failed-create
-   unwinding) — must land in the same M1 change as linuxulator support, or
+   unwinding), must land in the same M1 change as linuxulator support, or
    every Linux container leaks 5–7 mounts.
 4. ocijail silently ignoring `linux.resources` means a docker-compose file
    with memory limits will *appear* to work unenforced. `--memory`/`--cpus`
    must go through rctl (racct is now enabled on the dev host as well as the
    OVH VMs, so both can test enforcement).
 5. Rare glibc tools care about procfs statfs magic (systemd-tmpfiles does);
-   other tools may too — watch for "/proc is not mounted" class errors on
+   other tools may too, watch for "/proc is not mounted" class errors on
    images that otherwise should work.

@@ -2,7 +2,7 @@
 
 Covers what an operator needs to run SatL. Grows with each milestone; cluster
 operations (init/join, CA) arrive in M2, backup and restore in M5 ("Backup and
-restore", below — read it before you deploy a cluster with one manager).
+restore", below, read it before you deploy a cluster with one manager).
 
 ## Requirements
 
@@ -37,7 +37,7 @@ service satld start
 ### Distributing SatL as a package
 
 `make package` writes `dist/satl-<version>.pkg`, built with `pkg create`
-from a staging tree that mirrors `make install` — no ports tree needed.
+from a staging tree that mirrors `make install`, no ports tree needed.
 Alongside it goes `dist/CHECKSUM.SHA512`, in sha512sum(1) format and naming
 only the package that run built (it is rewritten on every `make package`).
 Install it on any FreeBSD 15 amd64 host with:
@@ -52,14 +52,14 @@ default), the declared `ocijail` dependency is resolved from it
 automatically; on an offline host, hand it the dependency's `.pkg` alongside
 SatL's. The post-install message recalls the host prerequisites (ZFS root
 dataset, pf anchors, `kern.racct.enable=1`). The package's ABI is stamped at
-build time from `pkg config ABI` — build on the FreeBSD major you deploy.
+build time from `pkg config ABI`, build on the FreeBSD major you deploy.
 
 See `docs/networking.md` for the anchor contract and the `pf_mode` setting that decides
 whether `satld` loads rules, only syntax-checks them, or stays out of pf entirely.
 
 `satld` creates the child datasets it needs under the root on first start
 (`raft`, `images`, `layers`, `containers`, `volumes`) and self-initializes a
-single-node cluster (no `swarm init` needed — see `docs/api-compat.md`).
+single-node cluster (no `swarm init` needed, see `docs/api-compat.md`).
 
 Verify:
 
@@ -88,7 +88,7 @@ old sample is kept beside the new one as `satld.toml.sample.pkgsave`, which is
 
 **Running containers are re-adopted, not restarted.** Startup reconciliation
 re-attaches the live jails it finds (architecture §7.2), so an upgrade is not a
-workload restart — which also means an uptime that resets to seconds is a
+workload restart, which also means an uptime that resets to seconds is a
 *failure to adopt*, not the price of upgrading. Check the jail, not just the
 container list, because `satl ps` would report a fresh container as running
 just as happily:
@@ -105,7 +105,7 @@ unchanged, `Up 9 days` across the restart.
 
 ## Configuration
 
-`/usr/local/etc/satl/satld.toml` — every key optional; defaults shown in the
+`/usr/local/etc/satl/satld.toml`, every key optional; defaults shown in the
 installed `satld.toml.sample`:
 
 | Key | Default | Meaning |
@@ -115,7 +115,7 @@ installed `satld.toml.sample`:
 | `zfs_root` | `zroot/satl` | Root ZFS dataset; startup fails if absent |
 | `node_name` | hostname | Node name (also the Raft peer name) |
 | `socket_group` | `wheel` | Intended socket group (a dedicated `satl` group comes with packaging) |
-| `pf_mode` | `check` | `enforce` loads the `satl/*` anchors (needed for published ports), `check` only syntax-checks them, `disabled` stays out of pf entirely — see `docs/networking.md` |
+| `pf_mode` | `check` | `enforce` loads the `satl/*` anchors (needed for published ports), `check` only syntax-checks them, `disabled` stays out of pf entirely, see `docs/networking.md` |
 | `network_name` | `satl` | Node-local bridge network; also names the bridge (`satl0`) and the ifconfig group SatL sweeps at startup. **Two daemons on one host must use different names**, or each one's reconciliation destroys the other's interfaces. Max 14 characters |
 | `network_pool` | `10.88.0.0/16` | Pool the per-network /24s are carved from; change it if it collides with your underlay |
 
@@ -128,7 +128,7 @@ rc.conf knobs (see the header of `/usr/local/etc/rc.d/satld`): `satld_enable`,
 under the tag `satld`, which lands in `/var/log/messages` and `/var/log/daemon.log` with
 the stock `/etc/syslog.conf`.
 
-### One event, one line — do not remove `--log-target syslog`
+### One event, one line, do not remove `--log-target syslog`
 
 The rc.d service starts the daemon with `--log-target syslog`, and that flag is a
 correctness requirement rather than a preference. **Taking it out silently corrupts the
@@ -136,7 +136,7 @@ log**, so if you edit `command_args` in `/usr/local/etc/rc.d/satld`, keep it.
 
 With the flag, `satld` hands each event to syslogd itself as its own datagram, so one
 event is one line. Without it, the log travels the way any supervised program's output
-does — the daemon writes lines to a pipe and `daemon(8) -S` forwards them — and that
+does, the daemon writes lines to a pipe and `daemon(8) -S` forwards them, and that
 path **merges events**: `daemon(8)` reads the pipe in chunks and passes a whole chunk to
 `syslog(3)` as a single message, then syslogd rewrites the newlines inside it as
 *spaces*. Two events written microseconds apart by two of the daemon's threads therefore
@@ -144,7 +144,7 @@ arrive joined onto one line.
 
 Measured on FreeBSD 15.1, on this daemon's own log: **281 of 7252 lines (3.9%) carried
 more than one event**, up to eleven of them, and under `--log-format json` about 3% of
-lines were two objects on one line — not JSON, so a consumer doing `json.loads` per line
+lines were two objects on one line, not JSON, so a consumer doing `json.loads` per line
 fails on them. A synthetic burst of 400 lines through `daemon -S` was worse: 138 lines
 carrying 174 records, up to 19 records on one line, and **more than half the records lost
 outright**, because merging inflates each datagram until it overruns syslogd's 16 KiB
@@ -157,7 +157,7 @@ What to know operationally:
   log path). The daemon's own events are one per line by construction.
 - `-S` is still passed to `daemon(8)` on purpose: `satld`'s log no longer travels that
   way, but a panic message written to stderr does, and it should still be captured.
-  A multi-line panic backtrace can still merge — that path is the fallback, not the log.
+  A multi-line panic backtrace can still merge, that path is the fallback, not the log.
 - If syslogd is unreachable or wedged, the daemon prints one
   `satld: cannot write the log to syslog …` note to stderr and falls back to writing
   lines there, where `daemon(8) -S` picks them up. That fallback can merge lines; it
@@ -166,7 +166,7 @@ What to know operationally:
   for up to 2 s) rather than dropping events. A wedged syslogd past that budget costs a
   line's ordering, not the line.
 - Every event carries one syslog priority, `daemon.notice`, regardless of its tracing
-  level — the same priority `daemon(8) -S` used — so `RUST_LOG=satld=debug` output still
+  level, the same priority `daemon(8) -S` used, so `RUST_LOG=satld=debug` output still
   lands in `/var/log/messages`. Mapping tracing levels onto syslog severities would move
   `INFO` and `DEBUG` lines out of that file with the stock `syslog.conf`.
 
@@ -178,7 +178,7 @@ works and colour is enabled only when stdout is really a terminal.
 Everything `satld` writes reaches `/var/log/messages` through syslogd, and syslogd is
 not 8-bit clean: it rewrites bytes in the `0x80`–`0x9f` range as literal `M-^X` text.
 A UTF-8 punctuation character is two or three bytes, usually including one in that
-range, so it arrives mangled and **unrecoverable** — an em dash logged as `—` lands as
+range, so it arrives mangled and **unrecoverable**, an em dash logged as `—` lands as
 `M-^@M-^T` (measured on this platform with `logger`, then read back with `od -c`).
 
 So SatL keeps operator-facing messages ASCII-only, the same way it keeps colour out of
@@ -186,13 +186,13 @@ non-terminal output. Two things to know:
 
 - **`M-^` sequences in a log line are a bug**, not a display problem: some message
   escaped the rule. Report it. (Characters above `0x9f`, such as `§` or `é`, do survive
-  in the file — if you see those as `M-BM-'`, that is your pager, not the log: `cat -v`
+  in the file, if you see those as `M-BM-'`, that is your pager, not the log: `cat -v`
   and non-UTF-8 tools render intact bytes that way.)
-- **Grep for words, not symbols.** Every identifier a diagnosis needs — `task_id`,
-  `node_id`, `jail_id`, interface names, addresses — is ASCII, so it is greppable
+- **Grep for words, not symbols.** Every identifier a diagnosis needs, `task_id`,
+  `node_id`, `jail_id`, interface names, addresses, is ASCII, so it is greppable
   exactly as printed.
 - **Use `grep -a` on the log file.** One non-ASCII byte anywhere in
-  `/var/log/messages` — from any program on the host, not necessarily `satld` — makes
+  `/var/log/messages`, from any program on the host, not necessarily `satld`, makes
   `grep` treat the whole file as binary and print *nothing*, with exit status 1 and no
   explanation. That looks exactly like "the daemon logged nothing", which is the worst
   possible way to be misled while diagnosing. `grep -a` reads it as text regardless;
@@ -234,8 +234,8 @@ to the future with `tracing::Instrument` instead enters and exits it around each
 
 ```
 /var/db/satl/                 zroot/satl (dataset)
-├── raft/                     zroot/satl/raft — cluster state (managers)
-│   ├── dek                   at-rest encryption key, 0600 — see below
+├── raft/                     zroot/satl/raft, cluster state (managers)
+│   ├── dek                   at-rest encryption key, 0600, see below
 │   ├── log.redb              raft log (entries encrypted)
 │   ├── snapshot              raft snapshot (encrypted), appears after ~10k writes
 │   ├── node-id               this node's cluster identity (25-char id)
@@ -244,10 +244,10 @@ to the future with `tracing::Instrument` instead enters and exits it around each
 ```
 
 - **Crash recovery**: cluster state fully recovers from `raft/` after a crash
-  (`kill -9` included) — verified by the M0 acceptance test. Node identity is
+  (`kill -9` included), verified by the M0 acceptance test. Node identity is
   stable across restarts.
 - **The `dek` file is critical**: it encrypts the raft log and snapshots at
-  rest, it is per-node, and a raft directory copied without it is unreadable —
+  rest, it is per-node, and a raft directory copied without it is unreadable,
   `satld` refuses to start rather than mint a new key over sealed data. Include
   it in any backup of `/var/db/satl/raft` and protect it like a private key.
   What a backup is worth, and the two ways back from a lost manager, are in
@@ -260,7 +260,7 @@ to the future with `tracing::Instrument` instead enters and exits it around each
 Removing a container does not always destroy its `containers/<task id>` dataset
 immediately, and that is expected. A rootfs cannot be unmounted while the
 container's jail is still `DYING`, and a jail whose container had an open TCP
-connection when it was removed stays dying for 2 x `net.inet.tcp.msl` — 60 s with
+connection when it was removed stays dying for 2 x `net.inet.tcp.msl`, 60 s with
 the default MSL (measured; `docs/jail-teardown.md`). Nothing in `fstat`,
 `procstat` or `mount` shows a holder: the reference belongs to the dying prison,
 and only `jls -d -h name dying` sees it.
@@ -281,8 +281,8 @@ Each deferral is one warn line carrying `task_id`, `dataset`, `waited_ms`,
 `jail_state` and the failed `zfs` command line, and a dataset that stays busy
 across several sweeps is reported once, not once per pass.
 
-If a dataset is still there minutes later, check whether its prison ever died —
-`jls -d -h name dying | grep <task id>` — and how many vnodes the mount still has
+If a dataset is still there minutes later, check whether its prison ever died,
+`jls -d -h name dying | grep <task id>`, and how many vnodes the mount still has
 (`mount -v | grep <task id>`). A prison that never dies is a different problem
 from this one.
 
@@ -297,19 +297,19 @@ the three-node test cluster, and the numbers are the reason:
 | a manager's raft directory restored from a copy of *that* manager | yes | ~2 s of downtime, then 3-4 s to catch up (5 runs) |
 | the same manager wiped and re-joined | **no** | **6 s** (leave 1 s, `node rm` 0 s, join 1 s, three managers reachable 4 s) |
 | a one-manager cluster restored from a copy | yes | full recovery: services, secrets and the running container |
-| a one-manager cluster with no copy | — | **nothing comes back** |
+| a one-manager cluster with no copy | - | **nothing comes back** |
 
 The arithmetic is the ordinary quorum arithmetic and it is what makes the
 recommendation: three managers tolerate one loss, so a manager can be destroyed
 and rebuilt with no downtime and no backup, and the cluster keeps committing
 throughout. One manager tolerates none, and its raft directory is the only copy
-of every service, secret, config and network in the cluster — which makes a
+of every service, secret, config and network in the cluster, which makes a
 scheduled backup of that one directory the whole disaster-recovery plan.
 
 **A rejoin is not a backup policy, though.** It covers one manager failing; it
 covers nothing the day the majority goes. A cluster that has lost quorum cannot
 admit a replacement, cannot be forced into a smaller membership, and cannot even
-be stopped cleanly — so on a three-manager cluster the copy to schedule is the
+be stopped cleanly, so on a three-manager cluster the copy to schedule is the
 raft directory of **at least two** of them. That is measured, in "When quorum is
 gone" below, and it is the one place where a restore is not just an alternative
 to a rejoin but the only way back.
@@ -320,7 +320,7 @@ Run one and back it up, or run three.
 
 ### What has to be in the copy
 
-Everything in `<state_dir>/raft` — `log.redb`, `node-id`, `raft-id` **and
+Everything in `<state_dir>/raft`, `log.redb`, `node-id`, `raft-id` **and
 `dek`**:
 
 ```sh
@@ -339,7 +339,7 @@ ls -l /var/db/satl/raft
   than as a new member: they are plain files, they travel in the copy, and the
   daemon reads them instead of minting new ones.
 - `snapshot` appears too, once the log has passed ~10 000 entries; it is sealed
-  with the same key. Copy it if it is there — it is where most of the state is
+  with the same key. Copy it if it is there, it is where most of the state is
   after a compaction.
 - `log.redb` is **sparse and only grows**. It was 19 MB on a manager holding a
   store of ~230 small objects, and 1.1 GB after a synthetic burst of 10 000
@@ -350,7 +350,7 @@ The certificates in `<state_dir>/certs` are **not** part of this copy, and that
 is worth knowing rather than assuming: the raft state contains the cluster's CA,
 so a node whose raft directory is intact re-issues its own certificate. Verified
 by deleting `<state_dir>/certs` outright on a single-node cluster and starting
-the daemon — same node id, service still running, three log lines:
+the daemon, same node id, service still running, three log lines:
 
 ```
 INFO satld::cluster: no node certificate found; initializing this node's identity
@@ -379,7 +379,7 @@ service satld start
 
 **2. Snapshot the dataset (recommended for a manager you will not stop).**
 `<state_dir>/raft` is its own ZFS dataset, so a snapshot is atomic and
-crash-consistent — which is precisely the image `redb` is built to recover
+crash-consistent, which is precisely the image `redb` is built to recover
 from, and recovery from a `kill -9` is what the M0 acceptance test already
 verifies:
 
@@ -392,7 +392,7 @@ zfs destroy zroot/satl/raft@backup
 The snapshot directory is readable whether or not `snapdir` is visible, and the
 files in it carry their modes, `dek` included (`tar` keeps the 0600).
 
-**3. `cp -Rp` of a live raft directory — it worked, and it is still the one to
+**3. `cp -Rp` of a live raft directory, it worked, and it is still the one to
 avoid.** Three copies taken from a running manager while the cluster committed
 about 35 store writes a second were each restored onto that node, and all three
 came back and caught up. That is 3 for 3, and it is *not* a guarantee: `cp`
@@ -400,13 +400,13 @@ reads a file that is being written, so the result is a smear across the copy
 window rather than a point in time, and nothing in `redb`'s design promises a
 smeared file is consistent. A snapshot removes the question for free, so there
 is no reason to rely on the luck. (Nothing here detected a bad copy either: a
-deliberately torn file — one half read six seconds after the other — opened and
+deliberately torn file, one half read six seconds after the other, opened and
 ran anyway, so "it started" is not evidence that a copy was sound.)
 
 **A stale copy is fine, on a multi-manager cluster.** The copy only has to give
 raft a starting point; the leader replays the rest. Measured: copies a minute
 old, and copies taken before hundreds of writes, all converged 3-4 s after the
-daemon came up. On a **single-manager** cluster the opposite holds — everything
+daemon came up. On a **single-manager** cluster the opposite holds, everything
 committed after the copy is gone, so the backup interval *is* the amount of work
 you are prepared to lose.
 
@@ -424,7 +424,7 @@ service satld start
 ```
 
 Nothing has to be told to the cluster, and nothing has to be passed to the
-daemon: no `swarm init`, no `--advertise-addr` (which is refused anyway —
+daemon: no `swarm init`, no `--advertise-addr` (which is refused anyway,
 `docs/api-compat.md` #42, first boot *is* the init). What the log says, and this
 is the sequence that means the restore took:
 
@@ -470,7 +470,7 @@ key is usually still in the backup.
 Two related refusals, same reason:
 
 - a `dek` that is group- or world-readable is refused with `chmod 600` in the
-  message — restoring with a careless `umask` is the way that happens;
+  message, restoring with a careless `umask` is the way that happens;
 - a `dek` of the wrong length is refused as corrupt rather than used.
 ### Losing a manager entirely: rejoin, do not restore
 
@@ -493,7 +493,7 @@ satl swarm join --token <token> <any manager>:2377
 What to expect, all of it observed:
 
 - **the node comes back under a new node id.** The identity is issued by the
-  cluster it joins (`docs/api-compat.md` #86), so its old id is gone for good —
+  cluster it joins (`docs/api-compat.md` #86), so its old id is gone for good,
   which is why `satl node rm --force` on the old one is part of the procedure
   and not an optional tidy-up. Anything that referred to it by id (a
   `node.labels` constraint pinned to that id, dashboards) has to be repointed.
@@ -503,9 +503,9 @@ What to expect, all of it observed:
   back.
 - `satl swarm leave --force` is not "make this node idle": the node immediately
   forms a **fresh single-node cluster of its own** (`docs/api-compat.md` #86) and
-  `satl node ls` on it lists one node, itself, as Leader. That is expected — it
+  `satl node ls` on it lists one node, itself, as Leader. That is expected, it
   is a cluster of one until the join lands.
-- **if the daemon cannot start** (it lost its raft directory, so it refuses —
+- **if the daemon cannot start** (it lost its raft directory, so it refuses,
   see the single-node section), `satl swarm leave --force` is not available.
   Discard the identity by hand instead, which is what the refusal tells you:
   `rm -rf <state_dir>/certs` and empty `<state_dir>/raft`, start `satld` (it
@@ -518,13 +518,13 @@ What to expect, all of it observed:
   `Ready` in the STATUS column suggests. Rejoin it.
 
 A restore is the right answer when the cluster still has quorum and you would
-rather not lose the node's identity — and it is the *only* answer once quorum is
+rather not lose the node's identity, and it is the *only* answer once quorum is
 gone, which is the case the next section is about.
 
 ### When quorum is gone: the case where a backup is the only way back
 
 A cluster commits writes only while a majority of its managers are up, and
-losing that majority is the one situation where a restore beats a rejoin — and
+losing that majority is the one situation where a restore beats a rejoin, and
 where having no backup is unrecoverable. Measured on a three-manager cluster by
 destroying two of them (state removed, daemons down) and restarting the third:
 
@@ -532,11 +532,11 @@ destroying two of them (state removed, daemons down) and restarting the third:
 
 - **writes hang.** They do not fail: `satl secret create` sat there until the
   20 s `timeout` killed it (exit 124). A proposal has no timeout by design (a
-  timeout cannot retract an appended entry — architecture §6.2), so a write
+  timeout cannot retract an appended entry, architecture §6.2), so a write
   aimed at a quorum that will never form waits for ever. Nothing tells the
   operator why.
 - **reads keep working and `satl node ls` lies.** It listed all three nodes
-  `Ready` with the survivor as `Leader` — the store frozen at its last applied
+  `Ready` with the survivor as `Leader`, the store frozen at its last applied
   state, and a `current_leader` left over from the term before the restart. In
   this state that column is not evidence of anything.
 - **a replacement manager cannot join.** The join needs a certificate, issuing
@@ -545,14 +545,14 @@ destroying two of them (state removed, daemons down) and restarting the third:
 - **`satl swarm init --force-new-cluster` answers 501.** There is no way to
   shrink the membership to the survivor, which is exactly what Docker's flag
   exists for (`docs/api-compat.md` #137).
-- **and `service satld stop` hangs** — 21 minutes, in the run that measured it,
+- **and `service satld stop` hangs**, 21 minutes, in the run that measured it,
   before it was killed ("A stop that does not finish", below). Use `pkill -9
   satld`: the raft directory is crash-safe, and this is the one state where a
   graceful stop is not available.
 
 **Restoring a second manager brings it back, and that is the whole recovery.**
-Node2's raft directory was restored from its own backup — the raft directory
-*only*, no certificates — and its daemon started:
+Node2's raft directory was restored from its own backup, the raft directory
+*only*, no certificates, and its daemon started:
 
 ```
 INFO satld::cluster: re-issued this node's certificate from the cluster CA already in the store
@@ -560,7 +560,7 @@ INFO satl_cluster::node: raft state found, resuming existing cluster raft_id=197
 INFO satld::cluster: cluster state ready node_id=2gsc8z0qa8db2sk8c7cigvaqv
 ```
 
-Two of three voters is a majority, so the cluster committed again immediately —
+Two of three voters is a majority, so the cluster committed again immediately,
 and the write that had been hanging landed: the retry answered `a secret named
 q2_after already exists`, which is the pending proposal from before the restore
 having gone through. `satl node ls` then showed node3 `Down`, correctly, and the
@@ -573,11 +573,11 @@ arithmetic and was not exercised:
 
 | Managers | Lost | Recovery | Backup needed |
 |---|---|---|---|
-| 3 | 1 | rejoin the node (6 s) — or restore it, either works | none |
+| 3 | 1 | rejoin the node (6 s), or restore it, either works | none |
 | 3 | 2 | restore **two** of the three raft directories: one is not a majority | 2 of 3 |
 | 3 | 3 | restore two, then rejoin the third (*inferred*) | 2 of 3 |
 | 1 | 1 | restore its raft directory | that one |
-| any | quorum, with no backups | **none. The cluster cannot be recovered** | — |
+| any | quorum, with no backups | **none. The cluster cannot be recovered** | - |
 
 That last row is the sharp edge of this whole section, and it is why the last
 line of advice is the boring one: **if the cluster matters, run three managers
@@ -587,7 +587,7 @@ once.
 
 Two managers deserve their own warning, for the same arithmetic: quorum is 2, so
 losing either one stops every write and leaves the survivor in the state
-described above — unable to admit a replacement, unable to be stopped
+described above, unable to admit a replacement, unable to be stopped
 gracefully. Two managers are strictly worse than one. Run one, or run three.
 
 ### The single-node cluster: the backup is the only way back
@@ -597,7 +597,7 @@ limits are. All three cases were run.
 
 **With a backup: full recovery.** A single-node cluster with a secret, a
 service, a running container and its own root CA had its raft directory
-destroyed and restored from a stopped-daemon tar. Everything came back — the
+destroyed and restored from a stopped-daemon tar. Everything came back, the
 secret, the service at 1/1, the container still `Up` (it never stopped), the
 same node id.
 
@@ -621,7 +621,7 @@ Caused by: this node holds a manager certificate for cluster 2e9za8a7stl3nuzf04v
 
 That refusal is the point. A manager certificate is only ever issued to a node
 that already has raft state, so a certificate over an empty raft directory is
-never a first boot — it is state that was lost. Starting anyway would mint a
+never a first boot, it is state that was lost. Starting anyway would mint a
 **second cluster under the same certificate**: empty, with a new cluster id and
 no root CA, looking perfectly healthy while every service, secret and network
 the operator had was gone. The daemon stops instead.
@@ -636,7 +636,7 @@ the raft state that is gone.
 **There is no `ForceNewCluster`.** Docker's `swarm init --force-new-cluster`
 rebuilds a cluster from one surviving manager's state by discarding the other
 members; SatL answers `501` (`docs/api-compat.md` #137) because a manager that
-*has* its raft state does not need forcing — restarting `satld` resumes it — and
+*has* its raft state does not need forcing, restarting `satld` resumes it, and
 one that does not have it has nothing to force from.
 
 So: on a one-manager deployment, schedule the copy. A stopped-daemon tar or a
@@ -659,7 +659,7 @@ while `netstat` shows an `ESTABLISHED` socket to that address, `nc -z` to it
 succeeds, and the member's own store stays empty or frozen and it campaigns in a
 loop. That was a replication batch bigger than the internal gRPC message limit:
 openraft rebuilt the same oversized message on every retry, so nothing ever
-progressed. It is fixed — the batch is now derived from the message limit — and
+progressed. It is fixed, the batch is now derived from the message limit, and
 it mattered precisely here, because the manager that has most to catch up on is
 the one that just rejoined or was just restored. If a build ever shows this
 signature again, note what does *not* help: restarting the member, and waiting.
@@ -686,14 +686,14 @@ elect around it as long as a quorum of them is left, and this one simply stops
 contributing.
 
 **A stop that does not finish.** `service satld stop` took 0.05 s on every
-healthy manager here, and hung on every manager that had lost its quorum — three
+healthy manager here, and hung on every manager that had lost its quorum, three
 times, once for 21 minutes before it was killed. What is certain is where it is
 *not* stuck: the API socket is already gone (`satl` on that node answers
 `Cannot connect to the SatL daemon`) and the daemon has not yet reached
 `shutting down raft node`, so the block is between those two, and a write that
 can never commit is in flight through both. The mechanism has not been pinned
 down further, so treat the *symptom* as the fact: if a stop hangs, `pkill -9
-satld` is safe — the raft directory is crash-safe by construction and recovery
+satld` is safe, the raft directory is crash-safe by construction and recovery
 from `kill -9` is part of the M0 acceptance test. Two consequences worth
 internalising: take a backup only after the daemon has *actually* gone
 (`pgrep satld`), not after `service satld stop` returns, and expect
@@ -702,7 +702,7 @@ indefinitely if any node is in this state.
 
 ### What this section does not cover
 
-Only cluster state — the raft directory on managers. Images, layers, containers
+Only cluster state, the raft directory on managers. Images, layers, containers
 and volumes are node-local (`satl system prune`, below, has the same asymmetry),
 they are rebuilt by pulling and by rescheduling, and none of them is in a raft
 backup. There is no cluster-wide backup command and no `satl` verb for any of
@@ -710,7 +710,7 @@ this: what is above is `zfs`, `tar` and the two cluster commands, on purpose.
 
 ## Resource limits (`--memory`, `--cpus`)
 
-Enforcement requires resource accounting, which is a **boot-time tunable** — it
+Enforcement requires resource accounting, which is a **boot-time tunable**, it
 cannot be switched on at runtime:
 
 ```sh
@@ -722,7 +722,7 @@ sysctl kern.racct.enable                          # expect 1
 `satld` probes it at startup and says which mode it is in (`rctl(8) resource limits
 are enforced`, or a warning that limits are *accepted but not enforced*). With
 accounting off, `--memory`/`--cpus` are honoured as far as the API is concerned and the
-reason is recorded in the task's status message — the daemon never refuses to start.
+reason is recorded in the task's status message, the daemon never refuses to start.
 
 Do **not** set `rctl_enable="YES"` in `rc.conf`: that loads static rules from
 `/etc/rctl.conf`, while SatL adds and removes its own rules per container.
@@ -731,25 +731,25 @@ What the flags actually do on FreeBSD:
 
 | Flag | Rule | Behaviour |
 |---|---|---|
-| `--memory` | `jail:<id>:memoryuse:sigkill=<bytes>` | The process is **killed** when the jail's resident set exceeds the cap — the closest equivalent to a Linux cgroup OOM kill. `memoryuse:deny` would be silently useless: RSS is not a deniable resource in the kernel, yet `rctl` accepts the rule (measured: a 64 MB `deny` cap allocated 200 MB without complaint). |
+| `--memory` | `jail:<id>:memoryuse:sigkill=<bytes>` | The process is **killed** when the jail's resident set exceeds the cap, the closest equivalent to a Linux cgroup OOM kill. `memoryuse:deny` would be silently useless: RSS is not a deniable resource in the kernel, yet `rctl` accepts the rule (measured: a 64 MB `deny` cap allocated 200 MB without complaint). |
 | `--cpus` | `jail:<id>:pcpu:deny=<percent>` | The scheduler **throttles** the jail toward the cap. Accounting is a decaying average, so the cap is approached rather than imposed instantly: a fixed CPU-bound workload measured 4.4 s unlimited and 10.5 s at `pcpu:deny=20`, converging further on longer runs. |
 
 Inspect the live rules with `rctl -h jail:<container id>`; they are removed when the
-container is removed. Accounting adds per-process bookkeeping in the kernel — modest,
+container is removed. Accounting adds per-process bookkeeping in the kernel, modest,
 but it is why FreeBSD's GENERIC ships `RACCT_DEFAULT_TO_DISABLED`.
 
-Rules persist after the jail dies — a crash, or a satld older than the 2026-08-15
+Rules persist after the jail dies, a crash, or a satld older than the 2026-08-15
 fix (which removed rules after the jail was already gone), leaves them installed.
 They are still removable: `rctl -r jail:<name>` on a dead subject returns 0 and
 drops the rules (measured on FreeBSD 15.1). `No such process` is what rctl answers
 when the filter matches *no rule*, not when the subject is dead. Since 2026-08-17
 `satld` purges its own orphans at startup: the reconciliation pass removes every
-`jail:<task id>` rule subject that has no live prison — SatL-shaped subjects only,
+`jail:<task id>` rule subject that has no live prison, SatL-shaped subjects only,
 never another tool's rules.
 
 ## Overlay networks (M3)
 
-`if_vxlan` is **not in the GENERIC kernel** — it is `/boot/kernel/if_vxlan.ko`, and
+`if_vxlan` is **not in the GENERIC kernel**, it is `/boot/kernel/if_vxlan.ko`, and
 `config -x /boot/kernel/kernel` mentions vxlan nowhere. `satld` runs
 `kldload -n if_vxlan` itself before it creates the first VTEP, so an overlay works on
 an unprepared host; load it at boot anyway so a `kldload` failure surfaces once, at
@@ -764,8 +764,8 @@ kldstat -m if_vxlan                                 # expect one line
 **Set the overlay MTU from a measurement, never from a guess.** VXLAN costs 50 bytes
 over IPv4; SatL computes `underlay MTU − 50` and sets it explicitly on the vxlan
 interface, the bridge and each in-jail epair end. On the OVH VMs the underlay is 1500,
-so the overlay is 1450. If your underlay differs, measure it — every node to every
-other, with DF set — before believing anything else:
+so the overlay is 1450. If your underlay differs, measure it, every node to every
+other, with DF set, before believing anything else:
 
 ```sh
 ping -c 1 -D -s 1472 <peer underlay ip>    # 1472 + 28 = 1500: largest that must pass
@@ -774,7 +774,7 @@ ping -c 1 -D -s 1473 <peer underlay ip>    # must fail: "Message too long"
 
 ### Diagnosing a black-holed or one-way overlay
 
-Read `/var/log/messages` first — as everywhere else in SatL, the CLI shows a summary
+Read `/var/log/messages` first, as everywhere else in SatL, the CLI shows a summary
 and the log shows which command failed and why. Then work down this list; it is
 ordered by how often each step is the answer.
 
@@ -784,7 +784,7 @@ ordered by how often each step is the answer.
 | one pair of tasks fails, everything else works | the FDB on **both** nodes | the FDB is per direction. The node reporting 100 % loss is usually the *correctly* configured one: its replies are unicast to a MAC the other node cannot resolve. Diagnose from the sender of the replies |
 | everything works but throughput is poor and packet counts are doubled | `netstat -s -p ip` on the **hosts**, both ends | non-zero `fragments created` / `fragments received` on a healthy-looking overlay is a forgotten −50. Nothing else reports it, and throughput on a shared virtual switch does not |
 | big transfers stall while pings answer | same counters, plus `fragments dropped` | a path that discards IP fragments, on top of a too-large overlay MTU. Correcting the MTU fixes it |
-| a task loses the network some time after a config change | the task's ARP table | a static ARP or gateway entry pointing at a MAC that no longer answers. Removing a network's gateway address from under running tasks is a silent black hole — tear the endpoints down first |
+| a task loses the network some time after a config change | the task's ARP table | a static ARP or gateway entry pointing at a MAC that no longer answers. Removing a network's gateway address from under running tasks is a silent black hole, tear the endpoints down first |
 
 Useful commands, in that order:
 
@@ -794,7 +794,7 @@ ifconfig -g vxlan                                     # every VTEP on the host
 netstat -s -p ip | grep -i fragment                   # host stack: outer fragmentation
 netstat -I <satl-vx-*> -b                             # Ipkts/Opkts/Oerrs on the tunnel
 sysctl -n net.link.vxlan.<unit>.ftable.count          # entries the kernel holds
-sysctl -n net.link.vxlan.<unit>.ftable.dump           # the entries — see the caveat below
+sysctl -n net.link.vxlan.<unit>.ftable.dump           # the entries, see the caveat below
 ```
 
 Three counter traps, all measured (`docs/vxlan.md`):
@@ -823,12 +823,12 @@ anyway).
 
 ## Encrypted overlay networks (`--opt encrypted`, M6)
 
-The contract is in `docs/networking.md` ("M6 — encrypted overlay networks"); this
+The contract is in `docs/networking.md` ("M6, encrypted overlay networks"); this
 section is what runs where, and what to look at when it misbehaves.
 
 **The node-wide enc0/IPsec substrate is set once and never restored.** On the
 first encrypted network a node hosts, `satld` runs
-`sysctl net.enc.in.ipsec_filter_mask=2` and `ifconfig enc0 up` — decapsulated
+`sysctl net.enc.in.ipsec_filter_mask=2` and `ifconfig enc0 up`, decapsulated
 packets are then presented to pf on `enc0` after the ESP header is stripped,
 which is what lets the cleartext guard tell ESP from injection. The sysctl is
 node-wide, so it is deliberately **not** put back when the last encrypted
@@ -837,12 +837,12 @@ presentation in the meantime, and the mask alone is inert without matching
 SAs. Expect `enc0` to stay up and the sysctl to stay 2 forever after; that is
 the design, not a leak. The `satl/guard` anchor itself (block the encrypted
 VXLAN ports 4790:4999 on the underlay, `pass ... no state` on `enc0`) is
-loaded on the first encrypted network and flushed when the last one leaves —
+loaded on the first encrypted network and flushed when the last one leaves,
 `pfctl -a satl/guard -sr` shows the live rules and their counters.
 
 **Rotation events are logged on the leader only.** The keyring loop is a
 leader-only component, so `keyring transition` (with `phase=generate|append|
-promote|prune` and the network name) appears in exactly one manager's log —
+promote|prune` and the network name) appears in exactly one manager's log,
 grep **all** managers before concluding rotation is stuck, and remember
 `/var/log/messages` rotates roughly hourly (`bzcat messages.*.bz2 | grep -a`):
 
@@ -851,7 +851,7 @@ sudo grep -a 'keyring transition' /var/log/messages    # run on each manager
 ```
 
 The cadence knobs `keyring_rotate_after_secs` / `keyring_phase_settle_secs`
-(defaults 43200/60, production 12 h / 1 min) are testing knobs — see "Testing
+(defaults 43200/60, production 12 h / 1 min) are testing knobs, see "Testing
 key rotation: the `keyring_*_secs` knobs" below; a non-default value draws a
 loud startup warning.
 
@@ -869,19 +869,19 @@ sudo setkey -DP                                         # the outbound policies
 To watch the *decapsulated* packets during a capture, present them to bpf on
 `enc0` too: `sudo sysctl net.enc.in.ipsec_bpf_mask=2`, then
 `tcpdump -ni enc0 udp port <port>`. satld sets the **filter** mask (pf), not
-the bpf mask — the bpf one is a capture-time knob for the operator.
+the bpf mask, the bpf one is a capture-time knob for the operator.
 
 **Troubleshooting.** The security reconcile is level-triggered: it runs on
 every assignment shipment and on the 1-minute periodic overlay resync, so a
 node whose guard anchor, SAs or SPs were flushed or tampered with converges
-back **within a minute** — if it does not, the node's log says which of
+back **within a minute**, if it does not, the node's log says which of
 `sysctl`/`ifconfig`/`pfctl`/`setkey` failed and why. A cleartext probe from a
 node whose SAD/SPD was flushed is **expected to be dropped** by the guard:
 nothing is decapsulated onto the overlay bridge, while the block rule's
 counter moves (`pfctl -a satl/guard -sr`) and the packet hits `pflog0`
 (`kldload pflog` first; tcpdump's PFLOG decode prints the packet without a
 "block" keyword, so grep for the port). The probe's ping still shows 100 %
-loss for the orthogonal reason that replies are ESP towards a flushed node —
+loss for the orthogonal reason that replies are ESP towards a flushed node,
 the bridge capture and the counters are the evidence, not the ping.
 
 **Upgrades: every manager must run the new build before the first encrypted
@@ -889,11 +889,11 @@ network.** The `encrypted` / `keys` / `vxlan_port` fields ride on the `Network`
 object as unknown fields to old code, and serde drops unknown fields on
 re-serialize: an old-code manager that rewrites the network (any allocator
 pass) strips them, and every new-code node then reads `encrypted=false` and
-tears down its SAs and guard — a silent downgrade to cleartext with no error
+tears down its SAs and guard, a silent downgrade to cleartext with no error
 anywhere. So: finish the rolling manager upgrade first, and do not create
 encrypted networks while it is in progress. The worker side fails closed
 instead: an old-code worker shipped an encrypted network ignores the new
-fields, builds its VTEP on the default port 4789 and blackholes — restart it
+fields, builds its VTEP on the default port 4789 and blackholes, restart it
 on the new build.
 
 ## Published ports (M3)
@@ -902,15 +902,15 @@ on the new build.
 default. Since M6d this is a real routing mesh **on managers**: every manager
 answers on the port, and one running no replica of the service relays over the
 `ingress` overlay to a healthy task (`docs/api-compat.md` #75). A **worker**
-still answers only when it runs a replica — it has no store replica to compute
+still answers only when it runs a replica, it has no store replica to compute
 the cluster-wide pool from. Operator consequences:
 
 - a load balancer in front of the swarm can treat every **manager** as a
-  backend; health-check the port anyway — the check is what keeps a dead
+  backend; health-check the port anyway, the check is what keeps a dead
   backend out of *your* pool too;
 - on a relayed connection the application sees the **relaying node's ingress
   gateway address, not the client's** (the SNAT is what makes the reply come
-  back through the relay — same trade Docker's mesh makes). Where the real
+  back through the relay, same trade Docker's mesh makes). Where the real
   client address matters (logs, rate limiting, fail2ban), use the opt-in
   PROXY-protocol mode below;
 - reach a published port from **another host**. pf applies `rdr` to packets *entering*
@@ -923,7 +923,7 @@ A service labeled `satl.publish.proxy_protocol=v2` publishes its TCP ports
 through `satld` itself instead of pf: every manager listens on the published
 port, picks a healthy task from the same set that feeds the pf pool, dials it
 over the overlay and writes a PROXY protocol v2 header before splicing the
-connection. The task — if it parses PROXY v2 — sees the **real client
+connection. The task, if it parses PROXY v2, sees the **real client
 address**, which the pf mesh cannot deliver. Example:
 
 ```sh
@@ -945,7 +945,7 @@ address on relayed connections. What proxy mode buys beyond the address:
 real health-aware member selection (a member that refuses is skipped to the
 next), where pf's pool is just a table. Operational notes:
 
-- a proxy-mode port never has an `rdr` rule — check with
+- a proxy-mode port never has an `rdr` rule, check with
   `pfctl -a satl/rdr -s nat`: the port must be absent from it;
 - UDP ports of a labeled service stay on the pf path;
 - a port with no healthy member closes connections (a drained pool is
@@ -968,21 +968,21 @@ grep -a 'published ports converged' /var/log/messages
 Each published `(port, protocol, container port)` triple is one `table` plus one
 static `rdr` rule (M6): the task addresses live in the table, so a replica
 starting or dying is a `pfctl -T replace` on the table and **not** an anchor
-reload — established connections are not touched by membership changes. The
+reload, established connections are not touched by membership changes. The
 ruleset itself is reloaded only when the *set* of published triples changes,
 and a triple that disappears has its table killed (`persist` tables survive a
 flush with their members), so `-T show` never reports a pool that no longer
 exists.
 
-The anchor is re-derived from the node's live tasks on a short periodic level —
+The anchor is re-derived from the node's live tasks on a short periodic level,
 and, on managers, woken by the store's event feed the moment a task's state or
 ports move, so a stopping task leaves every node's pool within about a second
-rather than a sweep interval — so it repairs
+rather than a sweep interval, so it repairs
 itself: one flushed by hand (rules or tables) comes back within a minute, and one
 lost across a daemon restart comes back with the daemon. `satld` logs one line per
 *change*, carrying every redirect as `<task id>=<published>/<proto>-><task ip>:<container port>`,
 so grep by task id or by port number. A node whose published ports are steady logs
-nothing here and runs no pfctl at all — silence is the healthy state.
+nothing here and runs no pfctl at all, silence is the healthy state.
 
 Two tasks of one service on one node share one pool table, listed by
 `-T show`, which is what to expect after scaling a service past the node count.
@@ -992,7 +992,7 @@ matching translation rule and the others would never be reached.
 The round-robin pool is also what made one class of bug visible, and worth recognising
 if it ever comes back: **connections to one node failing every other attempt, in
 bursts of about five seconds**. That is one dead address in a two-address pool, and its
-cause was the port pass publishing a task the manager had already ordered to stop —
+cause was the port pass publishing a task the manager had already ordered to stop,
 the node's own agent had removed the redirect, and the pass put it back because the
 store's copy of that task was still `RUNNING` for another few hundred milliseconds. The
 signature to grep for on the node is a task id that appears in a `published ports
@@ -1003,7 +1003,7 @@ grep -a -E 'published ports (removed|converged)' /var/log/messages
 ```
 
 On a meshed manager the anchor also shows the mesh's two rule shapes after
-the rdr rules — per pool the return-path SNAT whose target is this node's
+the rdr rules, per pool the return-path SNAT whose target is this node's
 ingress gateway, then the MSS clamp (`docs/networking.md`, M6d):
 
 ```sh
@@ -1016,7 +1016,7 @@ satl network inspect ingress   # the mesh's overlay: every node's gateway under 
 SatL services resolve by DNS-RR inside the overlays: `proxy_pass
 http://myservice:80` from an nginx task gets one answer per healthy task.
 **nginx open source resolves that name once, at startup, and pins the first
-address forever** — so a proxying task keeps sending every request to one
+address forever**, so a proxying task keeps sending every request to one
 replica, and when that replica dies the proxy serves 502s against a service
 that is up everywhere else. This is the single most common way a SatL (or
 Docker Swarm) deployment looks broken while nothing is.
@@ -1027,7 +1027,7 @@ The fix is nginx's runtime resolver, and both halves of it are load-bearing:
 resolver 10.100.0.4 valid=10s;   # the node's gateway on the overlay (satl network inspect)
 server {
     location / {
-        set $upstream http://myservice:80;   # a VARIABLE — this is what forces
+        set $upstream http://myservice:80;   # a VARIABLE, this is what forces
         proxy_pass $upstream;                # resolution per request, not at startup
     }
 }
@@ -1035,7 +1035,7 @@ server {
 
 Without the variable, `proxy_pass http://myservice:80` is resolved once even
 with a `resolver` line present. The gateway address to name is the node's own
-on the overlay the proxying task is attached to — the embedded DNS responder
+on the overlay the proxying task is attached to, the embedded DNS responder
 listens there. The same trap exists in every client that resolves once
 (most HTTP libraries' connection pools do not re-resolve either); the general
 rule is: against a DNS-RR service, resolution must happen per connection, and
@@ -1043,8 +1043,8 @@ stale-connection errors must be retried.
 
 A redirect is now created only for a task whose desired state is still below
 `SHUTDOWN`, so an ordered stop cannot produce this. A container that exits *on its
-own* leaves a narrower version of the same window — there the store's lagging copy of
-the observed state is the only signal a manager-side pass has — bounded by one pass
+own* leaves a narrower version of the same window, there the store's lagging copy of
+the observed state is the only signal a manager-side pass has, bounded by one pass
 (5 s) and by the agent removing the redirect the moment the container dies.
 
 ## Published ports and healthchecks (M5)
@@ -1052,7 +1052,7 @@ the observed state is the only signal a manager-side pass has — bounded by one
 **`pf` does not health-check what it redirects to.** It is a packet filter: a
 `round-robin` pool distributes connections and never probes a target, so a container
 that stops answering on its port keeps receiving its share of the traffic. Nothing in
-pf will ever fix that, and nothing should — what takes a dead backend out of the pool is
+pf will ever fix that, and nothing should, what takes a dead backend out of the pool is
 one layer up. An unhealthy task is stopped and reported `FAILED`, it leaves the live
 set, and the port pass rewrites the whole anchor without it. Docker Swarm works the same
 way (IPVS does not probe backends either; orchestration removes the task), so the
@@ -1061,7 +1061,7 @@ question is not architecture, it is how many seconds.
 Which makes the healthcheck the load-bearing part: **without a probe, `RUNNING` means
 only "the jail started".** Measured when publishing landed: 5 ms after `jail start`,
 while the nginx in the same jail needed 250 ms to bind its port. So an unprobed published
-service is answered *before* it can serve — and, worse, stays answered after it stops
+service is answered *before* it can serve, and, worse, stays answered after it stops
 serving, for as long as its jail is up. A `satl run -p` container is always in that
 state: the container API reads no healthcheck at all and `satl run` has no flag to set
 one (`docs/api-compat.md` #127). If a published service has no healthcheck, health-check
@@ -1079,8 +1079,8 @@ dead container keeps its share of the traffic (pf does not probe a redirect pool
 ### The numbers, and the one they cost
 
 A published service whose healthcheck leaves `interval`, `timeout` or `retries` unset
-gets tighter values than Docker's — **5 s interval, 3 s timeout, 2 retries** instead of
-30 s / 30 s / 3 — and only where they are earned: it publishes a port, and it left the
+gets tighter values than Docker's, **5 s interval, 3 s timeout, 2 retries** instead of
+30 s / 30 s / 3, and only where they are earned: it publishes a port, and it left the
 field unset (`docs/api-compat.md` #125, #126). They are written into the stored spec, so
 `satl service inspect` shows them, and one log line names them at creation:
 
@@ -1109,7 +1109,7 @@ The timeline the log gives you, which is the shape to recognise:
 Note *what* removed it: two failed probes, 5 s apart, then the container was **killed**.
 
 **That is the cost, and it is the whole cost of this version.** In SatL "drop from the
-pool" and "kill and replace" are the same event — an unhealthy task is stopped and
+pool" and "kill and replace" are the same event, an unhealthy task is stopped and
 `FAILED` (`docs/api-compat.md` #88), where Docker leaves the container running and merely
 takes it out of the load balancer. So tightening detection ninefold makes replacement
 ninefold more eager too. A long GC pause, a wedged dependency, a probe that blips under
@@ -1117,9 +1117,9 @@ load: what used to need 90 s of failure to cost you a container now needs 10 s. 
 how a restart storm starts where the operator only wanted the traffic to stop, and the
 tighter the probe, the smaller the hiccup that triggers it.
 
-Two things bound it. `retries` is what separates a blip from a sustained failure — 2
+Two things bound it. `retries` is what separates a blip from a sustained failure, 2
 retries at 5 s means the probe must fail for **10 s continuously**, and a single success
-resets the streak — and M4's restart budget bounds the loop: `RestartPolicy.MaxAttempts`
+resets the streak, and M4's restart budget bounds the loop: `RestartPolicy.MaxAttempts`
 counts replacements per replica and per spec version and survives a leadership change, so
 a service created with `MaxAttempts` stops replacing instead of churning forever ("The
 restart budget survives a manager restart", above). The default is unlimited, so on a
@@ -1128,7 +1128,7 @@ service that matters, set it.
 ### If you want the tighter pool without the eager restart
 
 Trade detection latency for stability, deliberately, and know the arithmetic. A verdict
-takes up to **`retries + 1` cycles** of `interval + timeout` — one cycle more than
+takes up to **`retries + 1` cycles** of `interval + timeout`, one cycle more than
 `retries` because a container stops answering *between* two probes and the probe already
 in flight may have passed a moment before. The stop that follows takes up to
 `stop_grace_period` (10 s by default), and if the agent's own `pfctl` load fails, the
@@ -1148,12 +1148,12 @@ how long a dead one keeps taking traffic. Raising `retries` is usually the bette
 it lengthens the failure a blip must sustain without slowing the probe down, so a
 genuinely dead backend still leaves within a couple of intervals of the verdict. Raising
 `interval` slows detection and *also* slows the first probe after a start. Setting
-either explicitly disables SatL's default for that field — including the coherent
+either explicitly disables SatL's default for that field, including the coherent
 timeout, which then becomes `min(30 s, interval)`, so set `timeout` too if the probe is
 slow. Asking for Docker's exact behaviour is `Interval: 30000000000`, `Timeout:
 30000000000`, `Retries: 3` in the healthcheck.
 
-> **CLI gap.** There are no `--health-*` flags on `satl service create` — none of
+> **CLI gap.** There are no `--health-*` flags on `satl service create`, none of
 > docker's `--health-cmd`, `--health-interval`, `--health-retries`,
 > `--health-timeout`, `--health-start-period` or `--no-healthcheck`. A healthcheck can
 > only be declared in a compose file (`healthcheck:`, `satl compose up`) or over the
@@ -1172,21 +1172,21 @@ slow. Asking for Docker's exact behaviour is `Interval: 30000000000`, `Timeout:
 > Durations on the wire are nanoseconds. Leave `Interval`, `Timeout` and `Retries` out
 > to get the values above.
 
-**Coming in M6: unhealthy will stop meaning killed.** The decoupling — a task that stays
-running but leaves the pool, replaced only on prolonged failure, which is Docker's model
-— removes the restart-storm risk above and lets you inspect a sick container instead of
+**Coming in M6: unhealthy will stop meaning killed.** The decoupling, a task that stays
+running but leaves the pool, replaced only on prolonged failure, which is Docker's model,
+removes the restart-storm risk above and lets you inspect a sick container instead of
 watching it vanish. It needs a task state the machine does not have yet, and it retires
 `docs/api-compat.md` #88. No date; what is written above is what the daemon does today.
 
 ## Certificate renewal (M4)
 
 Every node's mTLS certificate (architecture §12.1) is renewed automatically at a
-random point in the 50-80 % of its validity — 90 days by default, so a renewal is
-roughly a 50-70 day event — re-issued from the cluster root held in the raft store,
+random point in the 50-80 % of its validity, 90 days by default, so a renewal is
+roughly a 50-70 day event, re-issued from the cluster root held in the raft store,
 written to `<state_dir>/certs`, and **swapped into the live TLS configuration in the
 same breath**. No restart, ever: the listeners and every outbound channel resolve
 their certificate per handshake through the daemon's live identity, so the very next
-connection — inbound or outbound — presents the new certificate. Role changes
+connection, inbound or outbound, presents the new certificate. Role changes
 (promotion/demotion) ride the same mechanism, since the role *is* the certificate's
 OU.
 
@@ -1200,7 +1200,7 @@ INFO satld::identity: node certificate renewed and live TLS configuration swappe
 ```
 
 Grep by `node_id`, or for `certificate renewed`. To see the certificate a node is
-*actually presenting* (as opposed to the one on its disk), ask the listener — this is
+*actually presenting* (as opposed to the one on its disk), ask the listener, this is
 the check that distinguishes a live swap from a stale config:
 
 ```sh
@@ -1215,23 +1215,23 @@ Two things are expected and are not bugs:
   severed by a renewal and keeps working. The next reconnect (network blip, leader
   change, daemon restart on the *other* side) picks up the new certificate.
 - **The on-disk `not_after` and the presented `not_after` match only after the swap
-  log line.** Between the disk write and the swap there is no observable window — they
+  log line.** Between the disk write and the swap there is no observable window, they
   happen in the same loop iteration.
 
 If renewal *fails* (CA material missing from the store, disk full), the daemon logs
 `certificate renewal failed; will retry` and backs off exponentially (5 s doubling,
 capped at 1 h). The certificate stays valid for a long while after the renewal window
-opens — 20-45 days at production validity — so a few failed attempts are a warning,
+opens, 20-45 days at production validity, so a few failed attempts are a warning,
 not an incident.
 
 ### The failure signature of a stale TLS config
 
-What breaks when renewal writes to disk but nothing swaps the live configuration —
+What breaks when renewal writes to disk but nothing swaps the live configuration,
 the pre-M4 behavior, reproduced on the test cluster with the swap deliberately
 disabled. It is also what a *bug* in the swap would look like, so it is worth
 recognizing. The treacherous part is the shape of the failure: **nothing** breaks at
-expiry. Established connections never re-check certificates, so the cluster coasts —
-reads work, `satl node ls` says `Ready` everywhere — until the first reconnect after
+expiry. Established connections never re-check certificates, so the cluster coasts,
+reads work, `satl node ls` says `Ready` everywhere, until the first reconnect after
 expiry (a network blip, a daemon restart on a peer, an idle connection cycling). Then,
 all at once:
 
@@ -1249,25 +1249,25 @@ all at once:
   err=Unreachable node: ... certificate expired`), quorum is lost, and every write is
   refused: `Error response from daemon: cannot update the service: this cluster has
   no raft leader right now`;
-- `satl node ls` **still shows every node Ready with the old Leader** — it reads the
+- `satl node ls` **still shows every node Ready with the old Leader**, it reads the
   last replicated store state, which can no longer change. Do not trust that column
   in this failure mode; trust `openssl s_client` (above) and the log;
 - and the tell that separates this from every other TLS failure: the renewal loop is
   *still succeeding*, interleaving `issued node certificate` / `node certificate
   renewed` lines between the expired-handshake warnings. Certificates on disk are
   fresh; the process is presenting a stale one. **The fix is a daemon restart**, which
-  loads the disk certificate — and on any build with live swap working this state is
+  loads the disk certificate, and on any build with live swap working this state is
   unreachable, because the swap happens in the same loop iteration as the disk write.
 
 ### Testing renewal: the `cert_validity` knob
 
 `satld.toml` accepts `cert_validity = "5m"` (`s`/`m`/`h`/`d` suffixes), which sets the
-validity of every certificate this daemon issues — its own, and the ones its `NodeCA`
+validity of every certificate this daemon issues, its own, and the ones its `NodeCA`
 signs for joiners when it leads. **It exists to test renewal** by compressing the
 50-80 % window from weeks to minutes; values below one hour draw a loud startup
 warning, values below one minute are refused at config load. Never set it on a real
 cluster; the default (no key) is 90 days. The cluster harness passes it through
-`SATL_SATLD_EXTRA='cert_validity = "5m"' sh tests/cluster/deploy.sh` — the deploy
+`SATL_SATLD_EXTRA='cert_validity = "5m"' sh tests/cluster/deploy.sh`, the deploy
 template itself never carries it. The backdate every certificate gets against clock
 skew (1 h) is capped at an eighth of the validity, so even a five-minute certificate
 renews *before* it expires rather than after.
@@ -1275,7 +1275,7 @@ renews *before* it expires rather than after.
 ### Testing key rotation: the `keyring_*_secs` knobs
 
 `satld.toml` accepts `keyring_rotate_after_secs = 43200` and
-`keyring_phase_settle_secs = 60` (plain integers, seconds) — the cadence of the
+`keyring_phase_settle_secs = 60` (plain integers, seconds), the cadence of the
 encrypted-overlay keyring (`--opt encrypted`): how old a network's keyring may get
 before a fresh key is appended, and how long each rotation phase (append, promote,
 prune) settles before the next. **They exist to test rotation**: with the 12h
@@ -1294,8 +1294,8 @@ before every node has picked the ring up.
 live cluster, with **no downtime**: services keep serving, dispatcher sessions stay
 up, writes keep committing through every phase. Run it from (or pointed at) any
 manager; it blocks until the rotation converges (`--detach` to return immediately,
-`--quiet` for just the new PEM). Rotate when the root key may have been exposed —
-a stolen manager disk, a compromised backup of the raft store — or on a compliance
+`--quiet` for just the new PEM). Rotate when the root key may have been exposed,
+a stolen manager disk, a compromised backup of the raft store, or on a compliance
 clock.
 
 What actually happens, in order (architecture §12.3):
@@ -1304,13 +1304,13 @@ What actually happens, in order (architecture §12.3):
    trust bundle becomes *old + new* (transitional). From this moment `GET /swarm`
    reports `RootRotationInProgress: true` and `TLSInfo.TrustRoot` carries two
    certificates.
-2. **Both join tokens are regenerated immediately** — the token digest pins the
+2. **Both join tokens are regenerated immediately**, the token digest pins the
    trust bundle, so every token minted before the rotation is void the moment it
    starts (and the tokens are regenerated *again* at completion). Re-print them with
    `satl swarm join-token worker|manager`. A stale token fails its join cleanly:
    `root CA bundle does not match the join token ... if its root CA was rotated
    since (satl ca rotate), every older token is void`.
-3. Every node is re-issued under the new root, live — same pid, no dropped
+3. Every node is re-issued under the new root, live, same pid, no dropped
    sessions. New leaves carry the cross-signed intermediate, so they satisfy peers
    still anchored on the old root *and* peers already on the new one, whichever
    state each peer is in. Watch it happen:
@@ -1327,14 +1327,14 @@ What actually happens, in order (architecture §12.3):
    one atomic store write. `satl ca` now prints one certificate, and it is the new
    one.
 
-The rotation **waits for every node object**, deliberately — a node the store still
+The rotation **waits for every node object**, deliberately, a node the store still
 lists must be re-issued before the old root can be dropped. Consequences:
 
 - **A node that is down during the rotation holds it open.** If it will come back,
   just wait: a node returning mid-rotation reconnects with its old certificate (the
   old root is still trusted), receives the transitional bundle and the re-issue mark
   over its session, converges, and the rotation finishes. If it will *never* come
-  back, remove it: `satl node rm --force <node>` — the reconciler stops waiting on
+  back, remove it: `satl node rm --force <node>`, the reconciler stops waiting on
   the next tick.
 
   The leader says which nodes are holding it, once per change rather than on every
@@ -1358,7 +1358,7 @@ lists must be re-issued before the old root can be dropped. Consequences:
   obvious guess is wrong and it decides where you look:
 
   - the returning node still verifies the managers *fine*. Their leaves carry the
-    cross-signed intermediate, which bridges back to the root it still holds —
+    cross-signed intermediate, which bridges back to the root it still holds,
     that bridging is exactly what the cross-signing is for, and it keeps working
     for the node that is behind;
   - the managers do **not** accept its leaf: it was signed by a root they have
@@ -1381,7 +1381,7 @@ lists must be re-issued before the old root can be dropped. Consequences:
   the verifier holds and fails on the signature. Grep for the sentence, not the
   rustls spelling.
 
-  **On the returning node itself you will not see a certificate error** — it has
+  **On the returning node itself you will not see a certificate error**, it has
   none to report. What it shows is the managers' fatal alert, once per reconnect
   attempt:
 
@@ -1392,10 +1392,10 @@ lists must be re-issued before the old root can be dropped. Consequences:
 
   `DecryptError` from a peer means *the peer rejected this node's certificate*. If
   that is what a node shows and it will not come back, go read a manager's log for
-  the sentence above — that is where the reason and the recovery are printed.
+  the sentence above, that is where the reason and the recovery are printed.
 
   There *is* a node-side diagnosis, and it fires in the cases where this node is
-  the one doing the rejecting — a peer from a different cluster, or a node more
+  the one doing the rejecting, a peer from a different cluster, or a node more
   than one rotation behind, where no cross-signed bridge is left:
 
   ```
@@ -1422,7 +1422,7 @@ lists must be re-issued before the old root can be dropped. Consequences:
     is not the leader answers `IssueNodeCertificate` with the leader's address and
     the joining daemon follows that redirect itself (`following its redirect to the
     leader` in its log). An operator pasting a manager address has no way to know
-    which one leads, so this has to hold — before this was fixed, pointing the
+    which one leads, so this has to hold, before this was fixed, pointing the
     documented recovery at a follower failed with `this manager is not the raft
     leader; certificates are signed by the leader`, and the node stayed stranded.
     If *no* manager is currently the leader, the join says so and says to wait for
@@ -1431,7 +1431,7 @@ lists must be re-issued before the old root can be dropped. Consequences:
     cluster-first: a daemon always has a cluster, so leaving discards this node's
     cluster state and immediately forms a **fresh single-node cluster** of its own,
     with its own root CA and its own tokens (`docs/api-compat.md` #86). Until it
-    joins, `satl node ls` on it lists one node — itself, as Leader. That is
+    joins, `satl node ls` on it lists one node, itself, as Leader. That is
     expected, and it is also why the node comes back under a **new node id**: the
     identity it rejoins with is issued by the cluster it joins. Its old containers
     were long since rescheduled elsewhere; the reconciliation pass reaps what is
@@ -1450,8 +1450,8 @@ the rotation acts on lives in the raft store, and the reconciler will re-assert 
 The two operator levers are `satl node rm --force` (stop waiting for a dead node)
 and rejoining a node that missed the rotation.
 
-**If a whole test or lab cluster has drifted apart** — several nodes each in a
-cluster of their own after a botched rotation — do not chase it node by node:
+**If a whole test or lab cluster has drifted apart**, several nodes each in a
+cluster of their own after a botched rotation, do not chase it node by node:
 `sh tests/cluster/reset.sh` wipes state on every node in `tests/cluster/inventory.toml`
 and restarts the daemons, and `sh tests/cluster/run.sh init_and_join` forms a fresh
 three-node cluster from there. On a production cluster the equivalent is per node:
@@ -1460,18 +1460,18 @@ three-node cluster from there. On a production cluster the equivalent is per nod
 ## Worker nodes and live role changes (M4)
 
 `satl swarm join --token <worker token> <manager>:2377` brings a node up as a
-**worker**: it runs tasks, the overlay data plane and DNS, and nothing else — no
+**worker**: it runs tasks, the overlay data plane and DNS, and nothing else, no
 raft, no store, no listener of its own (architecture §1.2). What an operator needs
 to know:
 
 - **Cluster commands answer Docker's refusal on a worker.** `satl service ls`,
   `satl node ls`, `satl network ls` etc. return 503 "This node is not a swarm
-  manager. Worker nodes can't be used to view or modify cluster state. ..." —
+  manager. Worker nodes can't be used to view or modify cluster state. ...",
   run them on a manager. `satl ps`, `satl logs`, `satl exec`, `satl images` and
   `satl pull` keep working and show that node's own containers
   (`docs/api-compat.md` #79-#86). Container create/start/stop/rm are refused too:
   every SatL container is a service task, and those are manager writes (#80).
-- **A worker finds its cluster again through `<state_dir>/managers.json`** — the
+- **A worker finds its cluster again through `<state_dir>/managers.json`**, the
   manager list its session last reported, refreshed automatically. If that file is
   lost the daemon refuses to start with a message saying to re-join; it never
   invents a cluster of its own.
@@ -1486,7 +1486,7 @@ to know:
 - **`satl node demote <node>` applies live too**, in the reverse shape: the leader
   removes it from raft first (quorum-checked; refuses rather than breaking
   quorum), then flips the role; the node renews into a worker certificate and
-  rebuilds as a worker. Its raft state directory is emptied — the log belongs to a
+  rebuilds as a worker. Its raft state directory is emptied, the log belongs to a
   membership it left.
 - **A promotion that cannot reach any manager falls back to the worker runtime and
   retries** on the next session event; a daemon restarted mid-promotion (manager
@@ -1496,14 +1496,14 @@ to know:
   `manager certificate with no raft state: resuming an interrupted promotion`.
 - **Quorum arithmetic changes when you run workers.** Managers alone form quorum:
   two managers plus a worker tolerate *no* manager failure (one of two managers
-  down = no quorum). Promote a third manager before taking one down — promotion
+  down = no quorum). Promote a third manager before taking one down, promotion
   being live is what makes that a viable emergency move.
 
 ## Rolling updates (M4)
 
 `satl service update --image <new tag> <service>` replaces the tasks of a service under
 the policy in its spec. The policy is set at create time and adjusted with Docker's own
-flags on either verb — `--update-parallelism`, `--update-delay`,
+flags on either verb, `--update-parallelism`, `--update-delay`,
 `--update-failure-action`, `--update-monitor`, `--update-max-failure-ratio`,
 `--update-order`, and the same six as `--rollback-*` for the policy a *rollback* runs
 under. Two things to know before using them:
@@ -1514,7 +1514,7 @@ under. Two things to know before using them:
   failure action, and `satl service update --image ... web` does not disturb its
   policy at all. (This was not true before M4's tail: the CLI carried only
   parallelism and delay, so every update reset the rest to defaults and quietly
-  disabled automatic rollback — `docs/api-compat.md` #96.)
+  disabled automatic rollback, `docs/api-compat.md` #96.)
 - **Naming one flag of a half names that whole half.** A service created with no
   policy at all and updated with a lone `--update-monitor 30s` gets Docker's defaults
   for the other five (parallelism 1, `pause`, ratio 0, `stop-first`), because
@@ -1531,7 +1531,7 @@ grep -a -E 'rolling update|rolling back|updating slot' /var/log/messages
 **A paused update, and how to get out of it.** With `--update-failure-action pause`
 (the default) a rollout that trips `MaxFailureRatio` stops where it is:
 `UpdateStatus.State` reads `paused`, the slot it was replacing may be empty, and the
-updater deliberately does nothing more for that service — it will not keep feeding
+updater deliberately does nothing more for that service, it will not keep feeding
 replicas to a spec that is failing. Everything else keeps working (scale, restart
 policy, node eviction), only further slots stop being replaced. **Push a corrected
 spec and the rollout starts fresh**: any `satl service update` clears the paused
@@ -1541,8 +1541,8 @@ manager does the same thing for you, swapping the spec back to `PreviousSpec` an
 ending at `rollback_completed`; a rollback that itself fails pauses rather than rolling
 again (architecture §5), and the same corrected-spec push gets it moving.
 
-A rollback the manager performs clears `PreviousSpec` on purpose — the spec that just
-failed is not a target to return to (`docs/api-compat.md` #95) — so
+A rollback the manager performs clears `PreviousSpec` on purpose, the spec that just
+failed is not a target to return to (`docs/api-compat.md` #95), so
 `?rollback=previous` has nothing to go back to until the next update. There is no
 `satl service update --rollback` yet; a manual rollback is
 `curl --unix-socket /var/run/satl.sock -X POST '.../services/<id>/update?version=<v>&rollback=previous'`
@@ -1555,7 +1555,7 @@ eligible node instead of a fixed number of replicas. It has no replica count, so
 `--replicas` is refused on both verbs and `satl service scale` answers "scale can only
 be used with replicated mode"; the way to change what it runs is
 `satl service update`. Its tasks are named `<service>.<node id>.<task id>` rather than
-`<service>.<slot>.<task id>` — the node *is* the replica identity — and they all carry
+`<service>.<slot>.<task id>`, the node *is* the replica identity, and they all carry
 slot 0, which is what `satl service ps` shows as `<service>.<node id>`. The `REPLICAS`
 column of `satl service ls` reads `running/wanted`, where "wanted" is the number of
 tasks the cluster currently *wants*, so a global service on a three-node cluster with
@@ -1566,7 +1566,7 @@ one node drained honestly reads `2/2`, not `2/3`.
 | | |
 |---|---|
 | `active` | the normal state: runs tasks, takes new ones |
-| `pause` | keeps what it runs, takes no new tasks. Nothing is moved off it — this is the state to put a node in while you inspect it |
+| `pause` | keeps what it runs, takes no new tasks. Nothing is moved off it, this is the state to put a node in while you inspect it |
 | `drain` | gives up every task it runs, and takes none |
 
 Two things about a drain are worth knowing before you rely on it:
@@ -1574,13 +1574,13 @@ Two things about a drain are worth knowing before you rely on it:
 - **it does not wait.** Eviction from a draining node is the one case where SatL
   ignores the service's `RestartPolicy.Delay`: an operator emptying a node is waiting
   on it, so the replacements are created immediately (SWK §7.4). Every other
-  eviction — a node going `Down`, a constraint that stopped matching — pays the delay
+  eviction, a node going `Down`, a constraint that stopped matching, pays the delay
   in full. In the log, the drain's evictions read `trigger="node is draining"` with
   `delay_ms=0`; a `Down` node's read `trigger="node is down"` with the service's own
   delay. Measured on the test cluster: a 6-replica service with a 30 s restart delay
   is fully re-placed **1–2 s** after the drain;
 - **a global service's task on that node is stopped and not replaced.** There is no
-  other node for it to run on — its node is its identity — so the service simply runs
+  other node for it to run on, its node is its identity, so the service simply runs
   on one node fewer (`stopping a global task … reason="node is no longer eligible for
   this global service"`). Put the node back to `active` and it gets a **new** task
   there on its own, with no operator action. The same holds for a node that goes
@@ -1589,13 +1589,13 @@ Two things about a drain are worth knowing before you rely on it:
 **A replicated service is not rebalanced when the node comes back.** SatL has no
 rebalancer: the tasks the drain moved stay where they were re-placed, so a 6-replica
 service drained off one of three nodes stays 3/3 on the survivors and the returned node
-runs none of it. That is deliberate — moving a healthy task costs an outage for
-cosmetic balance — but it means a node that has been drained and returned is empty of
+runs none of it. That is deliberate, moving a healthy task costs an outage for
+cosmetic balance, but it means a node that has been drained and returned is empty of
 everything except global services until something else places work on it. Scaling the
 service up and back down, or any update that replaces its tasks, spreads it again.
 
-**Node labels** — `satl node update --label-add zone=eu <node>` /
-`--label-rm zone <node>` — are matched by `--constraint node.labels.zone==eu` and, from
+**Node labels**, `satl node update --label-add zone=eu <node>` /
+`--label-rm zone <node>`, are matched by `--constraint node.labels.zone==eu` and, from
 M4, are **enforced continuously**: a task whose node stops matching is shut down and
 replaced on a node that does match (SWK §7.6). So editing a label is a placement
 change that moves running containers, at the service's restart delay. Two caveats:
@@ -1608,20 +1608,20 @@ change that moves running containers, at the service's restart delay. Two caveat
 **An absent `RestartPolicy.Delay` is the 5 s SwarmKit default, even when the
 rest of the policy is present.** Compose's `deploy.restart_policy` without a
 `delay:` and `satl service create --restart-condition` both send a policy that
-names a condition and no delay, and admission fills 5 s — the same value an
+names a condition and no delay, and admission fills 5 s, the same value an
 absent policy gets. That default is the only thing pacing a crash loop: every
 attempt costs a jail, a ZFS clone and an epair, and an audit of this cluster
 measured a service stored with `Delay: 0` (the shape above, before the fill
 landed) failing **~110 tasks/minute across 3 replicas**. One caveat the wire
 forces: `Delay` travels as a plain integer, so an explicit `"Delay": 0` is
-indistinguishable from an absent one and becomes 5 s too — a zero-delay
+indistinguishable from an absent one and becomes 5 s too, a zero-delay
 restart is not expressible (api-compat 153).
 
 **The restart budget survives a manager restart and a leadership change.**
 `RestartPolicy.MaxAttempts` counts replacements per replica *and* per spec version, and
 that count is derived from the store's task history on every pass rather than held in
 the leader's memory. A crash-looping task therefore stops for good after its attempts
-are spent, whatever happens to the managers in between — before M4 an election handed
+are spent, whatever happens to the managers in between, before M4 an election handed
 it a fresh budget and it restarted forever. What an operator reads when a slot has
 given up:
 
@@ -1631,7 +1631,7 @@ grep -a 'task not restarted' /var/log/messages
 #   attempts=2 reason="max restart attempts reached"
 ```
 
-The task is left in its terminal state with `DESIRED STATE` still `Running` — that is
+The task is left in its terminal state with `DESIRED STATE` still `Running`, that is
 what "nothing will replace this" looks like in `satl service ps`, and it is not a stuck
 orchestrator. A service update (a new spec version) starts a fresh budget.
 
@@ -1652,7 +1652,7 @@ orchestrator. A service update (a new spec version) starts a fresh budget.
 ## Secrets and configs (M5)
 
 ```sh
-# Create (payload from a file or stdin), list, inspect, remove — docker verbs.
+# Create (payload from a file or stdin), list, inspect, remove, docker verbs.
 printf 'hunter2' | satl secret create db_password -
 satl secret ls
 satl secret inspect db_password        # metadata only: the payload is never returned
@@ -1667,12 +1667,12 @@ satl service create --name web \
 What an operator must know:
 
 - **Inside the container**, each secret is a file at `/run/secrets/<target>` on a
-  tmpfs sized to the payloads — it never touches the node's disk (encrypted at rest
+  tmpfs sized to the payloads, it never touches the node's disk (encrypted at rest
   in the Raft store on managers, memory-only on workers). Secret targets are
   relative to `/run/secrets`; config targets are absolute (a relative one is rooted
   at `/`) and mounted read-only. uid/gid must be numeric.
 - **Limits**: a secret payload is under 500 KiB, a config under 1000 KiB.
-- **Secrets are immutable — rotation is by replacement**: create the new secret
+- **Secrets are immutable, rotation is by replacement**: create the new secret
   under a new name, `satl service update` the services to reference it, then
   `satl secret rm` the old one. There is no update verb, and the API's update
   endpoint is refused (`docs/api-compat.md`).
@@ -1699,7 +1699,7 @@ satl compose down -p shop    # ... from anywhere, with no compose file at all
 
 **`satl compose up` is not `docker compose up`.** It deploys *services*: one per
 compose service, on an overlay network of its own, scheduled across the cluster.
-That is `docker stack deploy`'s model, and it is forced by SatL's own — there are
+That is `docker stack deploy`'s model, and it is forced by SatL's own, there are
 no standalone containers here, every container is a task of a service. The
 consequences worth knowing before the first `up`:
 
@@ -1719,13 +1719,13 @@ consequences worth knowing before the first `up`:
 - **Unsupported keys are refused, not ignored** (`docs/api-compat.md` 110-124).
   The error names the file, the service and the key, and says why. If a stack you
   brought from a single host is refused, the three usual causes are `build:`
-  (build and push the image first), a relative bind mount (`./conf:/etc/nginx` —
+  (build and push the image first), a relative bind mount (`./conf:/etc/nginx`,
   the path is on your workstation, not on the nodes; deliver the file as a
   `config:` instead), and `${VAR}` interpolation (substitute it before
   deploying).
 - **Secrets and configs must exist first.** Only `external: true` is accepted:
   `satl secret create redis_auth ./auth.conf`, then refer to it. A `file:`
-  declaration is refused because a secret is immutable — `up` could create it
+  declaration is refused because a secret is immutable, `up` could create it
   once and would then silently keep the old payload for ever.
 - **A second `up` is a rolling update.** Each service is reposted against the
   version `up` read, so the updater replaces tasks under the service's own
@@ -1784,7 +1784,7 @@ To reclaim a cluster, run it on every node (`for n in ...; do ssh $n satl system
 
 **Pruning a stopped container removes the service behind it.** A container in SatL is a
 task of a service (architecture §4), so there is no way to remove the container and keep
-the service without the orchestrator immediately creating a replacement — `satl rm` has
+the service without the orchestrator immediately creating a replacement, `satl rm` has
 resolved this the same way since M1 (api-compat 33). The rail is at the service: a
 service is pruned only when **every** container of it is stopped, so a `--replicas 3`
 service with one dead task keeps all three. This is also what finally reclaims the jail,
@@ -1810,7 +1810,7 @@ registry can undo it, while running prune twice costs nothing.
 | container | cluster | it is stopped **and** every container of its service is |
 | network | cluster | no task is attached and no service asks for it; the ingress network is never pruned |
 | image record | node | `-a` only, and no task's spec names it |
-| image content (blob, manifest, config) | node | no image record reaches it — SatL's "dangling image" (api-compat 132) |
+| image content (blob, manifest, config) | node | no image record reaches it, SatL's "dangling image" (api-compat 132) |
 | layer dataset | node | no image chain, no clone and no apply in flight claims it, on two passes |
 | volume | node | `--volumes` only, and no task mounts it |
 
@@ -1821,7 +1821,7 @@ Three things a prune will decline to do, all of them on purpose:
   One line at info says so; run it again when the pull is done.
 - **a layer something still holds a clone of** is left alone with a warn naming it. ZFS
   refuses this itself (`filesystem has dependent clones`) and `-R`, which would force it,
-  is never used — that flag would flatten a container's writable layer along with the
+  is never used, that flag would flatten a container's writable layer along with the
   image layer under it.
 - **an image whose metadata is unreadable** stops content reclamation for that pass
   entirely, with a warn: a record whose manifest is missing cannot say which blobs it
@@ -1852,7 +1852,7 @@ blobs/manifests/configs   2/3/2      ->        1/1/1
 ```
 
 Two invocations, and the second one is the point: the first reclaimed the containers and
-untagged one image reference, but the alpine layer was still claimed — the removed tasks
+untagged one image reference, but the alpine layer was still claimed, the removed tasks
 were still in the store's task history, and history names the image. The second, once the
 reaper had pruned that history, untagged the last reference and destroyed the layer. The
 running nginx container kept serving on its own address throughout.
@@ -1866,7 +1866,7 @@ them went unnoticed through every clean run this project has had:
 
 | Tool | Shows them |
 |---|---|
-| `mount` | **no** — mount(8) hides `MNT_IGNORE` unless `-v` is given |
+| `mount` | **no**, mount(8) hides `MNT_IGNORE` unless `-v` is given |
 | `mount -t tmpfs` | **no** |
 | `df -t tmpfs` | only while the filesystem under them still exists; once orphaned, `statfs` fails and `df` prints `stats possibly stale` to stderr and nothing to stdout |
 | `mount -p` | **yes** |
@@ -1890,7 +1890,7 @@ mount -p | awk -F'[\t ]+' -v d=/var/db/satl/containers/ '
 **A container that still exists as a record is not a leftover.** A stopped container keeps
 its jail and its rootfs, so its `/tmp` is part of something an operator can still
 inspect; only a mount whose task is claimed by nothing is orphaned. `satld` sweeps those
-itself now, at startup and every 20 s, and — like the dataset sweep it runs in front of —
+itself now, at startup and every 20 s, and, like the dataset sweep it runs in front of,
 only on the second consecutive pass that agrees:
 
 ```sh
@@ -1900,7 +1900,7 @@ grep -a "the periodic sweep unmounted leftover"    /var/log/messages
 
 Where they came from is worth knowing, because nothing in the removal path was at fault.
 Measured on the cluster nodes: 54, 54 and 56 stale tmpfs, three mounts each for 54 task
-ids long gone, while 247 removals in the same logs all reported "no leaked mounts" —
+ids long gone, while 247 removals in the same logs all reported "no leaked mounts",
 `ocijail delete` unmounts correctly and `satl-runtime` sweeps the rootfs afterwards. What
 orphaned them was `umount -f` on the **rootfs dataset itself** while its `MNT_IGNORE`
 submounts were still there, done by a test script that enumerated mounts with plain
@@ -1920,7 +1920,7 @@ Anything that force-unmounts under `<state_dir>` must therefore go deepest-first
 ## Metrics (M6)
 
 `satld` exposes a Prometheus endpoint on a **separate listener**, off by
-default — dockerd's exact posture (`--metrics-addr`). Enable it in
+default, dockerd's exact posture (`--metrics-addr`). Enable it in
 `satld.toml`:
 
 ```toml
@@ -1932,7 +1932,7 @@ the config key). `GET /metrics` is the only route; everything else is a 404.
 
 **The endpoint is unauthenticated, exactly like dockerd's.** The scrape
 reveals cluster shape, task ids and per-task resource usage, so bind it to a
-private address reachable by the Prometheus server and nothing else — the
+private address reachable by the Prometheus server and nothing else, the
 cluster underlay (vtnet1 on the test cluster) is the natural choice, never
 the public interface. If only local scraping is needed, `127.0.0.1:9323`
 works too.
@@ -1952,9 +1952,9 @@ everything SatL-specific is `satl_*`. What is exposed:
 | `satl_tasks{state}`, `satl_services` | the cluster store as this manager sees it; empty on a worker |
 | `satl_dispatcher_sessions` | open agent sessions on this manager |
 | `satl_reconcile_pass_seconds{sweep}`, `satl_reconcile_passes_total{sweep,outcome}` | the two node sweeps (dataset 20 s, port 5 s) |
-| `satl_external_command_failures_total{tool}` | failed zfs/ifconfig/pfctl/ocijail/rctl invocations, counted in the runners — the early-warning series: anything above zero deserves a look at `/var/log/messages`, which carries the full argv and stderr |
+| `satl_external_command_failures_total{tool}` | failed zfs/ifconfig/pfctl/ocijail/rctl invocations, counted in the runners, the early-warning series: anything above zero deserves a look at `/var/log/messages`, which carries the full argv and stderr |
 | `satl_node_certificate_not_after_timestamp_seconds` | the node certificate's expiry, re-read from disk so a renewal is reflected |
-| `satl_container_memory_usage_bytes{task_id}`, `satl_container_cpu_time_seconds{task_id}` | `rctl -hu jail:<task>` every 20 s — **only when `kern.racct.enable=1`**; with racct off no `rctl` process is ever spawned and these series are absent |
+| `satl_container_memory_usage_bytes{task_id}`, `satl_container_cpu_time_seconds{task_id}` | `rctl -hu jail:<task>` every 20 s, **only when `kern.racct.enable=1`**; with racct off no `rctl` process is ever spawned and these series are absent |
 
 Scrape check and name hygiene:
 
@@ -1964,9 +1964,9 @@ curl -s http://10.2.0.4:9323/metrics | promtool check metrics
 ```
 
 One expected `promtool` lint: `http_requests_total non-counter metrics
-should not have "_total" suffix`. The name is Docker's own — dockerd names
+should not have "_total" suffix`. The name is Docker's own, dockerd names
 its API timer exactly that, and the dashboards this series exists for query
-it by that name — so the lint is inherited deliberately, not by accident.
+it by that name, so the lint is inherited deliberately, not by accident.
 Everything else must be clean.
 
 ## Known M0 limits
@@ -1974,5 +1974,5 @@ Everything else must be clean.
 - No containers yet (M1): `/info` reports zero counts; only `/_ping`,
   `/version`, `/info` are served.
 - Resource limits (rctl) will require `kern.racct.enable=1` in
-  `/boot/loader.conf` (reboot needed) — enforced from M1 on worker nodes;
+  `/boot/loader.conf` (reboot needed), enforced from M1 on worker nodes;
   without it SatL logs a warning and runs without enforcement.
