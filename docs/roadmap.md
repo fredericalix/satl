@@ -19,7 +19,7 @@
 | M5 | Secrets, configs, compose, hardening | ✅ done (DoD verified 2026-08-13) |
 | M9 | CLI parity and a generated API contract | `[~]` partially done (M9a verbs ✅; M9b OpenAPI contract in progress) |
 | M6 | Backlog (routing mesh, dataplane encryption, build, metrics) | `[~]` partially done (`plan-m6.md`: M6a–M6g ✅; dataplane encryption ✅ 2026-08-16 on `m6-encryption`; jobs/placement prefs/autolock landed in M7; only plugin volumes remain, unscheduled) |
-| M10 | Field fixes and man pages | 🔨 in progress |
+| M10 | Field fixes and man pages | ✅ done (DoD verified 2026-08-23) |
 
 Legend: ⏳ not started · 🔨 in progress · 🔍 in review · ✅ done · 🧊 frozen · `[~]` partially done
 
@@ -795,6 +795,8 @@ would otherwise hit in the first hour.
 - [x] Man pages: satl(1), satld(8), satld.toml(5), hand-written mdoc pinned to the code by three drift tests, linted by `mandoc -T lint` in `make check` (see the decision log); packaging ships them in the next item
 - [x] Packaging: license dir, man pages, post-install message, sample keys (see the decision log)
 - [x] Cluster inventory refresh: the reinstalled VMs kept their hostnames and underlay addresses, only the public addresses changed (verified live 2026-08-23)
+
+DoD verification, all on 2026-08-23: `make check` green on every commit; `sudo make integration` green end to end (71 suites; it now requires the production satld stopped, which `health_pool` enforces with an explicit message); `make cluster-test` 23/23 scenarios on the reinstalled `fbsd{1,2,3}.satl.cc` testbed; the package installed with `pkg add -f` on the dev host and all three VMs, running containers re-adopted with their jail ids unchanged; the three bug fixes exercised live (PLATFORM column on an informally spelled image, a rejected run leaving nothing behind, `satl run false` exiting 1, and a `kldload`-then-run without a daemon restart).
 
 ---
 
