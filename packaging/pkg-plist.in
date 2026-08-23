@@ -1,0 +1,10 @@
+bin/satl
+sbin/satld
+etc/rc.d/satld
+etc/satl/satld.toml.sample
+share/man/man1/satl.1.gz
+share/man/man5/satld.toml.5.gz
+share/man/man8/satld.8.gz
+share/licenses/satl-@VERSION@/BSD2CLAUSE
+share/licenses/satl-@VERSION@/LICENSE
+share/licenses/satl-@VERSION@/catalog.mk

@@ -27,7 +27,7 @@ sysrc pf_enable=YES
 service pf start
 
 # 3. Build and install binaries + rc.d script + sample config
-make install          # installs satl, satld, /usr/local/etc/rc.d/satld
+make install          # satl, satld, rc.d script, sample config, man pages, license
 
 # 4. Enable and start the daemon
 sysrc satld_enable=YES

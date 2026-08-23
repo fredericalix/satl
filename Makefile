@@ -58,14 +58,35 @@ release:
 # whatever stale binary happened to be lying around.
 INSTALL_TARGET_DIR?=	target/install
 
+# The version names the license directory (share/licenses/satl-<version>/,
+# the ports-tree layout), so both `install` and `package` need it. bmake
+# evaluates `!=` at parse time wherever it stands; the position is for
+# readability only.
+PKG_VERSION!=	awk -F'"' '/^version = / { print $$2; exit }' Cargo.toml
+
+# Man pages are gzipped with -9n: -n drops the original name and mtime from
+# the gzip header, so the same page always compresses to the same bytes and
+# the package hash stays reproducible.
 install:
 	${CARGO} build --workspace --release --target-dir ${INSTALL_TARGET_DIR}
 	install -d ${DESTDIR}${PREFIX}/bin ${DESTDIR}${PREFIX}/sbin
 	install -d ${DESTDIR}${PREFIX}/etc/rc.d ${DESTDIR}${PREFIX}/etc/satl
+	install -d ${DESTDIR}${PREFIX}/share/man/man1 \
+	    ${DESTDIR}${PREFIX}/share/man/man5 ${DESTDIR}${PREFIX}/share/man/man8
+	install -d ${DESTDIR}${PREFIX}/share/licenses/satl-${PKG_VERSION}
 	install -m 0755 ${INSTALL_TARGET_DIR}/release/satl ${DESTDIR}${PREFIX}/bin/satl
 	install -m 0755 ${INSTALL_TARGET_DIR}/release/satld ${DESTDIR}${PREFIX}/sbin/satld
 	install -m 0755 rc.d/satld ${DESTDIR}${PREFIX}/etc/rc.d/satld
 	install -m 0644 etc/satld.toml.sample ${DESTDIR}${PREFIX}/etc/satl/satld.toml.sample
+	gzip -9n -c man/satl.1 > ${DESTDIR}${PREFIX}/share/man/man1/satl.1.gz
+	gzip -9n -c man/satld.toml.5 > ${DESTDIR}${PREFIX}/share/man/man5/satld.toml.5.gz
+	gzip -9n -c man/satld.8 > ${DESTDIR}${PREFIX}/share/man/man8/satld.8.gz
+	install -m 0644 LICENSE \
+	    ${DESTDIR}${PREFIX}/share/licenses/satl-${PKG_VERSION}/BSD2CLAUSE
+	install -m 0644 packaging/licenses/LICENSE \
+	    ${DESTDIR}${PREFIX}/share/licenses/satl-${PKG_VERSION}/LICENSE
+	install -m 0644 packaging/licenses/catalog.mk \
+	    ${DESTDIR}${PREFIX}/share/licenses/satl-${PKG_VERSION}/catalog.mk
 
 # A distributable package: `make package` writes dist/satl-<version>.pkg,
 # installable anywhere with `pkg add` — no repository needed. The staging
@@ -75,7 +96,16 @@ install:
 # package in sha512sum(1) format, so a consumer verifies it with
 # `sha512sum -c CHECKSUM.SHA512` from inside dist/. It names only the package
 # this run built, and is rewritten on every `make package`.
-PKG_VERSION!=	awk -F'"' '/^version = / { print $$2; exit }' Cargo.toml
+#
+# The plist is rendered from packaging/pkg-plist.in because `pkg create -p`
+# substitutes nothing and the license path carries the version.
+#
+# Two knobs keep the package hash reproducible, so two `make package` runs
+# from the same tree write the same CHECKSUM.SHA512: gzip -n on the man pages
+# (above) and `pkg create -t` pinning the archive's file timestamps to the
+# last commit's time — the staging tree is rebuilt with fresh mtimes on every
+# run, and pkg create records them.
+PKG_TIMESTAMP!=	git log -1 --format=%ct
 PKG_STAGE=	target/package
 DISTDIR?=	${.CURDIR}/dist
 
@@ -83,18 +113,34 @@ package: release
 	rm -rf ${PKG_STAGE}
 	mkdir -p ${PKG_STAGE}/root${PREFIX}/bin ${PKG_STAGE}/root${PREFIX}/sbin \
 	    ${PKG_STAGE}/root${PREFIX}/etc/rc.d ${PKG_STAGE}/root${PREFIX}/etc/satl \
+	    ${PKG_STAGE}/root${PREFIX}/share/man/man1 \
+	    ${PKG_STAGE}/root${PREFIX}/share/man/man5 \
+	    ${PKG_STAGE}/root${PREFIX}/share/man/man8 \
+	    ${PKG_STAGE}/root${PREFIX}/share/licenses/satl-${PKG_VERSION} \
 	    ${DISTDIR}
 	install -m 0755 target/release/satl ${PKG_STAGE}/root${PREFIX}/bin/satl
 	install -m 0755 target/release/satld ${PKG_STAGE}/root${PREFIX}/sbin/satld
 	install -m 0755 rc.d/satld ${PKG_STAGE}/root${PREFIX}/etc/rc.d/satld
 	install -m 0644 etc/satld.toml.sample \
 	    ${PKG_STAGE}/root${PREFIX}/etc/satl/satld.toml.sample
+	gzip -9n -c man/satl.1 > ${PKG_STAGE}/root${PREFIX}/share/man/man1/satl.1.gz
+	gzip -9n -c man/satld.toml.5 \
+	    > ${PKG_STAGE}/root${PREFIX}/share/man/man5/satld.toml.5.gz
+	gzip -9n -c man/satld.8 > ${PKG_STAGE}/root${PREFIX}/share/man/man8/satld.8.gz
+	install -m 0644 LICENSE \
+	    ${PKG_STAGE}/root${PREFIX}/share/licenses/satl-${PKG_VERSION}/BSD2CLAUSE
+	install -m 0644 packaging/licenses/LICENSE \
+	    ${PKG_STAGE}/root${PREFIX}/share/licenses/satl-${PKG_VERSION}/LICENSE
+	install -m 0644 packaging/licenses/catalog.mk \
+	    ${PKG_STAGE}/root${PREFIX}/share/licenses/satl-${PKG_VERSION}/catalog.mk
+	sed -e 's/@VERSION@/${PKG_VERSION}/' \
+	    packaging/pkg-plist.in > ${PKG_STAGE}/pkg-plist
 	sed -e 's/@VERSION@/${PKG_VERSION}/' \
 	    -e "s/@ABI@/`pkg config ABI`/" \
 	    -e "s/@OCIJAIL_VERSION@/`pkg rquery %v ocijail | tail -1`/" \
 	    packaging/+MANIFEST.in > ${PKG_STAGE}/+MANIFEST
 	pkg create -M ${PKG_STAGE}/+MANIFEST -r ${PKG_STAGE}/root \
-	    -p packaging/pkg-plist -o ${DISTDIR}
+	    -p ${PKG_STAGE}/pkg-plist -t ${PKG_TIMESTAMP} -o ${DISTDIR}
 	cd ${DISTDIR} && sha512sum satl-${PKG_VERSION}.pkg > CHECKSUM.SHA512
 	@echo "wrote ${DISTDIR}/satl-${PKG_VERSION}.pkg"
 	@echo "wrote ${DISTDIR}/CHECKSUM.SHA512"

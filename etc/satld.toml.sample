@@ -98,6 +98,15 @@
 # outbound connectivity (satld warns loudly at startup).
 #egress_if = "vtnet0"
 
+# The blackhole default remote every VXLAN VTEP on this node is created with.
+# vxlan(4) requires a default remote and sends every broadcast, multicast and
+# unknown-unicast frame there without consulting the forwarding table, so the
+# value must be an address nothing answers on. When unset, satld derives it
+# from the measured underlay prefix as its last usable host (10.2.0.0/16
+# gives 10.2.255.254). Set it only when that derived address is real on your
+# fabric, and pick another address on the underlay that nothing answers on.
+#overlay_blackhole = "10.2.255.254"
+
 # Address the Prometheus /metrics endpoint binds, mirroring dockerd's
 # --metrics-addr (the CLI flag of the same name wins over this key). OFF when
 # unset — the endpoint is unauthenticated, exactly like dockerd's, and the
@@ -114,3 +123,12 @@
 # time that does not fit below the rotation interval.
 #keyring_rotate_after_secs = 43200
 #keyring_phase_settle_secs = 60
+
+# TESTING knob: validity of the node certificates this daemon issues (its own
+# on init and renewal and, when it leads, the ones NodeCA signs for joiners
+# and renewers). A duration string with a mandatory unit: "300s", "5m", "12h",
+# "90d". The default, 90 days, is the only production setting; this knob
+# exists for testing certificate renewal, by making the 50-80 % renewal
+# window arrive in minutes instead of weeks. A value below one hour is issued
+# under a loud startup warning; below one minute is refused at load.
+#cert_validity = "90d"

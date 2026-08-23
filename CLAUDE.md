@@ -63,7 +63,7 @@ sudo service satld restart
 
 Two things this relies on and one to check after:
 
-- **`satld.toml` survives.** `packaging/pkg-plist` ships `satld.toml.sample`, never the
+- **`satld.toml` survives.** `packaging/pkg-plist.in` ships `satld.toml.sample`, never the
   real config; a `.pkgsave` of the old sample is normal.
 - **Running containers are re-adopted, not restarted.** Startup reconciliation re-attaches
   live jails (architecture §7.2), so a `satl ps` uptime that resets to seconds means the

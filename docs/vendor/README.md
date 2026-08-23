@@ -28,6 +28,6 @@ bump, and this table has to move with it.
 
 These are data files, not sources. `make check`'s `license-check` scans only
 `crates`/`tests` `*.rs`, `proto/*.proto`, `rc.d/satld`, `Makefile`, `*.sh` and
-`hack/**/*.c`, so nothing here needs an SPDX header; `packaging/pkg-plist`
-ships four files and none of them is under `docs/`, so nothing here reaches a
-package either.
+`hack/**/*.c`, so nothing here needs an SPDX header; `packaging/pkg-plist.in`
+ships binaries, rc.d, the sample config, man pages and the license directory,
+none of them under `docs/`, so nothing here reaches a package either.

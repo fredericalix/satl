@@ -16,8 +16,10 @@ name/version separator.
   against the CLI and the config by tests so they cannot drift silently
   (satl.1's COMMANDS list is set-equal to the CLI's verbs, satld.8's flags
   match the daemon's, satld.toml.5's keys match the config struct), and
-  linted by `mandoc -T lint` inside `make check`. Packaging ships them in a
-  follow-up.
+  linted by `mandoc -T lint` inside `make check`.
+- The package (and `make install`) now ships the three man pages, gzipped,
+  and `share/licenses/satl-<version>/` (BSD2CLAUSE, LICENSE, catalog.mk) in
+  the same layout the ports tree uses.
 - **`satl images rm`** (and `satl rmi`), plus `DELETE /images/{name}`, there was
   no way to delete a single image, from the CLI or from a Docker client. It runs
   the same two-agreeing-passes layer reclamation `satl system prune` runs, so
@@ -39,6 +41,12 @@ name/version separator.
 
 ### Fixed
 
+- The package's post-install message now spells the state dataset's creation
+  with its mountpoint (`zfs create -o mountpoint=/var/db/satl zroot/satl`);
+  without it the dataset mounts at `/zroot/satl` and satld warns that
+  `state_dir` differs from the dataset's mountpoint.
+- `satld.toml.sample` now lists `cert_validity` and `overlay_blackhole`, the
+  two keys the daemon accepted but the sample never mentioned.
 - `GET /images/json`'s `Containers` count read 0 for exactly the images most
   likely to be in use: it compared a task spec's raw image string against the
   store's canonical reference, so a service saying `alpine` never matched
