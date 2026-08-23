@@ -273,7 +273,7 @@ pub async fn build(
         Err(error) => {
             tracing::info!(
                 reason = %error,
-                "linuxulator not available; only freebsd/* images can run (kldload linux)"
+                "linuxulator not available; only freebsd/* images can run (service linux start)"
             );
             false
         }

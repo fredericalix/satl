@@ -948,7 +948,7 @@ pub fn spawn_linux_probe(
                         Some(LinuxTransition::BecameUnavailable) => tracing::warn!(
                             "linuxulator is no longer available; new linux/* tasks on this \
                              node will be rejected, running linux tasks are unaffected \
-                             (kldload linux to restore)"
+                             (service linux start to restore)"
                         ),
                         None => {}
                     }
