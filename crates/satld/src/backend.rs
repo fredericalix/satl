@@ -1844,16 +1844,24 @@ fn wait_result(task_id: &Id, last: Option<Task>) -> WaitResult {
             error: Some("container was removed before it could be waited on".to_owned()),
         };
     };
-    let status_code = match task.status.container.as_ref().and_then(|c| c.exit_code) {
+    let exit_code = task.status.container.as_ref().and_then(|c| c.exit_code);
+    let status_code = match exit_code {
         Some(code) => code,
         None if task.status.state == TaskState::Complete => 0,
         None => UNKNOWN_EXIT_CODE,
     };
+    // Docker's wait contract: `Error` reports a wait failure, never the
+    // container's own non-zero exit. A task whose container status carries
+    // an exit code ran, so its `status.err` ("container exited with code 3")
+    // is already told by `StatusCode`; only a task that terminated without
+    // ever producing an exit code (rejected at prepare, for instance)
+    // surfaces its err as the wait error (api-compat #167).
+    let error = match exit_code {
+        Some(_) => None,
+        None => task.status.err.clone(),
+    };
     tracing::info!(task_id = %task_id, state = %task.status.state, status_code, "wait finished");
-    WaitResult {
-        status_code,
-        error: task.status.err.clone(),
-    }
+    WaitResult { status_code, error }
 }
 
 /// Raise a task's desired state to `SHUTDOWN` (stop and kill share this).
@@ -1931,6 +1939,53 @@ pub(crate) mod tests {
             job_iteration: None,
             id,
         }
+    }
+
+    /// A container that ran and exited non-zero: `StatusCode` alone tells
+    /// the story, `Error` stays empty (Docker's wait contract, #167).
+    #[test]
+    fn wait_result_reports_an_exit_code_without_an_error() {
+        let mut task = sample_task("web");
+        task.status = TaskStatus::new(TaskState::Failed, "failed");
+        task.status.err = Some("container exited with code 3".to_owned());
+        task.status.container = Some(satl_core::ContainerStatus {
+            jail_id: Some(task.id.as_str().to_owned()),
+            pid: Some(4242),
+            exit_code: Some(3),
+        });
+        let id = task.id.clone();
+        let result = wait_result(&id, Some(task));
+        assert_eq!(result.status_code, 3);
+        assert_eq!(result.error, None);
+    }
+
+    /// A task rejected before its container ever ran carries no exit code:
+    /// the wait error is the rejection message.
+    #[test]
+    fn wait_result_surfaces_the_error_of_a_task_that_never_ran() {
+        let mut task = sample_task("web");
+        task.status = TaskStatus::new(TaskState::Rejected, "rejected");
+        task.status.err = Some(
+            "no matching platform for freebsd/amd64 in docker.io/library/nginx:latest".to_owned(),
+        );
+        let id = task.id.clone();
+        let result = wait_result(&id, Some(task));
+        assert_eq!(result.status_code, UNKNOWN_EXIT_CODE);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("no matching platform for freebsd/amd64 in docker.io/library/nginx:latest")
+        );
+    }
+
+    /// The removed-before-wait arm is unchanged: code 0 plus a wait error.
+    #[test]
+    fn wait_result_reports_a_container_removed_before_the_wait() {
+        let result = wait_result(&Id::generate(), None);
+        assert_eq!(result.status_code, 0);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("container was removed before it could be waited on")
+        );
     }
 
     fn options(edit: impl FnOnce(&mut CreateContainerOptions)) -> CreateContainerOptions {

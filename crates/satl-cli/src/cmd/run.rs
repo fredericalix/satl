@@ -215,7 +215,18 @@ pub async fn run(host: &Host, args: &RunArgs, streams: &mut Streams) -> anyhow::
         return Ok(Outcome { id, code: 0 });
     }
 
-    let status = attach(host, &id, streams).await?;
+    let status = match attach(host, &id, streams).await? {
+        WaitOutcome::Exited(code) => code,
+        WaitOutcome::NeverRan(message) => {
+            // The container never ran, so leaving it behind keeps nothing an
+            // operator could use: remove the anonymous service the create
+            // made, then report the daemon's error (api-compat #167). Docker
+            // never creates a container for an unresolvable image; this
+            // restores the same observable outcome.
+            remove_quietly(host, &id, streams).await;
+            anyhow::bail!("Error response from daemon: {message}");
+        }
+    };
     if args.rm {
         remove_quietly(host, &id, streams).await;
     }
@@ -286,9 +297,21 @@ fn is_missing_image(err: &anyhow::Error) -> bool {
         .is_some_and(|daemon| daemon.status == StatusCode::NOT_FOUND)
 }
 
+/// How the wait on a foreground container ended. Transport and stream
+/// failures stay on the `Err` path of [`attach`]: a dropped connection says
+/// nothing about the container, so it must never trigger a removal.
+enum WaitOutcome {
+    /// The container ran and exited with this code.
+    Exited(i64),
+    /// The daemon's wait body carried an error: the task terminated
+    /// without ever producing an exit code (rejected at prepare, or
+    /// removed before it could be waited on).
+    NeverRan(String),
+}
+
 /// Follow the container's output until it exits, forwarding `Ctrl-C` as a
-/// kill, and return its exit status.
-async fn attach(host: &Host, id: &str, streams: &mut Streams) -> anyhow::Result<i64> {
+/// kill, and return how the wait ended.
+async fn attach(host: &Host, id: &str, streams: &mut Streams) -> anyhow::Result<WaitOutcome> {
     let path = logs::logs_path(id, true, "all", false);
     let body = client::stream(host, &Method::GET, &path, None).await?;
     let wait_path = format!("/containers/{id}/wait");
@@ -340,9 +363,9 @@ async fn attach(host: &Host, id: &str, streams: &mut Streams) -> anyhow::Result<
     if let Some(error) = response.error
         && !error.message.is_empty()
     {
-        anyhow::bail!("Error response from daemon: {}", error.message);
+        return Ok(WaitOutcome::NeverRan(error.message));
     }
-    Ok(response.status_code)
+    Ok(WaitOutcome::Exited(response.status_code))
 }
 
 /// `--rm` also sets `AutoRemove`, so the container may already be gone.
@@ -983,6 +1006,119 @@ mod tests {
                 "Error response from daemon: ocijail create failed: jail(2) EPERM"
             );
             assert!(out.contents().is_empty());
+        }
+
+        /// A wait body whose `Error` is set means the task terminated
+        /// without ever running (rejected at prepare, for instance): a
+        /// foreground run removes the container it just created and reports
+        /// the daemon's error (api-compat #167).
+        #[tokio::test]
+        async fn a_foreground_run_that_never_ran_removes_the_container() {
+            let stub = Stub::start().await;
+            stub.on("POST", "/containers/create", created())
+                .on(
+                    "POST",
+                    &format!("/containers/{ID}/start"),
+                    Reply::empty(204),
+                )
+                .on(
+                    "GET",
+                    &format!("/containers/{ID}/logs"),
+                    Reply::raw(200, Vec::new()),
+                )
+                .on(
+                    "POST",
+                    &format!("/containers/{ID}/wait"),
+                    Reply::json(
+                        200,
+                        r#"{"StatusCode":255,"Error":{"Message":"no matching platform for freebsd/amd64 in docker.io/library/nginx:latest"}}"#,
+                    ),
+                )
+                .on("DELETE", &format!("/containers/{ID}"), Reply::empty(204));
+
+            let (mut streams, _out, _err) = testing::streams();
+            let err = run(&stub.host(), &args("nginx"), &mut streams)
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                "Error response from daemon: no matching platform for freebsd/amd64 in \
+                 docker.io/library/nginx:latest"
+            );
+            let delete = stub
+                .first_call(&format!("DELETE /containers/{ID}"))
+                .expect("the container must be removed");
+            assert_eq!(delete.query, "v=true");
+        }
+
+        /// Detached: the CLI has already printed the ID and exited before
+        /// the task fails, so nothing is removed (api-compat #167).
+        #[tokio::test]
+        async fn a_detached_run_never_removes_on_a_later_failure() {
+            let stub = Stub::start().await;
+            stub.on("POST", "/containers/create", created())
+                .on(
+                    "POST",
+                    &format!("/containers/{ID}/start"),
+                    Reply::empty(204),
+                )
+                .on(
+                    "POST",
+                    &format!("/containers/{ID}/wait"),
+                    Reply::json(
+                        200,
+                        r#"{"StatusCode":255,"Error":{"Message":"no matching platform for freebsd/amd64 in docker.io/library/nginx:latest"}}"#,
+                    ),
+                );
+
+            let (mut streams, out, _err) = testing::streams();
+            let outcome = run(&stub.host(), &detached("nginx"), &mut streams)
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.code, 0);
+            assert_eq!(out.contents(), format!("{ID}\n"));
+            let routes = stub.routes();
+            assert!(
+                !routes.iter().any(|route| route.starts_with("DELETE ")),
+                "{routes:?}"
+            );
+        }
+
+        /// A container that ran and exited non-zero is exactly that: the
+        /// exit code comes back and nothing gets removed.
+        #[tokio::test]
+        async fn a_container_that_ran_and_failed_is_not_removed() {
+            let stub = Stub::start().await;
+            stub.on("POST", "/containers/create", created())
+                .on(
+                    "POST",
+                    &format!("/containers/{ID}/start"),
+                    Reply::empty(204),
+                )
+                .on(
+                    "GET",
+                    &format!("/containers/{ID}/logs"),
+                    Reply::raw(200, Vec::new()),
+                )
+                .on(
+                    "POST",
+                    &format!("/containers/{ID}/wait"),
+                    Reply::json(200, r#"{"StatusCode":3}"#),
+                );
+
+            let (mut streams, _out, _err) = testing::streams();
+            let outcome = run(&stub.host(), &args("nginx"), &mut streams)
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.code, 3);
+            let routes = stub.routes();
+            assert!(
+                !routes.iter().any(|route| route.starts_with("DELETE ")),
+                "{routes:?}"
+            );
         }
     }
 }
