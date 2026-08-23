@@ -84,6 +84,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use satl_agent::LinuxEmulation;
 use satl_cluster::ClusterStore;
 use satl_core::{DesiredState, Id};
 use satl_dispatcher::assignment::belongs_to;
@@ -94,6 +95,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cluster::ClusterSlot;
 use crate::node::NodeRuntime;
+use crate::sysctl::Sysctl;
 
 /// How often the node re-checks its container datasets against the live task
 /// set.
@@ -125,6 +127,18 @@ const PORT_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// for `port 8080`), so a text comparison against it would be a parser with a
 /// bug for every service name in `/etc/services`.
 const PORT_REASSERT_EVERY: u32 = 12;
+
+/// How often the node re-probes `compat.linux.osrelease`.
+///
+/// The linuxulator can appear (`kldload linux`) or vanish (`kldunload`, only
+/// possible with no linux process running) at any time, and the startup probe
+/// alone made a post-boot `kldload` invisible until a daemon restart. The
+/// probe is one `sysctl -n` every 10 s; the flip lands in the shared
+/// [`LinuxEmulation`] handle, which the executor's prepare gate and platform
+/// policy and the node describer all read live, and the 20 s description
+/// refresh then re-registers the session, so the cluster sees the change
+/// within about 30 s.
+const LINUX_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 
 /// What one reconciliation pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -862,20 +876,86 @@ impl MountSweeper {
     }
 }
 
-/// Start the node's periodic passes: the dataset sweep and the port sweep.
+/// Start the node's periodic passes: the dataset sweep, the port sweep and
+/// the linuxulator re-probe.
 ///
-/// Both belong to the *node* rather than to a cluster (see each), and both are
+/// All belong to the *node* rather than to a cluster (see each), and all are
 /// cancelled by the daemon's own shutdown token, so they are started and
 /// stopped together.
 pub fn spawn_node_sweeps(
     slot: &Arc<ClusterSlot>,
     node: &Arc<NodeRuntime>,
+    sysctl: Sysctl,
     shutdown: &CancellationToken,
-) -> [JoinHandle<()>; 2] {
+) -> [JoinHandle<()>; 3] {
     [
         spawn_dataset_sweep(Arc::clone(slot), Arc::clone(node), shutdown.clone()),
         spawn_port_sweep(Arc::clone(slot), Arc::clone(node), shutdown.clone()),
+        spawn_linux_probe(sysctl, node.linux.clone(), shutdown.clone()),
     ]
+}
+
+/// What one linuxulator re-probe observed, when it observed a change at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxTransition {
+    /// `kldload linux` happened: `linux/*` images become selectable.
+    BecameAvailable,
+    /// `linux.ko` is gone: new `linux/*` tasks will be rejected on this node.
+    BecameUnavailable,
+}
+
+/// Record `probed` in the shared handle and name the transition, if any.
+///
+/// Pure with respect to logging so the log-on-transition-only rule is unit
+/// testable: `Some` exactly when the value flipped, `None` on steady state.
+fn record_linux_probe(linux: &LinuxEmulation, probed: bool) -> Option<LinuxTransition> {
+    match (linux.set(probed), probed) {
+        (false, true) => Some(LinuxTransition::BecameAvailable),
+        (true, false) => Some(LinuxTransition::BecameUnavailable),
+        _ => None,
+    }
+}
+
+/// Re-probe the linuxulator every [`LINUX_PROBE_INTERVAL`], flipping the
+/// shared [`LinuxEmulation`] handle and logging transitions in both
+/// directions (see [`LINUX_PROBE_INTERVAL`] for why this exists).
+///
+/// Node-local like the other sweeps: kernel modules belong to the host and
+/// outlive any one cluster. The probe is `tokio::process`-based
+/// ([`Sysctl::get`]), so nothing here blocks the runtime (invariant #4).
+pub fn spawn_linux_probe(
+    sysctl: Sysctl,
+    linux: LinuxEmulation,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(LINUX_PROBE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is immediate; skip it, since the startup probe in
+        // `node::build` has just run and logged its result.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return,
+                _ = ticker.tick() => {
+                    let probed = crate::node::probe_linux_emulation(&sysctl).await;
+                    match record_linux_probe(&linux, probed) {
+                        Some(LinuxTransition::BecameAvailable) => tracing::info!(
+                            "linuxulator is now available; linux/* images may be selected \
+                             (the node description update follows within 20s)"
+                        ),
+                        Some(LinuxTransition::BecameUnavailable) => tracing::warn!(
+                            "linuxulator is no longer available; new linux/* tasks on this \
+                             node will be rejected, running linux tasks are unaffected \
+                             (kldload linux to restore)"
+                        ),
+                        None => {}
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Re-run the dataset sweep every [`DATASET_SWEEP_INTERVAL`].
@@ -1411,6 +1491,39 @@ mod tests {
     #[test]
     fn a_clean_report_destroyed_nothing() {
         assert!(!ReconcileReport::default().destroyed_anything());
+    }
+
+    // ---- the linuxulator re-probe ------------------------------------------
+
+    /// The re-probe must log only on change: `Some` exactly when the value
+    /// flips, `None` on steady state, in both directions.
+    #[test]
+    fn linux_probe_reports_transitions_only() {
+        let linux = LinuxEmulation::new(false);
+        assert_eq!(record_linux_probe(&linux, false), None);
+        assert_eq!(
+            record_linux_probe(&linux, true),
+            Some(LinuxTransition::BecameAvailable)
+        );
+        assert_eq!(record_linux_probe(&linux, true), None);
+        assert_eq!(
+            record_linux_probe(&linux, false),
+            Some(LinuxTransition::BecameUnavailable)
+        );
+        assert_eq!(record_linux_probe(&linux, false), None);
+    }
+
+    /// The helper must also have recorded the probed value in the handle,
+    /// transition or not: the gate reads the handle, not the log.
+    #[test]
+    fn linux_probe_always_records_the_probed_value() {
+        let linux = LinuxEmulation::new(true);
+        record_linux_probe(&linux, false);
+        assert!(!linux.get());
+        record_linux_probe(&linux, false);
+        assert!(!linux.get());
+        record_linux_probe(&linux, true);
+        assert!(linux.get());
     }
 
     // ---- what a node publishes ---------------------------------------------

@@ -27,7 +27,11 @@ below are relative to that directory).
   on the jails are applied by the kernel as defaults (seeded from the global
   `compat.linux.*` sysctls) whenever the linuxulator modules are loaded.**
   Consequence: the only gate SatL controls is "are the linux modules
-  loaded", the satl-runtime precheck.
+  loaded", the satl-runtime precheck. That gate is live: `satld` re-probes
+  `compat.linux.osrelease` every 10 s, so a `kldload linux` on a running
+  node takes effect without a daemon restart, the daemon notices within
+  10 s and the cluster (through the 20 s node-description refresh) within
+  about 30 s.
 * A non-VNET jail defaults to `ip4=inherit`/`ip6=inherit`, a server bound
   in the container is reachable on the host's addresses (proved with busybox
   httpd + curl, `captures/04-httpd-shared-ip.txt`).

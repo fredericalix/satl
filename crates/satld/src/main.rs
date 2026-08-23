@@ -433,7 +433,11 @@ struct HostDescriber {
     ncpu: i64,
     memory_bytes: i64,
     version: String,
-    linux_emulation: bool,
+    /// Live linuxulator availability: the same shared handle the executor
+    /// reads, flipped by `reconcile::spawn_linux_probe`, so the next 20 s
+    /// description refresh re-registers the session with the new value.
+    linux: satl_agent::LinuxEmulation,
+    /// `kern.racct.enable=1` (a boot tunable, probed once at startup).
     racct_enabled: bool,
     /// This node's underlay address (`NodeDescription::data_addr`), from the
     /// advertise address the current bring-up resolved.
@@ -526,7 +530,7 @@ impl satl_dispatcher::NodeDescriber for HostDescriber {
                 version: self.version.clone(),
                 labels: BTreeMap::new(),
             },
-            linux_emulation: self.linux_emulation,
+            linux_emulation: self.linux.get(),
             racct_enabled: self.racct_enabled,
             data_addr: self.data_addr(),
         }
@@ -895,13 +899,14 @@ fn engine_facts(
 fn spawn_sweeps(
     slot: &Arc<ClusterSlot>,
     node_runtime: &Arc<node::NodeRuntime>,
+    sysctl: &sysctl::Sysctl,
     shutdown: &CancellationToken,
     metrics: satl_metrics::Metrics,
     metrics_addr: Option<std::net::SocketAddr>,
     facts: &crate::metrics::EngineFacts,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut sweeps: Vec<tokio::task::JoinHandle<()>> =
-        reconcile::spawn_node_sweeps(slot, node_runtime, shutdown).into();
+        reconcile::spawn_node_sweeps(slot, node_runtime, sysctl.clone(), shutdown).into();
     sweeps.extend(crate::metrics::spawn(
         metrics,
         metrics_addr,
@@ -965,8 +970,8 @@ async fn run(cli: &Cli, cfg: &Config, source: ConfigSource) -> anyhow::Result<()
         ncpu: i64::try_from(host.ncpu).unwrap_or(i64::MAX),
         memory_bytes: i64::try_from(host.physmem_bytes).unwrap_or(i64::MAX),
         version: version.to_owned(),
-        linux_emulation: node_runtime.host.linux_emulation,
-        racct_enabled: node_runtime.host.racct_enabled,
+        linux: node_runtime.linux.clone(),
+        racct_enabled: node_runtime.racct_enabled,
         data_addr: std::sync::RwLock::new(None),
     });
 
@@ -995,6 +1000,7 @@ async fn run(cli: &Cli, cfg: &Config, source: ConfigSource) -> anyhow::Result<()
     let sweeps = spawn_sweeps(
         &slot,
         &node_runtime,
+        &sysctl,
         &shutdown,
         metrics,
         metrics_addr,
@@ -1206,5 +1212,28 @@ mod tests {
         assert_eq!(docker_arch("x86_64"), "amd64");
         assert_eq!(docker_arch("aarch64"), "arm64");
         assert_eq!(docker_arch("riscv64"), "riscv64");
+    }
+
+    /// The description must read linuxulator availability live through the
+    /// shared handle: the re-probe sweep flips it and the next 20 s refresh
+    /// re-registers the session with the new value, no daemon restart.
+    #[test]
+    fn the_description_reads_linux_emulation_live() {
+        use satl_dispatcher::NodeDescriber as _;
+        let linux = satl_agent::LinuxEmulation::new(false);
+        let describer = HostDescriber {
+            hostname: "test".to_owned(),
+            ncpu: 4,
+            memory_bytes: 1024,
+            version: "0.0.0".to_owned(),
+            linux: linux.clone(),
+            racct_enabled: false,
+            data_addr: std::sync::RwLock::new(None),
+        };
+        assert!(!describer.describe().linux_emulation);
+        linux.set(true);
+        assert!(describer.describe().linux_emulation);
+        linux.set(false);
+        assert!(!describer.describe().linux_emulation);
     }
 }

@@ -18,14 +18,18 @@
 //!         Executor ──▶ Worker (TaskDb at <state_dir>/worker/tasks)
 //! ```
 //!
-//! Two facts are probed here and nowhere else, because both change how tasks
-//! are prepared (architecture §8.3):
+//! Two facts are probed here at startup, because both change how tasks are
+//! prepared (architecture §8.3):
 //!
 //! - `linux_emulation`: whether `compat.linux.osrelease` answers, i.e.
-//!   `linux.ko` is loaded — gates selecting `linux/*` images;
-//! - `racct_enabled`: whether `kern.racct.enable=1` — when it is off, rctl(8)
-//!   rules cannot be installed, so `--memory`/`--cpus` are accepted and
-//!   *degraded* with a prominent warning instead of failing.
+//!   `linux.ko` is loaded — gates selecting `linux/*` images. Probed here at
+//!   startup and re-probed every 10 s by `crate::reconcile::spawn_linux_probe`
+//!   through the shared [`satl_agent::LinuxEmulation`] handle, so a
+//!   `kldload linux` after startup takes effect without a daemon restart;
+//! - `racct_enabled`: whether `kern.racct.enable=1` — a boot tunable, so it
+//!   is probed once and never again; when it is off, rctl(8) rules cannot be
+//!   installed, so `--memory`/`--cpus` are accepted and *degraded* with a
+//!   prominent warning instead of failing.
 //!
 //! The SatL devfs ruleset is installed here too: it must exist before any
 //! jail mounts `/dev` (docs/ocijail.md §2.3).
@@ -35,7 +39,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use satl_agent::{
-    Datasets, DependencyStore, Executor, ExecutorParts, HostFacts, Rctl, TaskDb, Worker,
+    Datasets, DependencyStore, Executor, ExecutorParts, LinuxEmulation, Rctl, TaskDb, Worker,
 };
 use satl_dispatcher::agent::SessionReporter;
 use satl_image::ImageStore;
@@ -76,8 +80,11 @@ pub struct NodeRuntime {
     pub dependencies: Arc<DependencyStore>,
     /// Dataset names (`<zfs_root>/layers`, `<zfs_root>/containers`).
     pub datasets: Datasets,
-    /// Self-reported facts (linuxulator, racct).
-    pub host: HostFacts,
+    /// Live linuxulator availability, shared with the executor and the node
+    /// describer and flipped by `crate::reconcile::spawn_linux_probe`.
+    pub linux: LinuxEmulation,
+    /// `kern.racct.enable=1` (a boot tunable, probed once at startup).
+    pub racct_enabled: bool,
     /// Node state directory.
     pub state_dir: PathBuf,
     /// Where `satl-net` keeps its IPAM state (read for container inspect).
@@ -93,7 +100,8 @@ impl std::fmt::Debug for NodeRuntime {
         f.debug_struct("NodeRuntime")
             .field("state_dir", &self.state_dir)
             .field("datasets", &self.datasets)
-            .field("host", &self.host)
+            .field("linux_emulation", &self.linux.get())
+            .field("racct_enabled", &self.racct_enabled)
             .finish_non_exhaustive()
     }
 }
@@ -106,25 +114,19 @@ impl NodeRuntime {
     }
 }
 
-/// Probe `compat.linux.osrelease`: the oid only exists when `linux.ko` is
-/// loaded (`satl_runtime::precheck::LINUX_PROBE_OID`).
-async fn probe_linux_emulation(sysctl: &Sysctl) -> bool {
-    match sysctl.get(satl_runtime::precheck::LINUX_PROBE_OID).await {
-        Ok(release) => {
-            tracing::info!(
-                osrelease = %release,
-                "linuxulator available; linux/* images may be selected"
-            );
-            true
-        }
-        Err(error) => {
-            tracing::info!(
-                reason = %error,
-                "linuxulator not available; only freebsd/* images can run (kldload linux)"
-            );
-            false
-        }
-    }
+/// Probe `compat.linux.osrelease` silently: the oid only exists when
+/// `linux.ko` is loaded (`satl_runtime::precheck::LINUX_PROBE_OID`).
+///
+/// Silent on purpose: `crate::reconcile::spawn_linux_probe` runs this every
+/// 10 s and logs only transitions; [`build`] logs the startup result once at
+/// its call site.
+pub(crate) async fn probe_linux_emulation(sysctl: &Sysctl) -> bool {
+    linux_osrelease(sysctl).await.is_ok()
+}
+
+/// The linuxulator's advertised osrelease, or the probe error.
+async fn linux_osrelease(sysctl: &Sysctl) -> anyhow::Result<String> {
+    sysctl.get(satl_runtime::precheck::LINUX_PROBE_OID).await
 }
 
 /// The interface container traffic is NAT-ed out of.
@@ -258,10 +260,25 @@ pub async fn build(
 
     install_devfs_ruleset().await;
     probe_ip_forwarding(sysctl).await;
-    let host = HostFacts {
-        linux_emulation: probe_linux_emulation(sysctl).await,
-        racct_enabled: probe_racct().await,
-    };
+    // Startup probe, logged once here; the periodic re-probe
+    // (`crate::reconcile::spawn_linux_probe`) then logs transitions only.
+    let linux = LinuxEmulation::new(match linux_osrelease(sysctl).await {
+        Ok(release) => {
+            tracing::info!(
+                osrelease = %release,
+                "linuxulator available; linux/* images may be selected"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::info!(
+                reason = %error,
+                "linuxulator not available; only freebsd/* images can run (kldload linux)"
+            );
+            false
+        }
+    });
+    let racct_enabled = probe_racct().await;
 
     let images = ImageStore::open(state_dir.join("images")).with_context(|| {
         format!(
@@ -323,10 +340,11 @@ pub async fn build(
         network,
         runtime: OcijailRuntime::system(&ocijail_root, &scratch_dir),
         jails: Jails::system(),
-        rctl: Rctl::system(host.racct_enabled),
+        rctl: Rctl::system(racct_enabled),
         state_dir: state_dir.clone(),
         datasets: datasets.clone(),
-        host,
+        linux: linux.clone(),
+        racct_enabled,
         overlay: Some(Arc::clone(&overlay) as Arc<dyn satl_agent::TaskOverlay>),
         dependencies: Arc::clone(&dependencies),
     }));
@@ -346,7 +364,8 @@ pub async fn build(
         task_db: db,
         dependencies,
         datasets,
-        host,
+        linux,
+        racct_enabled,
         proxy: std::sync::Arc::new(crate::proxy::ProxyManager::new(shutdown)),
         net_state_dir,
         net_pool: cfg.network_pool,

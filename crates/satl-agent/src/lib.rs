@@ -77,7 +77,7 @@ pub use db::{DbError, TaskDb, TaskRecord};
 pub use deps::DependencyStore;
 pub use do_step::{Step, do_step};
 pub use error::ControllerError;
-pub use executor::{Datasets, Executor, ExecutorParts, HostFacts};
+pub use executor::{Datasets, Executor, ExecutorParts, HostFacts, LinuxEmulation};
 pub use health::{
     HealthRegistry, HealthStatus, HealthTracker, ProbeResult, ProbeSettings, TaskHealth,
 };

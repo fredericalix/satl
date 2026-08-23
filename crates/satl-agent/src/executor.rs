@@ -23,6 +23,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use satl_image::{ImageStore, PlatformPolicy};
 use satl_net::NetworkManager;
@@ -33,9 +34,38 @@ use crate::controller::Controller;
 use crate::health::HealthRegistry;
 use crate::rctl::Rctl;
 
+/// Live linuxulator availability, shared between the executor (image
+/// selection and the prepare gate) and satld's node describer, and
+/// flipped by satld's periodic re-probe. Relaxed ordering: a lone flag
+/// with no data published under it.
+#[derive(Debug, Clone)]
+pub struct LinuxEmulation(Arc<AtomicBool>);
+
+impl LinuxEmulation {
+    /// A fresh handle carrying the startup probe's result.
+    #[must_use]
+    pub fn new(available: bool) -> Self {
+        Self(Arc::new(AtomicBool::new(available)))
+    }
+
+    /// Whether `linux/*` images may be selected right now.
+    #[must_use]
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Record a fresh probe result, returning the PREVIOUS value so the
+    /// caller can log transitions.
+    pub fn set(&self, available: bool) -> bool {
+        self.0.swap(available, Ordering::Relaxed)
+    }
+}
+
 /// Self-reported facts that change how tasks are prepared (architecture
-/// §8.3). `satld` probes these once at startup and feeds the same values into
-/// the node description.
+/// §8.3), a snapshot composed at each call: `linux_emulation` is re-probed
+/// by satld every 10 s and read live through the shared [`LinuxEmulation`]
+/// handle, while `racct_enabled` is a boot-time tunable, probed once at
+/// startup. The node description carries the same values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostFacts {
     /// `linux.ko` and friends are loaded, so `linux/*` images may be selected
@@ -96,8 +126,11 @@ pub struct ExecutorParts {
     pub state_dir: PathBuf,
     /// Dataset names.
     pub datasets: Datasets,
-    /// Host facts.
-    pub host: HostFacts,
+    /// Live linuxulator availability, shared with satld's node describer and
+    /// flipped by its periodic re-probe.
+    pub linux: LinuxEmulation,
+    /// `kern.racct.enable=1` (a boot tunable, probed once at startup).
+    pub racct_enabled: bool,
     /// The node's overlay plumbing ([`crate::overlay::TaskOverlay`]), or
     /// `None` on a daemon that programs no overlay — the M1 path, and every
     /// unit and integration test in this crate.
@@ -122,7 +155,8 @@ pub struct Executor {
     rctl: Rctl,
     state_dir: PathBuf,
     datasets: Datasets,
-    host: HostFacts,
+    linux: LinuxEmulation,
+    racct_enabled: bool,
     overlay: Option<Arc<dyn crate::overlay::TaskOverlay>>,
     dependencies: Arc<crate::deps::DependencyStore>,
     /// Per-task health, node-local and ephemeral (invariant #1). Created here
@@ -138,7 +172,7 @@ impl std::fmt::Debug for Executor {
         f.debug_struct("Executor")
             .field("state_dir", &self.state_dir)
             .field("datasets", &self.datasets)
-            .field("host", &self.host)
+            .field("host", &self.host())
             .finish_non_exhaustive()
     }
 }
@@ -159,7 +193,8 @@ impl Executor {
             rctl: parts.rctl,
             state_dir: parts.state_dir,
             datasets: parts.datasets,
-            host: parts.host,
+            linux: parts.linux,
+            racct_enabled: parts.racct_enabled,
             overlay: parts.overlay,
             dependencies: parts.dependencies,
             health: Arc::new(HealthRegistry::new()),
@@ -179,10 +214,21 @@ impl Executor {
         Controller::new(Arc::clone(self), task)
     }
 
-    /// Host facts (also reported in the node description).
+    /// Host facts (also reported in the node description), composed fresh on
+    /// every call so `linux_emulation` reflects the latest re-probe.
     #[must_use]
     pub fn host(&self) -> HostFacts {
-        self.host
+        HostFacts {
+            linux_emulation: self.linux.get(),
+            racct_enabled: self.racct_enabled,
+        }
+    }
+
+    /// The shared linuxulator-availability handle (cloned; satld's re-probe
+    /// sweep flips it and the node describer reads it).
+    #[must_use]
+    pub fn linux(&self) -> LinuxEmulation {
+        self.linux.clone()
     }
 
     /// Platform selection policy for this node, with `explicit` taken from
@@ -190,7 +236,7 @@ impl Executor {
     /// (architecture §9).
     #[must_use]
     pub fn platform_policy(&self, explicit: Option<&satl_core::Platform>) -> PlatformPolicy {
-        let mut policy = PlatformPolicy::for_host(self.host.linux_emulation);
+        let mut policy = PlatformPolicy::for_host(self.linux.get());
         // The node is FreeBSD by construction; be explicit rather than
         // trusting the build target of whatever binary linked this crate.
         "freebsd".clone_into(&mut policy.host_os);
@@ -340,5 +386,19 @@ mod tests {
         assert_eq!(arch_alias("aarch64"), "arm64");
         assert_eq!(arch_alias("amd64"), "amd64");
         assert_eq!(arch_alias("riscv64"), "riscv64");
+    }
+
+    /// `set` returns the previous value (that is what lets the re-probe sweep
+    /// log only transitions), and clones share the flag.
+    #[test]
+    fn linux_emulation_set_returns_the_previous_value_and_clones_share() {
+        let linux = LinuxEmulation::new(false);
+        assert!(!linux.get());
+        assert!(!linux.set(true));
+        assert!(linux.get());
+        assert!(linux.set(true), "steady state: previous value was true");
+        let clone = linux.clone();
+        assert!(clone.set(false));
+        assert!(!linux.get(), "a clone flips the same shared flag");
     }
 }

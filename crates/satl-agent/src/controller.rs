@@ -2026,7 +2026,7 @@ mod tests {
 
     // ---- the overlay detach on a failed start -------------------------------
 
-    use crate::executor::{Datasets, ExecutorParts, HostFacts};
+    use crate::executor::{Datasets, ExecutorParts, LinuxEmulation};
     use crate::overlay::TaskOverlay;
     use satl_net::{NetworkManager, NetworkManagerConfig, PfMode};
     use satl_runtime::{ExecSpec, Jails, OcijailRuntime};
@@ -2089,10 +2089,8 @@ mod tests {
             rctl: crate::rctl::Rctl::system(false),
             state_dir: dir.to_path_buf(),
             datasets,
-            host: HostFacts {
-                linux_emulation: false,
-                racct_enabled: false,
-            },
+            linux: LinuxEmulation::new(false),
+            racct_enabled: false,
             overlay: Some(overlay),
             dependencies: Arc::new(crate::deps::DependencyStore::new()),
         }))
@@ -2175,6 +2173,47 @@ mod tests {
             *overlay.detached.lock().expect("not poisoned"),
             [task_id],
             "the health gate's exit arm must detach the overlay, as wait_inner's does"
+        );
+    }
+
+    /// The prepare gate (`host().linux_emulation`) and image selection
+    /// (`platform_policy`) must read the linuxulator flag live through the
+    /// shared handle: `kldload linux` after satld started takes effect
+    /// without a daemon restart, and unloading it stops new linux/* tasks.
+    #[test]
+    fn host_facts_and_platform_policy_read_the_linux_handle_live() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executor = test_executor(dir.path(), Arc::new(RecordingOverlay::default()));
+        let linux = executor.linux();
+        let linux_only = [satl_image::Platform::new("linux", "amd64")];
+
+        assert!(!executor.host().linux_emulation);
+        assert!(
+            executor
+                .platform_policy(None)
+                .select(&linux_only, "img")
+                .is_err(),
+            "without the linuxulator a linux-only index must not resolve"
+        );
+
+        linux.set(true);
+        assert!(executor.host().linux_emulation);
+        assert!(
+            executor
+                .platform_policy(None)
+                .select(&linux_only, "img")
+                .is_ok(),
+            "after set(true) the linux/amd64 fallback must be selectable"
+        );
+
+        linux.set(false);
+        assert!(!executor.host().linux_emulation);
+        assert!(
+            executor
+                .platform_policy(None)
+                .select(&linux_only, "img")
+                .is_err(),
+            "after set(false) new linux/* selections must be refused again"
         );
     }
 }

@@ -33,7 +33,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use satl_agent::{
-    Controller, Datasets, Executor, ExecutorParts, HostFacts, Rctl, Step, TaskController as _,
+    Controller, Datasets, Executor, ExecutorParts, LinuxEmulation, Rctl, Step, TaskController as _,
     do_step,
 };
 use satl_core::{
@@ -400,10 +400,8 @@ async fn build_executor(
         rctl: Rctl::system(false),
         state_dir: state_dir.to_path_buf(),
         datasets,
-        host: HostFacts {
-            linux_emulation: false,
-            racct_enabled: false,
-        },
+        linux: LinuxEmulation::new(false),
+        racct_enabled: false,
         // No overlay programmer: these tests are the single-node path, where a
         // task attaches only to the node-local bridge. Every overlay step in the
         // controller is skipped when this is `None`, which is also what keeps

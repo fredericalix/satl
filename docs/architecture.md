@@ -812,6 +812,14 @@ config, and **`data_addr`**, this node's underlay address, i.e. the VXLAN tunnel
 endpoint peers must send to (§11.2). Refreshed every 20 s and pushed through session
 re-registration on change.
 
+Linux emulation is **re-probed every 10 s on the node** (`reconcile::spawn_linux_probe`,
+one `sysctl -n compat.linux.osrelease` per tick into the shared
+`satl_agent::LinuxEmulation` handle that the executor's prepare gate, its platform
+policy and this describer all read live), so a `kldload linux` after startup takes
+effect without a daemon restart and reaches the cluster through the existing 20 s
+description refresh, within about 30 s. racct remains probed once at startup:
+`kern.racct.enable` is a boot tunable and cannot change under a running daemon.
+
 `data_addr` sits on the **description** and not on `NodeStatus` on purpose: the
 description is what a node *asserts about itself*, `NodeStatus` is what a manager
 *observed*, and blurring the two is exactly what produced the bug this field fixes.
