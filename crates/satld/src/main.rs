@@ -1237,3 +1237,74 @@ mod tests {
         assert!(!describer.describe().linux_emulation);
     }
 }
+
+/// man/satld.8 is pinned to the clap surface. `Cli` is private to this
+/// binary, so the check lives here rather than in an integration test.
+/// Hand-written on purpose, no rewrite gate: see the rationale in
+/// crates/satl-cli/tests/man_sync.rs.
+#[cfg(test)]
+mod man {
+    use clap::CommandFactory as _;
+
+    use super::Cli;
+
+    fn page() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../man/satld.8");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()))
+    }
+
+    /// Every visible long flag must appear in the page in its mdoc
+    /// spelling, `Fl \-log\-format` (the `Fl` macro contributes the first
+    /// dash, the escaped `\-` the second).
+    #[test]
+    fn every_visible_flag_is_documented() {
+        let page = page();
+        let command = Cli::command();
+        for arg in command.get_arguments() {
+            if arg.is_hide_set() {
+                continue; // --skip-zfs-check stays undocumented on purpose.
+            }
+            let Some(long) = arg.get_long() else { continue };
+            if long == "help" || long == "version" {
+                continue; // clap's own, not satld's surface.
+            }
+            let needle = format!("Fl \\-{}", long.replace('-', "\\-"));
+            assert!(
+                page.contains(&needle),
+                "man/satld.8 does not document --{long}: expected the mdoc \
+                 spelling {needle:?} somewhere in the page. Add the flag to \
+                 the SYNOPSIS and the options list."
+            );
+        }
+    }
+
+    /// Every `Fl \-...` in the page names a real clap long. Hidden flags
+    /// are allowed here: documenting --skip-zfs-check later would not fail.
+    #[test]
+    fn every_documented_flag_exists() {
+        let command = Cli::command();
+        let longs: Vec<String> = command
+            .get_arguments()
+            .filter_map(|arg| arg.get_long())
+            .map(str::to_owned)
+            .collect();
+        for line in page().lines().filter(|line| line.starts_with('.')) {
+            let mut words = line.split_whitespace().peekable();
+            while let Some(word) = words.next() {
+                if word != "Fl" {
+                    continue;
+                }
+                let Some(flag) = words.peek().and_then(|next| next.strip_prefix("\\-")) else {
+                    continue;
+                };
+                let name = flag.replace("\\-", "-");
+                assert!(
+                    longs.contains(&name),
+                    "man/satld.8 documents --{name} (line {line:?}), which is \
+                     not a flag satld has; fix the page or add the flag."
+                );
+            }
+        }
+    }
+}

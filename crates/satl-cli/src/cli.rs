@@ -185,7 +185,7 @@ pub enum Command {
         command: cmd::service::ServiceCommand,
     },
 
-    /// Manage stacks — Docker's `docker stack` verbs on SatL's compose
+    /// Manage stacks -- Docker's `docker stack` verbs on SatL's compose
     /// machinery (a stack is one compose file's services and networks).
     #[command(subcommand)]
     Stack(cmd::stack::StackCommand),

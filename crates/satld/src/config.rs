@@ -803,6 +803,51 @@ advertise_addr = "10.2.0.9:12377"
         assert!(msg.contains("malformed config file"), "{msg}");
     }
 
+    /// man/satld.toml.5 is pinned to `ConfigFile`: one `.Ss <key>` per key,
+    /// no more, no less. The authoritative key list is harvested from
+    /// serde's own `deny_unknown_fields` error ("unknown field `x`,
+    /// expected one of `a`, `b`, ..."), so the struct stays the single
+    /// source of truth with no parallel list to maintain. Fallback: if
+    /// serde's message format ever changes, the extractor fails loudly
+    /// below asking to be updated, rather than passing on an empty list.
+    #[test]
+    fn the_man_page_documents_exactly_the_config_keys() {
+        let err = parse("bogus_key_for_the_man_page_test = 1\n", "alpha").unwrap_err();
+        let msg = format!("{err:#}");
+        let listing = msg.split("expected one of").nth(1).unwrap_or_else(|| {
+            panic!(
+                "serde's unknown-field message no longer says \"expected one \
+                 of\"; update this test's key extractor. Message was: {msg}"
+            )
+        });
+        let keys: Vec<&str> = listing.split('`').skip(1).step_by(2).collect();
+        assert!(
+            !keys.is_empty(),
+            "extracted no config keys from serde's message; update this \
+             test's key extractor. Message was: {msg}"
+        );
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../man/satld.toml.5");
+        let page = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+        for key in &keys {
+            let wanted = format!(".Ss {key}");
+            assert!(
+                page.lines().any(|line| line == wanted),
+                "man/satld.toml.5 does not document the config key {key:?}: \
+                 expected a line exactly {wanted:?}. Add the subsection."
+            );
+        }
+        for line in page.lines().filter(|line| line.starts_with(".Ss ")) {
+            let name = &line[".Ss ".len()..];
+            assert!(
+                keys.contains(&name),
+                "man/satld.toml.5 has a subsection {line:?} that names no \
+                 config key; fix the page or add the key to ConfigFile."
+            );
+        }
+    }
+
     #[test]
     fn valid_file_loads_from_file() {
         let dir = tempfile::tempdir().unwrap();

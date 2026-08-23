@@ -1,0 +1,206 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd August 23, 2026
+.Dt SATLD 8
+.Os
+.Sh NAME
+.Nm satld
+.Nd SatL container engine daemon
+.Sh SYNOPSIS
+.Nm satld
+.Op Fl \-config Ar PATH
+.Op Fl \-log\-format Ar text|json
+.Op Fl \-log\-level Ar LEVEL
+.Op Fl \-log\-target Ar stdout|syslog
+.Op Fl \-metrics\-addr Ar ADDR
+.Sh DESCRIPTION
+.Nm
+is the SatL daemon: a Docker-compatible container engine and cluster
+orchestrator for FreeBSD, running OCI containers as VNET jails through
+the external
+.Xr ocijail 1
+runtime.
+One
+.Nm
+runs per node.
+It serves the Docker Engine REST API on a unix socket, the only external
+surface, and an internal mTLS gRPC protocol on port 2377 for clustering.
+A fresh daemon initializes a cluster of one on first start; there is no
+separate init step, and a single node is simply a cluster of one.
+.Pp
+Startup proceeds in a fixed order: the configuration file is loaded
+(a missing file means defaults, see
+.Xr satld.toml 5 ) ;
+the ZFS preflight runs, and the daemon refuses to start when its root
+dataset is absent; host facts are gathered; the node runtime is built,
+including the
+.Ql satl/*
+pf anchors and the devfs ruleset containers run under; the node's
+identity and cluster runtime come up; startup reconciliation re-adopts
+the live jails a previous daemon left running and destroys what leaked;
+only then does the REST API begin answering.
+.Pp
+.Nm
+must run as root.
+ZFS is mandatory: there is no fallback storage driver.
+For published ports and container egress NAT,
+.Xr pf 4
+must be loaded and enabled with the
+.Ql satl/*
+anchors declared in
+.Pa /etc/pf.conf .
+Resource limits (memory, cpu) additionally need the boot tunable
+.Ql kern.racct.enable=1 ;
+without it the daemon degrades gracefully and enforces nothing.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl \-config Ar PATH
+Path to the daemon configuration file.
+The default is
+.Pa /usr/local/etc/satl/satld.toml ;
+a missing file means built-in defaults, a malformed one is fatal.
+.It Fl \-log\-format Ar text|json
+Log output format.
+The default is
+.Ql text .
+.It Fl \-log\-level Ar LEVEL
+Log level filter (default
+.Ql info ) .
+The
+.Ev RUST_LOG
+environment variable overrides this flag when set.
+.It Fl \-log\-target Ar stdout|syslog
+Where log lines go.
+.Ql syslog
+sends one datagram per event to the local syslogd and is what the rc.d
+service uses;
+.Ql stdout ,
+the default, is for running the daemon in the foreground.
+.It Fl \-metrics\-addr Ar ADDR
+Address the Prometheus
+.Ql /metrics
+endpoint binds, overriding
+.Ql metrics_addr
+in the config file.
+The endpoint is off unless one of the two is set, and it is
+unauthenticated, like dockerd's: bind a private address.
+.El
+.Pp
+Internal:
+.Nm
+re-executes itself as
+.Ql satld __jail-arp ,
+an in-jail ARP helper visible in
+.Xr ps 1 ;
+it is not an operator command.
+.Ss rc.conf variables
+The rc.d script
+.Pa /usr/local/etc/rc.d/satld
+runs the daemon under
+.Xr daemon 8
+and understands the following
+.Xr rc.conf 5
+variables:
+.Bl -tag -width Ds
+.It Va satld_enable
+Set to
+.Ql YES
+to start
+.Nm
+at boot (default
+.Ql NO ) .
+.It Va satld_config
+Configuration file passed as
+.Fl \-config
+(default
+.Pa /usr/local/etc/satl/satld.toml ) .
+.It Va satld_flags
+Extra
+.Nm
+flags, for example
+.Ql \-\-log\-format json .
+.It Va satld_env
+Environment for the daemon, for example
+.Ql RUST_LOG=satld=debug .
+.El
+.Pp
+The script always passes
+.Fl \-log\-target Cm syslog ,
+and that flag is a correctness requirement, not a preference: it makes
+.Nm
+hand each log event to syslogd as its own datagram, one event one line.
+Letting
+.Xr daemon 8
+forward the log instead merges events written microseconds apart onto
+one line of
+.Pa /var/log/messages
+and loses part of a burst outright.
+Do not remove it when editing
+.Va command_args .
+.Ss Network ports
+.Bl -tag -width "4790-4999/udp" -compact
+.It 2377/tcp
+Internal gRPC (Raft, Control, Dispatcher, NodeCA), mTLS on every
+connection.
+.It 2378/tcp
+NodeCA bootstrap for joining nodes, unauthenticated by design: a joiner
+has no certificate yet and pins the CA against the digest in its join
+token.
+Always the internal gRPC listen port plus one.
+.It 4789/udp
+VXLAN overlay networks.
+.It 4790-4999/udp
+Encrypted overlay networks; each one gets its own VTEP port from this
+range, carried inside ESP (IP protocol 50) between nodes.
+.El
+.Sh SIGNALS
+.Nm
+shuts down cleanly on
+.Dv SIGTERM
+and
+.Dv SIGINT .
+Running jails deliberately survive the daemon: containers keep running
+across a stop or an upgrade and are re-adopted by the next start's
+reconciliation pass.
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa /usr/local/etc/satl/satld.toml
+Daemon configuration,
+.Xr satld.toml 5 .
+.It Pa /usr/local/etc/satl/satld.toml.sample
+Installed sample listing every key and its default.
+.It Pa /var/run/satl.sock
+The Docker REST API unix socket.
+.It Pa /var/db/satl
+Node state directory, normally the mountpoint of the ZFS root dataset.
+.It Pa /var/run/satld.pid
+Pid file written by
+.Xr daemon 8
+for the rc.d service.
+.It Pa /usr/local/etc/rc.d/satld
+The rc.d service script.
+.El
+.Sh DIAGNOSTICS
+Under the rc.d service the daemon logs to syslog with the tag
+.Ql satld ,
+which the stock
+.Pa /etc/syslog.conf
+lands in
+.Pa /var/log/messages
+and
+.Pa /var/log/daemon.log .
+Always read the log with
+.Ql grep \-a :
+a single non-ASCII byte anywhere in the file makes plain
+.Xr grep 1
+print nothing at all, which looks exactly like the daemon logged
+nothing.
+.Sh SEE ALSO
+.Xr satl 1 ,
+.Xr pf 4 ,
+.Xr rc.conf 5 ,
+.Xr satld.toml 5 ,
+.Xr daemon 8 ,
+.Xr zfs 8
+.Pp
+.Lk https://docs.satl.cc/ "SatL manual"

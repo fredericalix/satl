@@ -1,0 +1,142 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd August 23, 2026
+.Dt SATL 1
+.Os
+.Sh NAME
+.Nm satl
+.Nd Docker-compatible container engine CLI
+.Sh SYNOPSIS
+.Nm satl
+.Op Fl \-host Ar URL
+.Ar command
+.Op Ar args ...
+.Sh DESCRIPTION
+.Nm
+is the command-line client of SatL, a Docker-compatible container engine
+for FreeBSD.
+It is a thin REST client for
+.Xr satld 8 :
+every verb maps onto Docker Engine API requests on the daemon socket, and
+.Nm
+never speaks the cluster's internal protocol.
+Any Docker client pointed at the same socket works the same way.
+.Pp
+The one global option:
+.Bl -tag -width Ds
+.It Fl \-host Ar URL
+Daemon socket to connect to (docker-style URL).
+When the flag is absent the
+.Ev DOCKER_HOST
+environment variable is read; the default is
+.Ql unix:///var/run/satl.sock .
+.El
+.Sh COMMANDS
+.Bl -tag -width Ds
+.It Cm version
+Show the SatL version information (client and server).
+.It Cm run
+Create and run a new container from an image.
+.It Cm ps
+List containers.
+.It Cm stop
+Stop one or more running containers.
+.It Cm kill
+Kill one or more running containers.
+.It Cm rm
+Remove one or more containers.
+.It Cm wait
+Block until one or more containers stop, then print their exit codes.
+.It Cm logs
+Fetch the logs of a container.
+.It Cm exec
+Execute a command in a running container.
+.It Cm inspect
+Return low-level information on containers.
+.It Cm events
+Get real-time events from the daemon.
+.It Cm info
+Display system-wide information about this node's daemon.
+.It Cm pull
+Download an image from a registry.
+.It Cm push
+Push an image from this node's store to a registry (client-side, like
+satl build).
+.It Cm tag
+Create a tag TARGET_IMAGE that refers to SOURCE_IMAGE.
+.It Cm build
+Build a FreeBSD image from a Satlfile into this node's store.
+.It Cm images
+List images, or manage them (ls, rm, prune, inspect).
+.It Cm rmi
+Remove one or more images.
+Alias of
+.Ql satl images rm .
+.It Cm container
+Manage containers \-\- the verbs that have no top-level spelling.
+.It Cm volume
+Manage volumes.
+.It Cm network
+Manage networks.
+.It Cm system
+Manage SatL itself.
+.It Cm swarm , cluster
+Manage the swarm.
+The
+.Cm cluster
+spelling is an accepted alias of this verb.
+.It Cm ca
+View and rotate the cluster root CA (docker's swarm ca, as its own verb:
+certificate operations deserve better than a flag pile).
+.It Cm node
+Manage swarm nodes.
+.It Cm compose
+Deploy a Compose file as cluster services (stack semantics, not
+docker compose's).
+.It Cm service
+Manage services.
+.It Cm stack
+Manage stacks \-\- Docker's docker stack verbs on SatL's compose machinery
+(a stack is one compose file's services and networks).
+.It Cm secret
+Manage secrets.
+.It Cm config
+Manage configs.
+.El
+.Pp
+Per-verb flags and subcommands are described by
+.Ql satl <verb> \-\-help
+and, in more depth, by the SatL manual at
+.Lk https://docs.satl.cc/ .
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa /var/run/satl.sock
+The daemon's Docker REST API socket, the default
+.Fl \-host
+target.
+.El
+.Sh EXIT STATUS
+.Nm
+exits 0 on success and non-zero when a verb fails.
+.Cm run ,
+.Cm exec
+and
+.Cm wait
+forward the container's or executed command's exit code instead of
+reporting their own.
+.Sh EXAMPLES
+Run an nginx container in the background and publish port 80:
+.Dl satl run \-d \-\-name web \-p 8080:80 nginx:1.27
+.Pp
+List running containers:
+.Dl satl ps
+.Pp
+Create a replicated cluster service:
+.Dl satl service create \-\-name web \-\-replicas 3 \-p 8080:80 nginx:1.27
+.Pp
+Follow a container's log:
+.Dl satl logs \-f web
+.Sh SEE ALSO
+.Xr satld.toml 5 ,
+.Xr satld 8
+.Pp
+.Lk https://docs.satl.cc/ "SatL manual"

@@ -5,12 +5,23 @@ CARGO?=		cargo
 PREFIX?=	/usr/local
 DESTDIR?=
 
-.PHONY: check build release install integration cluster-test clean license-check openapi
+.PHONY: check build release install integration cluster-test clean license-check openapi man-lint
 
-check: license-check
+MAN_PAGES=	man/satl.1 man/satld.8 man/satld.toml.5
+
+check: license-check man-lint
 	${CARGO} fmt --all --check
 	${CARGO} clippy --workspace --all-targets -- -D warnings
 	${CARGO} test --workspace
+
+# mandoc is in FreeBSD base and `make check` only runs on FreeBSD, so this
+# is unconditional. -W warning rather than lint's default: the pages must
+# cross-reference each other (satl(1), satld(8), satld.toml(5)) before any
+# of them is installed, which the default level flags as STYLE "referenced
+# manual not found"; real drift still bites, mandoc exits 2 on warnings and
+# 3 on errors. (Verified: a page with an unclosed .Bl exits 3.)
+man-lint:
+	mandoc -T lint -W warning ${MAN_PAGES}
 
 # Every source file carries its SPDX header as line 1 (line 2 after a
 # shebang). This is the only gate — there is no CI. Fixture data files
@@ -19,7 +30,7 @@ check: license-check
 license-check:
 	@missing=0; \
 	for f in `find crates tests -name '*.rs' -not -path '*/target/*' -not -path '*/fixtures/*'` \
-	    proto/*.proto rc.d/satld Makefile \
+	    proto/*.proto rc.d/satld Makefile ${MAN_PAGES} \
 	    `find . -name '*.sh' -not -path './target/*' -not -path './.git/*'` \
 	    `find hack -name '*.c' -not -path './target/*'`; do \
 	    if ! head -2 "$$f" | grep -q 'SPDX-License-Identifier'; then \

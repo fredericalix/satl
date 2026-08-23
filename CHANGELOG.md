@@ -12,6 +12,12 @@ name/version separator.
 
 ### Added
 
+- **Man pages**: hand-written satl(1), satld(8) and satld.toml(5), pinned
+  against the CLI and the config by tests so they cannot drift silently
+  (satl.1's COMMANDS list is set-equal to the CLI's verbs, satld.8's flags
+  match the daemon's, satld.toml.5's keys match the config struct), and
+  linted by `mandoc -T lint` inside `make check`. Packaging ships them in a
+  follow-up.
 - **`satl images rm`** (and `satl rmi`), plus `DELETE /images/{name}`, there was
   no way to delete a single image, from the CLI or from a Docker client. It runs
   the same two-agreeing-passes layer reclamation `satl system prune` runs, so

@@ -1,0 +1,191 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd August 23, 2026
+.Dt SATLD.TOML 5
+.Os
+.Sh NAME
+.Nm satld.toml
+.Nd configuration file for the SatL daemon
+.Sh DESCRIPTION
+.Nm
+is the configuration file of
+.Xr satld 8 ,
+in TOML format.
+Every key is optional and a missing file means all defaults, so a fresh
+install runs without one.
+Unknown keys are rejected at startup: a typo fails loudly instead of
+being silently ignored.
+The default path is
+.Pa /usr/local/etc/satl/satld.toml ,
+overridable with
+.Ql satld \-\-config .
+.Pp
+The keys, in the order the daemon declares them:
+.Ss socket_path
+Path (string).
+Default
+.Ql /var/run/satl.sock .
+Unix socket the Docker REST API is served on.
+Change it to run a second daemon on one host, together with
+.Ql network_name .
+.Ss state_dir
+Path (string).
+Default
+.Ql /var/db/satl .
+Node state directory; it should be the mountpoint of
+.Ql zfs_root ,
+and the daemon warns at startup when the two disagree.
+.Ss zfs_root
+ZFS dataset name (string).
+Default
+.Ql zroot/satl .
+Root dataset holding all SatL datasets; startup fails when it is
+absent, ZFS is mandatory and there is no fallback storage driver.
+.Ss node_name
+String.
+Default: the hostname.
+Node name, also shown by
+.Ql satl node ls .
+.Ss socket_group
+Group name (string).
+Default
+.Ql wheel .
+Group owning the REST API socket.
+.Ss pf_mode
+One of
+.Ql enforce ,
+.Ql check
+or
+.Ql disabled
+(string).
+Default
+.Ql check .
+How the node-local network manager applies its pf rules:
+.Ql enforce
+syntax-checks and loads the
+.Ql satl/*
+anchors,
+.Ql check
+only syntax-checks the generated rules, and
+.Ql disabled
+never invokes pfctl at all (hosts without pf).
+Published ports need
+.Ql enforce :
+under the default
+.Ql check
+mode ports are recorded and shown by
+.Ql satl ps
+but no redirect is ever installed, which is easy to mistake for a
+networking bug.
+Never run two daemons in
+.Ql enforce
+on one host: the
+.Ql satl/rdr
+anchor is one per host, so each daemon's reconciliation deletes the
+other's rules.
+.Ss network_name
+String, at most 14 characters.
+Default
+.Ql satl .
+Name of the node-local bridge network; it also names the bridge
+interface (default
+.Ql satl0 )
+and the interface group SatL marks and sweeps everything it owns with.
+Two daemons on one host must use different names, or each one's
+reconciliation destroys the other's interfaces.
+.Ss network_pool
+IPv4 subnet in CIDR notation (string).
+Default
+.Ql 10.88.0.0/16 .
+Pool the per-network /24 subnets are carved from; change it when it
+collides with your underlay.
+.Ss egress_if
+Interface name (string).
+Default: unset, meaning the interface carrying the default route at
+startup.
+Interface container traffic is NAT-ed out of.
+.Ss listen_addr
+.Ql host:port
+(string).
+Default
+.Ql 0.0.0.0:2377 .
+Address the internal gRPC server (Raft, Control, Dispatcher, NodeCA)
+binds.
+Every node listens.
+The unauthenticated NodeCA bootstrap listener always binds the same
+address one port above (default 2378).
+.Ss advertise_addr
+.Ql host:port
+or bare address (string); a bare address gets the listen port appended.
+Default: unset, meaning the address of the interface carrying the
+default route, which is what an operator would write by hand on an
+ordinary host.
+Set it explicitly on a multi-homed host, cloud hosts in particular,
+where the default route leaves through a public interface while peers
+must dial the private underlay: the value is also published as this
+node's VXLAN endpoint, so a wrong or missing one makes overlay traffic
+go nowhere.
+Use an IP literal, not a hostname; a VXLAN endpoint is an address.
+.Ss overlay_blackhole
+Bare IPv4 address (string).
+Default: unset, meaning the last usable host of the measured underlay
+prefix (for example
+.Ql 10.2.255.254
+on a /16).
+The blackhole default remote every VTEP is created with; it must be an
+address nothing answers on, because
+.Xr vxlan 4
+sends every broadcast, multicast and unknown-unicast frame there.
+Set it only on a fabric that really does use the top address of its
+prefix.
+.Ss cert_validity
+Duration string, an integer with a mandatory unit suffix:
+.Ql s ,
+.Ql m ,
+.Ql h
+or
+.Ql d
+(for example
+.Ql 5m ,
+.Ql 90d ) .
+Default: unset, meaning 90 days, the only production setting.
+This is a testing knob for exercising certificate renewal; values below
+one hour are issued under a loud startup warning and values below one
+minute are refused.
+.Ss metrics_addr
+.Ql host:port
+(string).
+Default: unset, meaning the Prometheus
+.Ql /metrics
+endpoint is off.
+The endpoint is unauthenticated, like dockerd's, so pick a private
+address; the
+.Ql \-\-metrics\-addr
+command-line flag wins over this key.
+.Ss keyring_rotate_after_secs
+Integer seconds.
+Default 43200 (12 hours).
+Rotation cadence of the encrypted-overlay keyrings.
+A testing knob: shortening it makes encrypted networks rotate their
+data-plane keys within minutes, under a loud startup warning.
+.Ss keyring_phase_settle_secs
+Integer seconds.
+Default 60.
+Settling time between keyring rotation phases; it must be smaller than
+.Ql keyring_rotate_after_secs .
+A testing knob to shorten together with the rotation interval in tests,
+never alone on a real cluster.
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa /usr/local/etc/satl/satld.toml.sample
+Installed sample listing every key and its default.
+.El
+.Sh EXAMPLES
+A minimal production file, enabling published ports and pinning the
+address peers dial on a multi-homed host:
+.Bd -literal -offset indent
+pf_mode = "enforce"
+advertise_addr = "10.0.0.11"
+.Ed
+.Sh SEE ALSO
+.Xr satl 1 ,
+.Xr satld 8
