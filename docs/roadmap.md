@@ -794,7 +794,7 @@ would otherwise hit in the first hour.
 - [x] Live linuxulator re-probe: the probe result now lives in one shared `LinuxEmulation` handle, re-probed every 10 s by a third node sweep; the existing 20 s description refresh carries the flip to the cluster (see the decision log)
 - [x] Man pages: satl(1), satld(8), satld.toml(5), hand-written mdoc pinned to the code by three drift tests, linted by `mandoc -T lint` in `make check` (see the decision log); packaging ships them in the next item
 - [x] Packaging: license dir, man pages, post-install message, sample keys (see the decision log)
-- [ ] Cluster inventory refresh
+- [x] Cluster inventory refresh: the reinstalled VMs kept their hostnames and underlay addresses, only the public addresses changed (verified live 2026-08-23)
 
 ---
 
