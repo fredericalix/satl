@@ -88,6 +88,8 @@ pub(super) struct ImageClaims {
 
 impl ImageClaims {
     /// Record a claim under both spellings of `image`.
+    // Deliberately not `satl_image::canonical_key`: this site keeps both
+    // spellings because conflict messages must echo what the user typed.
     fn add(&mut self, image: &str, holder: String, live: bool) {
         let Ok(parsed) = satl_image::ImageReference::parse(image) else {
             self.unparsable += 1;

@@ -474,15 +474,23 @@ fn exposed_ports(task: &Task) -> Vec<ExposedPort> {
 /// `linux/amd64` image is running under the linuxulator — so fall back to the
 /// pulled image's platform (architecture §9: `satl ps`/`satl images` show a
 /// PLATFORM column).
+///
+/// The map is keyed on the **canonical** reference, because that is how the
+/// image store keys its records, so the raw spec string goes through
+/// [`satl_image::canonical_key`] before the lookup. The honest-empty cases —
+/// the image was never pulled on this node, the image was removed, the task
+/// runs on another node — stay empty on purpose; persisting the resolved
+/// platform on the task is deliberately out of scope, task specs are
+/// immutable (api-compat #30).
 fn resolved_platform(
     task: &Task,
     images: &BTreeMap<String, satl_core::Platform>,
 ) -> Option<satl_core::Platform> {
-    task.spec
-        .container
-        .platform
-        .clone()
-        .or_else(|| images.get(&task.spec.container.image).cloned())
+    task.spec.container.platform.clone().or_else(|| {
+        images
+            .get(&satl_image::canonical_key(&task.spec.container.image))
+            .cloned()
+    })
 }
 
 fn container_summary(
@@ -1317,9 +1325,7 @@ impl satl_api::Backend for DaemonBackend {
         let in_use: BTreeMap<String, i64> = {
             let mut counts: BTreeMap<String, i64> = BTreeMap::new();
             let mut count = |image: &str| {
-                let key = satl_image::ImageReference::parse(image)
-                    .map_or_else(|_| image.to_owned(), |parsed| parsed.canonical());
-                *counts.entry(key).or_default() += 1;
+                *counts.entry(satl_image::canonical_key(image)).or_default() += 1;
             };
             match Self::manager_of(self.cluster()?.as_ref()) {
                 Ok(manager) => {
@@ -2012,13 +2018,18 @@ pub(crate) mod tests {
 
     #[test]
     fn the_platform_column_falls_back_to_the_pulled_image() {
-        let task = sample_task("web");
+        // The spec spells the image informally; the image store keys its
+        // records on the canonical reference. The lookup must bridge the two
+        // (it did not until 2026-08-23, and this test failed against that
+        // code).
+        let mut task = sample_task("web");
+        task.spec.container.image = "alpine".to_owned();
         assert_eq!(
             task.spec.container.platform, None,
             "no --platform requested"
         );
         let images = BTreeMap::from([(
-            task.spec.container.image.clone(),
+            "docker.io/library/alpine:latest".to_owned(),
             satl_core::Platform {
                 os: "linux".to_owned(),
                 arch: "amd64".to_owned(),
@@ -2032,12 +2043,13 @@ pub(crate) mod tests {
     #[test]
     fn an_explicit_platform_request_wins_over_the_image() {
         let mut task = sample_task("web");
+        task.spec.container.image = "alpine".to_owned();
         task.spec.container.platform = Some(satl_core::Platform {
             os: "freebsd".to_owned(),
             arch: "arm64".to_owned(),
         });
         let images = BTreeMap::from([(
-            task.spec.container.image.clone(),
+            "docker.io/library/alpine:latest".to_owned(),
             satl_core::Platform {
                 os: "linux".to_owned(),
                 arch: "amd64".to_owned(),
@@ -2052,6 +2064,22 @@ pub(crate) mod tests {
     fn an_unknown_image_leaves_the_platform_empty() {
         let task = sample_task("web");
         assert!(resolved_platform(&task, &BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn an_unparsable_image_leaves_the_platform_empty() {
+        // An input that will not parse keys as itself, so the fallback arm
+        // misses cleanly: the store can hold no record under such a key.
+        let mut task = sample_task("web");
+        task.spec.container.image = "NOT AN IMAGE reference".to_owned();
+        let images = BTreeMap::from([(
+            "docker.io/library/alpine:latest".to_owned(),
+            satl_core::Platform {
+                os: "linux".to_owned(),
+                arch: "amd64".to_owned(),
+            },
+        )]);
+        assert!(resolved_platform(&task, &images).is_none());
     }
 
     #[test]

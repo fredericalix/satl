@@ -5,8 +5,8 @@
 > definition of done). Milestone definitions come from `docs/project-brief.md`; this
 > file tracks progress against them.
 
-**Last updated:** 2026-08-19
-**Current focus:** M9, the 2026-08-19 verb audit found five daemon capabilities with no CLI client at all (`/events`, `/info`, `/volumes/{name}`, the `node` task filter, the four prune endpoints) and one operation missing at both layers: there was no way to delete a single image. M9a closed the CLI half and added `DELETE /images/{name}` and `GET /images/{name}/json`; M9b, the generated OpenAPI contract, is in progress. The cluster testbed was replaced the same day (decision log): `fbsd{1,2,3}.satl.cc`, underlay now 10.0.0.0/24, full suite 22/22 plus 7/7 encrypted. M6a–M6g, M7 and M8 remain done; of the M6 backlog only plugin volumes are unscheduled.
+**Last updated:** 2026-08-23
+**Current focus:** M10 started 2026-08-23, field fixes found during the documentation-validation run against the fresh test VMs plus the man pages (first fix landed: the `satl ps` PLATFORM column, empty for informally spelled images). Before that: M9, the 2026-08-19 verb audit found five daemon capabilities with no CLI client at all (`/events`, `/info`, `/volumes/{name}`, the `node` task filter, the four prune endpoints) and one operation missing at both layers: there was no way to delete a single image. M9a closed the CLI half and added `DELETE /images/{name}` and `GET /images/{name}/json`; M9b, the generated OpenAPI contract, is in progress. The cluster testbed was replaced the same day (decision log): `fbsd{1,2,3}.satl.cc`, underlay now 10.0.0.0/24, full suite 22/22 plus 7/7 encrypted. M6a–M6g, M7 and M8 remain done; of the M6 backlog only plugin volumes are unscheduled.
 
 | Milestone | Scope | Status |
 |---|---|---|
@@ -19,6 +19,7 @@
 | M5 | Secrets, configs, compose, hardening | ✅ done (DoD verified 2026-08-13) |
 | M9 | CLI parity and a generated API contract | `[~]` partially done (M9a verbs ✅; M9b OpenAPI contract in progress) |
 | M6 | Backlog (routing mesh, dataplane encryption, build, metrics) | `[~]` partially done (`plan-m6.md`: M6a–M6g ✅; dataplane encryption ✅ 2026-08-16 on `m6-encryption`; jobs/placement prefs/autolock landed in M7; only plugin volumes remain, unscheduled) |
+| M10 | Field fixes and man pages | 🔨 in progress |
 
 Legend: ⏳ not started · 🔨 in progress · 🔍 in review · ✅ done · 🧊 frozen · `[~]` partially done
 
@@ -780,12 +781,28 @@ return-path `nat` actually behaves as reasoned**, a throwaway two-node
 experiment in `hack/experiments/`, because this milestone has already had six
 written claims overturned by measurement, two of them mine.
 
+## M10, field fixes and man pages (2026-08-23)
+
+Found during the documentation-validation run of 2026-08-23 against the fresh
+test VMs: a batch of small user-visible defects that only surface when the
+documented commands are actually executed against a live cluster, plus the
+still-missing man pages and packaging polish. Each item is a fix an operator
+would otherwise hit in the first hour.
+
+- [x] `satl ps` PLATFORM column: `resolved_platform` now looks the pulled image up by its canonical reference via the new `satl_image::canonical_key`, the one home of the reference-key rule (see the decision log)
+- [ ] `satl run` rollback + wait parity (api-compat 167)
+- [ ] Live linuxulator re-probe
+- [ ] Man pages: satl(1), satld(8), satld.toml(5)
+- [ ] Packaging: license dir, man pages, post-install message, sample keys
+- [ ] Cluster inventory refresh
+
 ---
 
 ## Decision log
 
 | Date | Decision |
 |---|---|
+| 2026-08-23 | **The PLATFORM column was empty for any container whose spec spells the image informally, which is nearly all of them.** `image_platforms` keys its map on the pulled image's canonical reference while `resolved_platform` looked it up by the raw `task.spec.container.image`, so `alpine` never matched `docker.io/library/alpine:latest`, another instance of the one-rule-two-callers reference-key family (`list_images`, 2026-08-19). The rule now has one home, `satl_image::canonical_key`; the existing tests were tautological, keying the map on the raw spec string, and are rewritten to fail against the old code. The honest-empty cases stay empty on purpose: a task whose image this node never pulled has no resolved platform to show |
 | 2026-08-19 | **An endpoint with no CLI verb has no user, and nothing exercises it end to end.** The M9 audit went looking for why an image could not be deleted and found five capabilities the daemon has served since M1-M2 that **no client reaches**: `GET /events`, `GET /info`, `GET /volumes/{name}`, the `node` filter on `/tasks`, and all four prune endpoints. `/info` was invisible because the CLI called it internally in five places without ever exposing it; `/events` was invisible because nothing called it at all. The rule to keep: a route that no verb drives is a route no test drives either, and the gap will be found by an operator rather than by the suite |
 | 2026-08-19 | **`list_images`' `Containers` count was structurally zero for exactly the images most likely to be in use**, found while building the removal's conflict check, not by a test. It keyed the in-use map on the raw `task.spec.container.image` and looked it up by the record's canonical reference, so a service whose spec says `alpine` never counted against `docker.io/library/alpine:latest`. `untag_unused_images` had always got this right, inserting both spellings, which is precisely the kind of divergence that two copies of one rule produce. The fix was to make it one copy: `image_claims` reads the claim set, `image_conflict` answers the question, and `list_images`, `POST /images/prune` and `DELETE /images/{name}` all call them, the same "one rule, two callers, one of them drifts" family as `remove_network_impl`/`prune_networks_impl`, and now the third instance resolved the same way |
 | 2026-08-19 | **`satl images rm` costs about 1.5 s by construction, and that is the price of #131 rather than a slip.** A targeted removal has no more right to a single reading of the claim set than a prune does: a layer's loss is recoverable only from a registry that may not answer. So the removal runs the *same* `collect_layers`/`collect_content` the prune runs, two readings `SETTLE` apart, and `--no-prune` is the documented way to pay that cost once for a batch instead of once per image. **Measured 2 s wall on fbsd1** for an image reachable from two references (`satl images rm -f` by ID prefix, 5 items reported, 1374 bytes reclaimed, 0 deferred): the 1.5 s settle plus process start and the sweeps. Two things the API forced: Docker's rmi body is a bare array with no field for what the second pass deferred, so it rides on `X-Satl-Deferred-Layers` (a third field would corrupt a real Docker client's output, moby prints a bare `Untagged: ` for an item with neither field set); and the image-ID form has to be recognised *before* `ImageReference::parse`, because `sha256:abcdef` parses happily as `docker.io/library/sha256:abcdef` and would resolve to nothing |

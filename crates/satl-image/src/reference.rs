@@ -266,6 +266,22 @@ impl FromStr for ImageReference {
     }
 }
 
+/// The canonical store key for a user-written reference; an input that
+/// will not parse keys as itself (the store can hold no such record, so
+/// the lookup misses honestly rather than lying).
+///
+/// This is the one canonical-key rule for every map keyed by an image
+/// reference. Two callers spelling it differently is a recurring bug family:
+/// `list_images`' Containers count read 0 for informally spelled images
+/// (2026-08-19), and the PLATFORM column was empty for the same inputs
+/// (2026-08-23), both because one side keyed on the canonical reference and
+/// the other looked up the raw user string.
+#[must_use]
+pub fn canonical_key(reference: &str) -> String {
+    ImageReference::parse(reference)
+        .map_or_else(|_| reference.to_owned(), |parsed| parsed.canonical())
+}
+
 /// Collapses Docker Hub aliases and lowercases the host.
 fn normalize_registry(host: &str) -> String {
     let host = host.to_ascii_lowercase();
@@ -579,6 +595,31 @@ mod tests {
             Digest::from_str(&format!("sha256:{}", "A".repeat(64))).is_err(),
             "uppercase hex rejected"
         );
+    }
+
+    #[test]
+    fn canonical_key_normalizes_a_bare_name() {
+        assert_eq!(canonical_key("alpine"), "docker.io/library/alpine:latest");
+    }
+
+    #[test]
+    fn canonical_key_roundtrips_a_qualified_reference() {
+        assert_eq!(canonical_key("ghcr.io/x/y:v1"), "ghcr.io/x/y:v1");
+    }
+
+    #[test]
+    fn canonical_key_pins_on_the_digest() {
+        assert_eq!(
+            canonical_key(&format!("alpine:3.20@{SHA}")),
+            format!("docker.io/library/alpine@{SHA}"),
+            "the digest wins over the tag"
+        );
+    }
+
+    #[test]
+    fn canonical_key_of_unparsable_input_is_itself() {
+        assert_eq!(canonical_key("UPPER case image"), "UPPER case image");
+        assert_eq!(canonical_key(""), "");
     }
 
     #[test]

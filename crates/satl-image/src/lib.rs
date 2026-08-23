@@ -37,7 +37,7 @@ pub use client::{FetchedManifest, RegistryClient};
 pub use error::ImageError;
 pub use manifest::{ImageConfig, LayerCompression};
 pub use platform::{Platform, PlatformPolicy};
-pub use reference::{Digest, ImageReference};
+pub use reference::{Digest, ImageReference, canonical_key};
 pub use store::{
     ContentAudit, ContentFile, ContentKind, ImageStore, LayerDescriptor, LocalImage,
     ProgressSender, PullProgress, PulledImage,
