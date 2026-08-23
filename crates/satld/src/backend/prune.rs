@@ -925,6 +925,7 @@ mod tests {
                 image: image.to_owned(),
                 ..satl_api::model::CreateContainerOptions::default()
             },
+            &Id::generate(),
         );
         spec.task.container.image = image.to_owned();
         satl_core::Service {

@@ -41,6 +41,14 @@ name/version separator.
 
 ### Fixed
 
+- Every one-shot `satl run` executed its command twice: starting the container
+  flips a service label, which bumped the spec version, and the rolling updater
+  then refilled the completed task's slot with a replacement that re-ran the
+  command. The abandoned-slot fill now consults the deep spec comparison, so a
+  finished task whose spec matches the current one is converged, not refilled.
+- `satl run` now pins its container to the node that served the request
+  (api-compat 168), like `docker run`; before, a formed cluster could schedule
+  it on another node, where a foreground run printed nothing and exited 0.
 - The package's post-install message now spells the state dataset's creation
   with its mountpoint (`zfs create -o mountpoint=/var/db/satl zroot/satl`);
   without it the dataset mounts at `/zroot/satl` and satld warns that

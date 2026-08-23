@@ -700,8 +700,21 @@ fn short_digest(digest: &str) -> String {
 /// The `satl.autostart = "false"` label is the contract with the orchestrator
 /// (`satl_orchestrator::AUTOSTART_LABEL`): tasks are born desired-`READY`,
 /// i.e. Docker's `created`, and `start_container` promotes them.
+///
+/// `local_node` pins the task to the node that served the request
+/// (`node.id==...`), restoring `docker run`'s "runs on the engine you spoke
+/// to" semantics (api-compat #168): without it a formed cluster scheduled the
+/// anonymous service anywhere, so a foreground `satl run` printed nothing
+/// (logs are node-local, #81) and exited 0. It must be the RECEIVING node's
+/// id — mutations are forwarded to the leader, and the constraint is written
+/// here, before the forward, exactly so the leader's id never leaks in.
+/// `satl service create` keeps free placement; only this path pins.
 #[must_use]
-pub fn service_spec(name: String, options: &CreateContainerOptions) -> ServiceSpec {
+pub fn service_spec(
+    name: String,
+    options: &CreateContainerOptions,
+    local_node: &Id,
+) -> ServiceSpec {
     let limits = match (options.memory, options.nano_cpus) {
         (None, None) => None,
         (memory, nano_cpus) => Some(Resources {
@@ -747,7 +760,10 @@ pub fn service_spec(name: String, options: &CreateContainerOptions) -> ServiceSp
                 reservations: None,
             },
             restart: options.restart_policy,
-            placement: Placement::default(),
+            placement: Placement {
+                constraints: vec![format!("node.id=={local_node}")],
+                ..Placement::default()
+            },
             networks: Vec::new(),
             force_update: 0,
         },
@@ -851,7 +867,10 @@ impl satl_api::Backend for DaemonBackend {
             }
         };
 
-        let spec = service_spec(name.clone(), &options);
+        // The RECEIVING node's id, captured here so a follower forwarding the
+        // mutation pins the task to itself, not to the leader.
+        let local_node = self.cluster()?.node_id.clone();
+        let spec = service_spec(name.clone(), &options, &local_node);
         let endpoint = spec.endpoint.as_ref().map(initial_endpoint);
         let service = Service {
             id: Id::generate(),
@@ -1903,14 +1922,19 @@ pub(crate) mod tests {
 
     /// A task spec with nothing set, for tests that only care about identity.
     pub(crate) fn empty_task_spec() -> TaskSpec {
-        service_spec(
+        let mut task = service_spec(
             "test".to_owned(),
             &CreateContainerOptions {
                 image: "img".to_owned(),
                 ..CreateContainerOptions::default()
             },
+            &Id::generate(),
         )
-        .task
+        .task;
+        // The node pin is `create_container`'s business; "nothing set" means
+        // two calls must compare equal.
+        task.placement = Placement::default();
+        task
     }
 
     /// A task of a service called `service`, as the orchestrator would build
@@ -1999,7 +2023,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_service_spec_is_a_single_replica_created_container() {
-        let spec = service_spec("web".to_owned(), &options(|_| {}));
+        let spec = service_spec("web".to_owned(), &options(|_| {}), &Id::generate());
         assert_eq!(spec.annotations.name, "web");
         assert_eq!(spec.mode, ServiceMode::Replicated { replicas: 1 });
         assert_eq!(
@@ -2018,6 +2042,44 @@ pub(crate) mod tests {
         assert!(spec.task.resources.limits.is_none());
     }
 
+    /// `docker run` runs on the engine you spoke to: the anonymous service is
+    /// pinned to the receiving node (api-compat #168). Without the pin, a
+    /// formed cluster scheduled the task anywhere and a foreground `satl run`
+    /// printed nothing (logs are node-local, #81) and exited 0.
+    #[test]
+    fn the_created_container_is_pinned_to_the_receiving_node() {
+        let local_node = Id::generate();
+        let spec = service_spec("web".to_owned(), &options(|_| {}), &local_node);
+        assert_eq!(
+            spec.task.placement.constraints,
+            vec![format!("node.id=={local_node}")]
+        );
+        // The expression must be one the engine actually enforces.
+        let constraints = satl_core::Constraints::parse_all(&spec.task.placement.constraints)
+            .expect("the pin parses");
+        let node = |id: Id| satl_core::Node {
+            id,
+            meta: Meta::new(),
+            spec: satl_core::NodeSpec {
+                name: None,
+                labels: BTreeMap::new(),
+                role: satl_core::NodeRole::Worker,
+                availability: satl_core::Availability::Active,
+            },
+            description: None,
+            status: satl_core::NodeStatus {
+                state: satl_core::NodeState::Ready,
+                message: String::new(),
+                addr: String::new(),
+            },
+            manager_status: None,
+            certificate_status: satl_core::CertificateStatus::default(),
+            certificate_issuer: None,
+        };
+        assert!(constraints.matches(&node(local_node)));
+        assert!(!constraints.matches(&node(Id::generate())));
+    }
+
     #[test]
     fn entrypoint_and_cmd_map_onto_command_and_args() {
         let spec = service_spec(
@@ -2026,6 +2088,7 @@ pub(crate) mod tests {
                 o.entrypoint = vec!["/bin/sh".to_owned()];
                 o.cmd = vec!["-c".to_owned(), "echo hi".to_owned()];
             }),
+            &Id::generate(),
         );
         assert_eq!(spec.task.container.command, ["/bin/sh"]);
         assert_eq!(spec.task.container.args, ["-c", "echo hi"]);
@@ -2033,7 +2096,11 @@ pub(crate) mod tests {
 
     #[test]
     fn resource_limits_are_only_set_when_asked_for() {
-        let spec = service_spec("web".to_owned(), &options(|o| o.memory = Some(512)));
+        let spec = service_spec(
+            "web".to_owned(),
+            &options(|o| o.memory = Some(512)),
+            &Id::generate(),
+        );
         assert_eq!(
             spec.task.resources.limits,
             Some(Resources {
@@ -2041,7 +2108,11 @@ pub(crate) mod tests {
                 memory_bytes: 512
             })
         );
-        let spec = service_spec("web".to_owned(), &options(|o| o.nano_cpus = Some(1_500)));
+        let spec = service_spec(
+            "web".to_owned(),
+            &options(|o| o.nano_cpus = Some(1_500)),
+            &Id::generate(),
+        );
         assert_eq!(
             spec.task.resources.limits,
             Some(Resources {
@@ -2063,6 +2134,7 @@ pub(crate) mod tests {
                     protocol: satl_core::PortProtocol::Tcp,
                 }];
             }),
+            &Id::generate(),
         );
         let endpoint = spec.endpoint.expect("an endpoint spec");
         assert_eq!(endpoint.ports.len(), 1);
@@ -2210,7 +2282,7 @@ pub(crate) mod tests {
         assert!(create_warnings(&published).is_empty());
         // The spec really carries no healthcheck: nothing gates this port.
         assert!(
-            service_spec("web".to_owned(), &published)
+            service_spec("web".to_owned(), &published, &Id::generate())
                 .task
                 .container
                 .healthcheck
@@ -2219,7 +2291,7 @@ pub(crate) mod tests {
         // And the port is published all the same, which is the whole point of
         // the deviation entry.
         assert_eq!(
-            service_spec("web".to_owned(), &published)
+            service_spec("web".to_owned(), &published, &Id::generate())
                 .published_ports()
                 .len(),
             1

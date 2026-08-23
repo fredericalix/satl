@@ -441,9 +441,12 @@ struct SlotView {
     /// creating a second one after the first died: replacing a task that ran
     /// and failed is the restart supervisor's job, not the updater's.
     touched: bool,
-    /// Whether the slot holds a task that is finished and that no restart
-    /// policy will replace (see [`abandoned`]). Such a slot is nobody else's,
-    /// so the updater fills it rather than leaving the service short.
+    /// Whether the slot holds a task that is finished, that no restart
+    /// policy will replace (see [`abandoned`]), **and** that is deep-dirty
+    /// against the current spec ([`is_task_dirty`]). Such a slot is nobody
+    /// else's, so the updater fills it rather than leaving the service short.
+    /// A finished task whose spec already matches the service's is the
+    /// converged state of a one-shot container, not a hole to fill.
     abandoned: bool,
 }
 
@@ -746,7 +749,18 @@ fn slot_views(
         } else if task.desired_state >= DesiredState::Shutdown && !task.status.state.is_terminal() {
             entry.stopping.push(Arc::clone(task));
         } else if task.status.state.is_terminal() && abandoned(task, target) {
-            entry.abandoned = true;
+            // Deep dirtiness ([`is_task_dirty`]) is part of the verdict: a
+            // finished task whose spec already matches the current one is the
+            // *converged* state of a one-shot service, and its slot is
+            // nobody's to fill. Filling it anyway was the measured bug behind
+            // every `satl run` executing its command twice: `start_container`
+            // flips the autostart label, which bumps `spec_version` without
+            // touching the task spec, so the completed restart-none task
+            // looked abandoned at the old version and the updater re-ran it.
+            // A deep-dirty finished task (a real update over a dead slot) is
+            // still the updater's to fill.
+            let node = task.node_id.as_ref().and_then(|id| view.node(id));
+            entry.abandoned |= is_task_dirty(service, task, node.as_deref());
         }
     }
     slots
@@ -2642,5 +2656,90 @@ mod tests {
             phase(&view, DesiredState::Running, monitor, now(), false),
             Phase::Settled
         );
+    }
+
+    /// The measured bug behind every one-shot `satl run` executing its command
+    /// twice: `start_container` flips the autostart label, which bumps
+    /// `spec_version` without touching the task spec, so the completed
+    /// restart-none task looked abandoned at the old version and the updater
+    /// filled the slot with a replacement that re-ran the command. A finished
+    /// task whose spec deep-equals the current one is the converged state;
+    /// only a deep-dirty finished task (a real update over a dead slot) is the
+    /// updater's to fill.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_annotations_only_bump_does_not_refill_a_finished_slot() {
+        let cluster = crate::testing::TestCluster::start().await;
+        let store = cluster.store();
+
+        let mut service = sample_service("run", 1);
+        service.spec.task.restart.condition = satl_core::RestartCondition::None;
+        service
+            .spec
+            .annotations
+            .labels
+            .insert(crate::AUTOSTART_LABEL.to_owned(), "false".to_owned());
+        let service_id = service.id.clone();
+        store
+            .propose(vec![StoreAction::Create(StoreObject::Service(service))])
+            .await
+            .expect("service created");
+        let (service, old_version) = {
+            let view = store.view();
+            let service = (*view.service(&service_id).expect("service")).clone();
+            (service.clone(), service.spec_version)
+        };
+
+        // The one-shot task ran to completion, stamped from the pre-flip spec.
+        let now = SystemTime::now();
+        let mut task = planted_task(&service, 1, TaskState::Complete, DesiredState::Running, now);
+        task.spec_version = Some(old_version);
+        task.status.applied_at = Some(now);
+        store
+            .propose(vec![StoreAction::Create(StoreObject::Task(task))])
+            .await
+            .expect("task planted");
+
+        // What `start_container` does: an annotations-only change.
+        crate::testing::update_spec(store, &service_id, |spec| {
+            spec.annotations
+                .labels
+                .insert(crate::AUTOSTART_LABEL.to_owned(), "true".to_owned());
+        })
+        .await;
+
+        {
+            let view = store.view();
+            let bumped = view.service(&service_id).expect("service").spec_version;
+            assert_ne!(
+                bumped, old_version,
+                "the label flip must bump the version for this test to mean anything"
+            );
+            let plan = plan(&view, &service_id, SystemTime::now());
+            assert!(
+                plan.actions.is_empty(),
+                "a finished task whose spec matches the current one is converged, \
+                 not abandoned: {:?}",
+                plan.actions
+            );
+        }
+
+        // The counterpart, unchanged: a deep-dirty finished task is still the
+        // updater's to fill.
+        crate::testing::update_spec(store, &service_id, |spec| {
+            spec.task.container.image = "127.0.0.1:5000/freebsd-nginx:2".to_owned();
+        })
+        .await;
+        {
+            let view = store.view();
+            let plan = plan(&view, &service_id, SystemTime::now());
+            let created = created(&plan.actions);
+            assert_eq!(created.len(), 1, "a dirty finished slot is still filled");
+            assert_eq!(
+                created[0].spec.container.image,
+                "127.0.0.1:5000/freebsd-nginx:2"
+            );
+        }
+
+        cluster.shutdown().await;
     }
 }
