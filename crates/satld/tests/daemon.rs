@@ -11,6 +11,10 @@
 //! `zfs_root` that deliberately does not exist, paired with
 //! `--skip-zfs-check`: every ZFS operation then fails harmlessly instead of
 //! touching `zroot/satl`. pf is never loaded (`pf_mode = "disabled"`).
+//! `listen_addr` is a loopback port of its own (the CA listener derives the
+//! next port up): the default is 0.0.0.0:2377, which the production daemon
+//! on this host already holds, and the collision made this test's satld exit
+//! at cluster bring-up with "Address already in use".
 
 use std::io::{Read as _, Write as _};
 use std::os::unix::net::UnixStream;
@@ -82,7 +86,8 @@ fn daemon_answers_ping_and_shuts_down_cleanly_on_sigterm() {
              zfs_root = \"zroot/satl-wire-ping-{pid}\"\n\
              network_name = \"{NETWORK}\"\n\
              network_pool = \"10.84.0.0/16\"\n\
-             pf_mode = \"disabled\"\n",
+             pf_mode = \"disabled\"\n\
+             listen_addr = \"127.0.0.1:12377\"\n",
             socket = socket_path.display(),
             state = dir.path().join("state").display(),
             pid = std::process::id(),

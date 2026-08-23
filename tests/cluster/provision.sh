@@ -62,6 +62,17 @@ zfs_root=$2
 state_dir=$3
 registry_root=$4
 
+# --- linuxulator (optional) ---------------------------------------------
+# Before the packages: linux_base-rl9's pre-install script refuses to run
+# on a kernel without 64-bit Linux support ("kernel missing 64-bit Linux
+# support"), so the modules must be loaded before pkg install sees it.
+# Measured on a freshly reinstalled node, 2026-08-23.
+if [ "$with_linux" = "1" ]; then
+	sysrc linux_enable=YES >/dev/null
+	service linux start >/dev/null 2>&1 || kldload -n linux linux64 || true
+	echo "linuxulator: enabled"
+fi
+
 # --- packages ------------------------------------------------------------
 pkgs="ocijail curl skopeo docker-registry"
 [ "$with_linux" = "1" ] && pkgs="$pkgs linux_base-rl9"
@@ -153,13 +164,6 @@ else
 	echo "zfs: created $zfs_root at $state_dir"
 fi
 mkdir -p "$registry_root"
-
-# --- linuxulator (optional) ---------------------------------------------
-if [ "$with_linux" = "1" ]; then
-	sysrc linux_enable=YES >/dev/null
-	service linux start >/dev/null 2>&1 || kldload -n linux linux64 || true
-	echo "linuxulator: enabled"
-fi
 
 # --- does this node still need a reboot? ---------------------------------
 if [ "$(sysctl -n kern.racct.enable)" != "1" ]; then
