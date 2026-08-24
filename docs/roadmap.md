@@ -5,8 +5,8 @@
 > definition of done). Milestone definitions come from `docs/project-brief.md`; this
 > file tracks progress against them.
 
-**Last updated:** 2026-08-23
-**Current focus:** M10 started 2026-08-23, field fixes found during the documentation-validation run against the fresh test VMs plus the man pages (first fix landed: the `satl ps` PLATFORM column, empty for informally spelled images). Before that: M9, the 2026-08-19 verb audit found five daemon capabilities with no CLI client at all (`/events`, `/info`, `/volumes/{name}`, the `node` task filter, the four prune endpoints) and one operation missing at both layers: there was no way to delete a single image. M9a closed the CLI half and added `DELETE /images/{name}` and `GET /images/{name}/json`; M9b, the generated OpenAPI contract, is in progress. The cluster testbed was replaced the same day (decision log): `fbsd{1,2,3}.satl.cc`, underlay now 10.0.0.0/24, full suite 22/22 plus 7/7 encrypted. M6a–M6g, M7 and M8 remain done; of the M6 backlog only plugin volumes are unscheduled.
+**Last updated:** 2026-08-24
+**Current focus:** M11 done 2026-08-24 and shipped as **0.2.0**, splitting Docker's two worlds: `satl compose` is node-local, `satl stack` keeps the cluster. All five phases landed (the split, DNS on the node bridge, the lifecycle verbs, attach and logs, `build:`), plus the version bump and the `satl-doc` sweep. Two pre-existing defects the verification runs surfaced are in the decision log and unscheduled: demoting the current leader never completes, and a demoted node stops publishing ports. Both were masked by scenario order, so `make cluster-test` is currently red on `ca_rotate`. This reverses the M5 decision that `satl compose` carries stack semantics, which was inferred from "SatL has no standalone container" and does not follow from it: invariant #2 constrains the execution model, not the scope. Ships as 0.2.0. Before that: M10, field fixes found during the documentation-validation run against the fresh test VMs plus the man pages, done and DoD-verified 2026-08-23. Before that: M9, the 2026-08-19 verb audit found five daemon capabilities with no CLI client at all (`/events`, `/info`, `/volumes/{name}`, the `node` task filter, the four prune endpoints) and one operation missing at both layers: there was no way to delete a single image. M9a closed the CLI half and added `DELETE /images/{name}` and `GET /images/{name}/json`; M9b, the generated OpenAPI contract, is in progress. The cluster testbed was replaced the same day (decision log): `fbsd{1,2,3}.satl.cc`, underlay now 10.0.0.0/24, full suite 22/22 plus 7/7 encrypted. M6a–M6g, M7 and M8 remain done; of the M6 backlog only plugin volumes are unscheduled.
 
 | Milestone | Scope | Status |
 |---|---|---|
@@ -20,6 +20,7 @@
 | M9 | CLI parity and a generated API contract | `[~]` partially done (M9a verbs ✅; M9b OpenAPI contract in progress) |
 | M6 | Backlog (routing mesh, dataplane encryption, build, metrics) | `[~]` partially done (`plan-m6.md`: M6a–M6g ✅; dataplane encryption ✅ 2026-08-16 on `m6-encryption`; jobs/placement prefs/autolock landed in M7; only plugin volumes remain, unscheduled) |
 | M10 | Field fixes and man pages | ✅ done (DoD verified 2026-08-23) |
+| M11 | The two worlds: node-local `satl compose`, cluster `satl stack` | ✅ done (2026-08-24, shipped as 0.2.0) |
 
 Legend: ⏳ not started · 🔨 in progress · 🔍 in review · ✅ done · 🧊 frozen · `[~]` partially done
 
@@ -800,12 +801,233 @@ would otherwise hit in the first hour.
 
 DoD verification, all on 2026-08-23: `make check` green on every commit; `sudo make integration` green end to end (71 suites; it now requires the production satld stopped, which `health_pool` enforces with an explicit message); `make cluster-test` 23/23 scenarios on the reinstalled `fbsd{1,2,3}.satl.cc` testbed; the package installed with `pkg add -f` on the dev host and all three VMs, running containers re-adopted with their jail ids unchanged; the three bug fixes exercised live (PLATFORM column on an informally spelled image, a rejected run leaving nothing behind, `satl run false` exiting 1, and a `kldload`-then-run without a daemon restart).
 
+
+---
+
+## M11, the two worlds (2026-08-24)
+
+Docker has two worlds: `docker compose` runs containers on one host, `docker
+stack deploy` runs services on a swarm. Since M5 SatL had only the second, under
+both names — `satl stack deploy` delegated to `satl compose up`, which carried
+stack semantics, recorded as api-compat 110 and stated in the doc site.
+
+That was an over-reading. "SatL has no standalone container" is invariant #2,
+and invariant #2 constrains the **execution model**, not the **scope**: Docker's
+two worlds differ in where things run and what the file may say, not in whether
+an orchestrator is involved. So SatL can have both worlds while every container
+stays a Task of a Service in the Raft store, and invariants #1, #2 and #8 are
+untouched.
+
+The precedent was one day old: M10's last fix pins `satl run` to the receiving
+node with `node.id==<self>` (api-compat 168) to restore `docker run`'s "runs on
+the engine you spoke to". M11 applies the same idea to a whole compose file.
+
+Two facts make the node-local half natural rather than bolted on. The CLI speaks
+`unix://` **only**, so the client's filesystem *is* the target node's filesystem
+— which is precisely the reason relative binds were refused, and it evaporates.
+And the agent uses a locally present image before considering a pull
+(`resolve_image`), so a `build:` will need no registry.
+
+Ships as **0.2.0** (`-alpha` on the git tag only: a hyphen in a `pkg(8)` version
+is read as the name/version separator, CHANGELOG's own rule).
+
+- [x] **M11a, the split** (2026-08-24). A `Scope { Local { node_id }, Cluster }`
+      threaded through the compose planner, which was already a pure function of
+      the file's text. `satl compose` pins every service to the node `GET /info`
+      names, publishes in host mode, names objects `<project>-<service>` with
+      compose v2's hyphen, honours a relative bind against the project
+      directory, honours `driver: bridge` as a single-node overlay with a loud
+      warning, and refuses `deploy.placement`, an explicit `mode: ingress`, and
+      replicas above 1 sharing a fixed host port. `satl stack` passes
+      `Scope::Cluster` and is unchanged. api-compat 110 and 112 rewritten,
+      169–174 added. **The regression guard is that every compose unit test
+      written before the split still passes untouched under `Scope::Cluster`**,
+      so `satl stack`'s output is pinned byte for byte; eight new tests cover the
+      local world, each asserting both halves of the same file.
+- [x] **M11b, DNS on the node bridge** (2026-08-24). The live verification of
+      M11a found that the overlay choice was wrong, and measured why: alpha's
+      address is a public **/32**, satld cannot derive a VXLAN blackhole from
+      it and degrades to hosting no overlay at all (`cannot measure this node's
+      underlay ... bridge networks are unaffected`), so a node-local compose on
+      an overlay was dead on exactly the host shape it exists for. Proven
+      independent of M11a by deploying the same file through the untouched
+      `satl stack deploy`, which failed identically. But bridge was no better
+      as it stood: a bridge task got a copy of the host's `/etc/resolv.conf`
+      and `nslookup <service>` answered NXDOMAIN. So the responder now serves
+      bridge networks: the bind list gains the node bridge's gateway without
+      requiring an overlay identity, `resolv_conf` walks the task's attachments
+      and hands a bridge one that gateway, and the records and query scopes are
+      built from the node's own IPAM (`NetworkManager::address_of`) because
+      Raft never sees a bridge address (architecture §11.1) — which loses
+      nothing, since every task on a node-local bridge is local by
+      construction. `apply_network` now refreshes DNS on the bridge path too;
+      without that a node hosting only bridge networks never bound a socket at
+      all. Compose then switched to `driver: bridge`, so `satl network ls`
+      reports `bridge`/`local` as Docker does, and api-compat 170 was rewritten
+      around what is now true. Isolation is the documented cost (175): one
+      bridge per node means two projects share an L2, and only the *names* are
+      scoped.
+M11a+M11b DoD verification, all on 2026-08-24: `make check` green on every
+commit; `sudo make integration` green end to end; the package installed with
+`pkg add -f` on the dev host and the daemon restarted, re-adopting all three
+running jails at their existing jids. Live on alpha, which is the /32 host the
+milestone turned on: both services `Running`, `satl network ls` showing
+`bridge`/`local`, `resolv.conf` reading `nameserver 10.88.0.1`, the compose
+alias `cache` resolving to 10.88.0.6 and `web` to 10.88.0.4 in the other
+direction, ping between them at 0% loss, and `down` leaving nothing.
+
+`make cluster-test` **24/24** on `fbsd{1,2,3}.satl.cc` after `deploy.sh` put the
+new binaries on all three — worth stating because the suite does *not* deploy,
+and a first 23/23 run against the previously-deployed build proved nothing about
+this change. Two scenario results carry the weight. `overlay_dns_multinet`
+passes, which is the guard that matters most for M11b: it was written to catch
+DNS *scoping* defects, including the over-widening fix that would let one
+network's names leak into another, and that is exactly what feeding a second
+driver into the same tables could have broken. And `compose_local` is new,
+running on the three-node cluster on purpose — on one node "everything landed
+here" is true for free — asserting the pin (every task on the control node with
+three nodes Ready to have taken them) and then reaching one service from the
+other's jail by its bare compose name over the bridge, which fails on a DNS
+defect and on a data-path defect alike. `compose_stack` keeps every assertion it
+had and now drives them through `satl stack`, since spreading a file over the
+cluster is that verb's world now; it passes in 109s, the same as its M5
+measurement.
+
+- [x] **M11c, what node-local unlocks** (2026-08-24). `down -v` (there is a node
+      to remove from now), `up --scale`, and `compose stop`/`start`/`restart`.
+      `stop` and `start` cannot be Docker's, because a task is one-shot and a
+      stopped one is a 409 (api-compat 30): `stop` scales the project to 0 and
+      `start` scales back to what the file says, so no hidden state is stashed
+      in a label — which also means `start` needs the file and `stop` does not,
+      an asymmetry the help and the docs both state. `restart` bumps
+      `TaskSpec::force_update`, which the dirty module already treats as
+      dirtying everything, and lets the rolling updater replace the tasks under
+      the service's own policy — a replacement in the slot, which is what
+      invariant #2 means by restart. `--scale` is applied *after* the plan is
+      built and then re-checked against the planner's own rules, so it cannot
+      smuggle in the host-port conflict the file would have been refused for
+      (api-compat 174, 178). Verified live: `stop` left both services `0/0` with
+      the volume intact, `start` restored `1/1`, `restart` moved the old tasks
+      to `Shutdown` and brought new ids up in the same slots, `--scale peer=3`
+      reached `3/3`, and `down -v` removed services, network and the
+      `m11c-data` volume in that order. api-compat 118 and 124 rewritten, 176-178
+      added. `compose_local` grew the three verbs and a named volume, and
+      `make cluster-test` is **24/24** with them on the deployed testbed. One
+      defect in the new assertion, found by it failing: `cl_live_ids` listed
+      *every* task of a service, and `satl service ps` keeps the terminal ones,
+      so after a restart the count was four rather than two and the wait could
+      never converge. It filters on state now — the same shape `cl_task_nodes`
+      already had, which is why the failure was in the new helper and not in the
+      verb.
+- [x] **M11d, attach and logs** (2026-08-24). `up` attaches by default and `-d`
+      regains its meaning; `satl compose logs [--follow] [--tail N] [SERVICE…]`.
+      Possible only because logs are node-local (api-compat 81) and every task
+      is now on this node, which is the exact obstacle api-compat 124 recorded.
+      The multiplexer lives in its own module: one reader task per container
+      feeding a channel, lines assembled per stream kind so that two containers
+      writing at once cannot splice half a line into another, prefixes padded to
+      a common width with one colour each, and colour suppressed when stdout is
+      not a terminal. Two decisions worth their entries. **`--follow` is
+      long-only** (179): `-f` is already the global `--file` at this level and
+      clap refuses a duplicate short outright, where docker's parser resolves it
+      by position. And **Ctrl-C detaches rather than stopping** (180), unlike
+      `docker compose up`: the project is already deployed by the time attaching
+      begins, so stopping it on a keystroke would be a second hidden mutation;
+      the banner says so before the first line of output. Verified live: both
+      services prefixed and interleaved, a container's stdout on stdout and its
+      stderr on stderr through the multiplexer, `--follow` streaming new lines
+      from both at once, and a SIGINT to an attached `up` leaving both tasks
+      `Running`. `compose_local` gained a logs assertion (both services present,
+      each line carrying its `<service>-<slot>` prefix) and `make cluster-test`
+      is **24/24** with it. The attach change caught the suite itself first: the
+      scenario's own `cl_compose up` never returned, because it did not ask for
+      `-d`. That is the best evidence there is that this breaks scripts, and it
+      is why the CHANGELOG says so rather than leaving it to release notes.
+      `docs/operations.md`'s compose section was rewritten around the two
+      worlds; it still described `satl compose up` as `docker stack deploy`.
+- [x] **M11e, `build:`** (2026-08-24). `satl compose build [SERVICE…]` and
+      `up --build`, images tagged `<project>-<service>:latest` (or `image:` when
+      given) and used from the local store with no registry — verified end to
+      end on alpha: a `build:`-only service deployed from an image that exists
+      on one node and nowhere else, the container printing the file its Satlfile
+      `COPY`'d. `build:` stays refused under `satl stack`, and the refusal now
+      says where the image must come from instead of "not supported".
+      **`build:` builds a `Satlfile`, not a Dockerfile** (`docs/image-sources.md`):
+      `dockerfile:` keeps compose's key name because it is the one people type,
+      but names which file to read; `args:` and `target:` are refused with the
+      reason (a Satlfile has no `ARG`, and a multi-stage build always packs its
+      last stage), along with `cache_from`, `ssh`, `secrets`, `platform`,
+      `network` and `tags`. A Dockerfile pointed at by `dockerfile:` fails
+      naming the file, the line and the unknown verb. Both verbs need root,
+      because writing to the image store does.
+
+      Two things the live run found that reading could not. **A rebuild under
+      the same tag deployed nothing**: the service spec is byte-identical, so no
+      task was dirty and the old image kept running while the new one sat in the
+      store. Fixed by stamping `ForceUpdate` from the new manifest digest, the
+      same counter `compose restart` bumps. And **the builder is not
+      reproducible**: two builds of an unchanged tree give different manifest
+      digests (the config carries a `created` timestamp), so the stamp changes
+      every time and `--build` always replaces the tasks. The digest-derived
+      stamp is kept over a counter anyway, because it follows the image and
+      would become idempotent for nothing if the builder ever gained
+      reproducible output. api-compat 181-182.
+
+      Not added to `compose_local`: M11e is node-local by definition and alpha
+      is a node, so the suite's marginal value is lower than for M11a/M11b,
+      which were about placement and DNS *across* nodes. `build_push_run`
+      already exercises `satl build` on the testbed.
+
+      **M11e verification, stated exactly.** `make check` green; `compose_stack`
+      and `compose_local` both pass on the testbed (109s and 53s), which is what
+      covers the compose surface; the build path verified live on alpha as
+      above. The **full** suite is red on `ca_rotate`, for the port-publishing
+      defect in the decision log — pre-existing, order-dependent, and in code
+      M11 does not touch (`git diff` reaches no port path; the one `satl-net`
+      edit is two read-only accessors). It is reported rather than worked
+      around, and the testbed is left with that scenario failing.
+- [x] **The version bump** (2026-08-24). `Cargo.toml` to **0.2.0**, numeric, with
+      `-alpha` on the git tag only — a hyphen in a `pkg(8)` version is read as
+      the name/version separator (CHANGELOG's own rule). The fourteen internal
+      path dependencies pin the workspace version explicitly, so they move with
+      it or cargo refuses to resolve; `Cargo.lock` follows.
+- [x] **The `satl-doc` sweep** (2026-08-24). `use/compose.md` was rewritten
+      around the two scopes — the page that prompted the milestone, whose thesis
+      was inverted rather than patched — plus `docker-differences.md`'s "You
+      bring a Compose file", `reference/out-of-scope.md`'s `#compose-limits` and
+      `#no-build`, `about/status.md`, `about/what-satl-is.md` and
+      `use/index.md`. The 32 generated CLI pages were regenerated with
+      `make gen` against the 0.2.0 binaries; the doc repo's `make check` gates
+      that, and it is green (84 nav entries, 59 pages within the prose caps, no
+      drift between the committed pages and the generator).
+
+      One claim needed thought rather than a find-and-replace. `what-satl-is.md`
+      said there is "no `docker-compose` on one host and Swarm on three", which
+      now reads as a denial of exactly what M11 built. The point underneath it
+      survives and is worth keeping: the two verbs differ in *scope*, not in
+      what they make — a service, with tasks, in the same store, reconciled by
+      the same loops. It says that instead. "There are no standalone containers"
+      was left alone everywhere: it is still true (invariant #2), and it is the
+      sentence the whole milestone turns on.
+
+Deliberately **not** in M11, and now unblocked should they be wanted: variable
+interpolation and `.env` loading (api-compat 114 was a design choice, not a
+consequence of cluster scope, and widening it is its own decision), and real
+per-project bridge networks (one bridge per network in `satl-net`, DNS lifted
+out of `satl-overlay`, `reconcile.rs` dropping its overlay filter, root
+integration tests) which would make api-compat 170 unnecessary.
+
 ---
 
 ## Decision log
 
 | Date | Decision |
 |---|---|
+| 2026-08-24 | **A demoted node stops publishing ports, measured; `ca_rotate` has been passing on leftover state.** The second order-dependent defect the M11 verification runs surfaced, and like the first it is **unrelated to M11**: the port paths (`satld::reconcile`'s sweep, `satl_net::manager`'s publish) are untouched by that work -- the only edit to `satl-net` is two read-only accessors. Reproduced twice: after `ca_rotate` demotes fbsd3, the manager reports `rotca.2` and `rotca.4` `Running` there and `jls` confirms both jails exist, but `pfctl -sA` on that node lists only `satl` and `satl/nat` -- **the `satl/rdr` anchor is absent** -- so its published port answers nothing and the mesh assertion times out at 60s. The node's last `published ports converged` line predates the demote by ten minutes; nothing publishes after it. Note the diagnostic trap met on the way: `satl ps` on a demoted node prints an empty table, because a worker has no store to read from, which reads as "no containers here" and is not (invariant #1, api-compat #80) -- `jls` is the ground truth. Why the suite passed before: the preceding scenario used to leave published rules on that node which the demote did not clear, so the anchor was already populated; in the failing runs the previous scenario had emptied it (`published=none`) first. Unscheduled, and it wants the same treatment as the demote defect: fix the path, and make the scenario assert the case deliberately instead of inheriting it |
+| 2026-08-24 | **`satl node demote` on the *current leader* never completes, measured; the cluster suite has been passing it by luck.** Found during M11d verification and **unrelated to M11** (`satl-cluster` is untouched by that work). `ca_rotate` always demotes fbsd3, and whether that is the leader depends on where the previous scenario, `restart_budget`, happened to leave leadership: the passing run of the same suite two hours earlier logged `cluster left with 3 managers Ready, leader node1` and the demote took 0s; the failing one logged `leader node3` and the demote timed out at 180s. On the failing path `satl_cluster::membership` logs `asked to remove the current leader; handing leadership over first` and `yield_leadership` never returns — **10 attempts, 0 `leadership handed over` lines** on that node. `yield_leadership` stops the raft tick and then waits for another node to claim leadership within its budget; on this fabric that election does not happen, so every retry re-enters the same path. Two things follow, both unscheduled: the demote path needs a real handover (openraft has a leadership-transfer call; waiting for a spontaneous election is what fails), and the scenario should pick a demotion target that is *not* the leader, or assert the leader case deliberately rather than meeting it by accident. Worked around for the M11d run by moving leadership to fbsd2 before the suite, which is also the confirmation: with a follower as the target the demote is instant |
+| 2026-08-24 | **`satl compose` carrying stack semantics was an inference, not a consequence, and M11a reverses it.** api-compat 110 read "SatL has no standalone container" (invariant #2) as forbidding a node-local compose. It does not: invariant #2 fixes the execution model, and Docker's two worlds differ in scope. The split costs no invariant, adds no REST route, and lives entirely in `satl-cli` plus docs. Two properties read out of the code decided the design rather than taste. **The CLI speaks `unix://` only** (`client.rs`, `only unix:// sockets are supported`), so under a node-local scope the client's filesystem *is* the target node's, which is exactly the reason relative binds were refused (`plan.rs`, "this client's filesystem and not the nodes'") — so the refusal had to go, not be kept out of caution. And **`force_update` already dirties everything** (`satl-orchestrator::dirty`, pinned by `force_update_dirties_everything`), which is what M11c's `compose restart` will use, so restart-as-replacement needs no new mechanism. The regression guard chosen for the whole milestone: every compose planner test written before the split runs untouched under `Scope::Cluster`, so `satl stack`'s output is pinned byte for byte by 400 pre-existing assertions rather than by new ones |
+| 2026-08-24 | **The overlay-for-compose choice survived one live test and no more, and the host that killed it is the ordinary one.** M11a first shipped compose on a single-node overlay, on the reasoning that only the overlay driver carries DNS. Deploying it on alpha failed: every task looped through `Failed` with `no cluster identity yet ... This is a start-up ordering bug in satld`, which is a **misleading message for a deliberate degradation** — alpha's address is a public **/32** (`netmask 0xffffffff`), no VXLAN blackhole can be derived from one (docs/vxlan.md §2), and satld had already said so at boot: `cannot measure this node's underlay, so it can host no overlay network; bridge networks are unaffected`. So a node-local compose on an overlay is dead on precisely the host shape a node-local compose is for: one machine with one public address. **Proven independent of the M11a change** by deploying the same file through `satl stack deploy`, whose code path was untouched, and watching it fail identically — the discipline that mattered here, because the symptom looked like a regression. The measured alternative was no better as it stood: a service on a bridge network ran, but its task got a copy of the host's `/etc/resolv.conf` (`nameserver 213.186.33.99`, the upstream provider's) and `nslookup <service>` returned NXDOMAIN. Hence M11b: fix the driver rather than route around it |
+| 2026-08-24 | **Bridge DNS needed no new source of truth, because a node-local network has no remote half.** The obstacle looked structural: a bridge address never reaches Raft (architecture §11.1, measured — a bridge task's `NetworksAttachments` carries no `Addresses`), so neither the store nor the dispatcher's endpoint tables can describe one, and both the endpoint records and the query scopes are built from those. But every task on a node-local bridge is local *by construction*, so the node's own IPAM is not a partial view, it is the whole one: `NetworkManager::address_of` supplies what the store cannot, and the record is derived field for field the way `satl_dispatcher::manager` derives an overlay endpoint, so one name means one thing on either driver. Three smaller things had to move with it. `resolv_conf` demanded an overlay identity before looking at what the task attached to, so on a node that hosts no overlay it fell through to the host's file for *every* task — the same shape as the bug `a_task_on_no_overlay_starts_on_a_node_that_has_no_overlay_identity` already pins for `attach`. `apply_network` returned early for a bridge network without refreshing the responder's bind list, so a node hosting only bridge networks never bound a socket at all. And the bind map's value became an owner enum, because one bridge gateway serves every bridge network on the node while an overlay gateway serves exactly one. Verified live on alpha after a package upgrade and a restart that re-adopted all three running jails at their existing jids: both services `Running`, `satl network ls` showing `bridge`/`local`, `resolv.conf` reading `nameserver 10.88.0.1`, the compose alias `cache` resolving to 10.88.0.6 in one direction and `web` to 10.88.0.4 in the other, and ping between them at 0% loss |
 | 2026-08-23 | **Every one-shot `satl run` executed its command twice, and nothing user-visible said so.** The mechanism predates M10, it is the composition of M1's autostart contract with M7's abandoned-slot fill: `start_container` flips the `satl.autostart` label, which bumps `spec_version` without touching the task spec; the task completes carrying the old version; the updater then saw an untouched slot whose only task was finished, unreplaceable by any restart policy and at an old version, and filled it with a replacement at the current spec, which re-ran the command. Measured in /var/log/messages on the formed 3-node cluster and on single-node alpha alike: the first task Complete, then a replacement task prepared and started, `uname -a` executed twice. Invisible because the foreground CLI attaches to the first task's logs and exits on its completion, so the second run happened after the output was printed and the exit code returned. The fix makes the fill consult the deep dirtiness the dirty module already computes (`is_task_dirty`, whose own doc warns that a false dirty replaces containers for nothing): a finished task whose spec matches the current one is the converged state of a one-shot service and its slot is nobody's to fill, while a deep-dirty finished task, a real update over a dead slot, is still filled. Regression test `an_annotations_only_bump_does_not_refill_a_finished_slot` drives the planner through the real store |
 | 2026-08-23 | **`satl run` now pins its anonymous service to the receiving node (api-compat 168).** Docker parity: `docker run` always runs on the engine you spoke to, and the tutorial is written against that promise. Measured on the formed 3-node cluster: the anonymous service had free placement, the scheduler put the task on another node, and the foreground `satl run` printed nothing (logs are node-local, api-compat 81) and exited 0. The pin is a `node.id==<id>` constraint written into the service spec by the receiving daemon before the mutation is forwarded to the leader, so a worker pins to itself, never to the leader; `satl service create` keeps free placement |
 | 2026-08-23 | **Two test-infrastructure defects only a fresh host could reveal, both measured during the M10 verification.** The `daemon.rs` integration test wrote a config that isolated its satld's socket, state, network name and ZFS root, and not its ports: the default `listen_addr` is 0.0.0.0:2377, which the production daemon on the dev host already holds, so the test's satld exited at cluster bring-up with `Address already in use`; it now listens on a loopback port of its own. And `provision.sh` installed `linux_base-rl9` in its packages step, before its own linuxulator step ran: the package's pre-install script refuses on a kernel without 64-bit Linux support, so `SATL_WITH_LINUX=1` provisioning failed on any node that had never loaded the modules, which every node provisioned so far happened to have loaded already. The linuxulator step now precedes the packages |

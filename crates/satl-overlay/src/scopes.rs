@@ -229,13 +229,33 @@ impl ScopeTable {
 ///   to the allocator's pool — keeping it could scope a *new* task's query to
 ///   the dead one's networks;
 /// - a task with **no parsed address** has no source address to be recognised
-///   by (a bridge attachment carries none: the node's own IPAM owns it,
-///   architecture §11.1).
+///   by. A bridge attachment carries none in the store — the node's own IPAM
+///   owns it (architecture §11.1) — so a task on bridge networks alone is only
+///   scopable through [`scope_for_task_with`], which is how the node hands its
+///   IPAM's answer in.
 ///
 /// Whether the task runs on *this* node is not decided here: this module is
 /// given data and the caller is what knows the node id.
 #[must_use]
 pub fn scope_for_task(task: &Task) -> Option<TaskScope> {
+    scope_for_task_with(task, &[])
+}
+
+/// The same, plus addresses the **node** knows and the store does not.
+///
+/// A bridge network's addressing never reaches Raft (architecture §11.1), so a
+/// task attached only to bridge networks parses to no source address and would
+/// be unscopable — it would send queries no responder recognises, and get them
+/// forwarded upstream, which is exactly the `NXDOMAIN`-for-a-service-name this
+/// module exists to prevent. The node reads the address out of
+/// `satl_net::NetworkManager::address_of` and passes it here; everything after
+/// that is identical for both drivers, which is the point: one scoping rule,
+/// not one per network kind.
+///
+/// `local` is additive and deduplicated against what the store already carries,
+/// so passing an address the store also holds changes nothing.
+#[must_use]
+pub fn scope_for_task_with(task: &Task, local: &[IpAddr]) -> Option<TaskScope> {
     if task.status.state.is_terminal() {
         return None;
     }
@@ -249,6 +269,11 @@ pub fn scope_for_task(task: &Task) -> Option<TaskScope> {
                 .iter()
                 .filter_map(|address| parse_cidr_address(address)),
         );
+    }
+    for address in local {
+        if !addresses.contains(address) {
+            addresses.push(*address);
+        }
     }
     let scope = TaskScope::new(task.id.clone(), addresses, networks);
     scope.is_usable().then_some(scope)
@@ -415,6 +440,51 @@ mod tests {
             [front, back],
             "the network stays in scope: the task is on it, address or not"
         );
+    }
+
+    /// A bridge-only task is unscopable from the store alone, and scopable the
+    /// moment the node supplies the address the store never saw.
+    ///
+    /// This is the whole reason [`scope_for_task_with`] exists. A bridge
+    /// network's addressing stays node-local (architecture §11.1), so the task
+    /// object carries no address on it; an unscoped source is forwarded
+    /// upstream, and a service name forwarded upstream comes back NXDOMAIN.
+    #[test]
+    fn a_bridge_only_task_scopes_on_the_address_the_node_supplies() {
+        let network = id('n', 4);
+        let mut task = task(TaskState::Running);
+        // A bridge attachment: the store holds the network, never the address.
+        task.networks = vec![attachment(&network, &[])];
+
+        assert!(
+            scope_for_task(&task).is_none(),
+            "no source address means no way to recognise the querying task"
+        );
+
+        let local = IpAddr::V4(Ipv4Addr::new(10, 88, 0, 6));
+        let scope = scope_for_task_with(&task, &[local]).expect("the node knows the address");
+        assert_eq!(scope.addresses, [local]);
+        assert_eq!(scope.networks, [network]);
+    }
+
+    /// Addresses the store already carries are not duplicated, so a task on
+    /// both drivers is scoped once per address however the two halves overlap.
+    #[test]
+    fn local_addresses_are_additive_and_deduplicated() {
+        let overlay = id('n', 5);
+        let bridge = id('n', 6);
+        let mut task = task(TaskState::Running);
+        task.networks = vec![
+            attachment(&overlay, &["10.100.0.9/24"]),
+            attachment(&bridge, &[]),
+        ];
+
+        let already = v4(0, 9);
+        let bridge_address = IpAddr::V4(Ipv4Addr::new(10, 88, 0, 6));
+        let scope =
+            scope_for_task_with(&task, &[already, bridge_address]).expect("scopable on both");
+        assert_eq!(scope.addresses, [already, bridge_address]);
+        assert_eq!(scope.networks, [overlay, bridge]);
     }
 
     fn attachment(network: &Id, addresses: &[&str]) -> satl_core::NetworkAttachment {

@@ -1685,30 +1685,61 @@ What an operator must know:
   (`materialized dependency payload`, `secret assigned/withdrawn`); if a payload
   byte sequence ever shows up in `/var/log/messages`, that is a bug to report.
   The integration suite greps for exactly that.
+## Compose files: two worlds (M5, split in M11)
 
-## Compose stacks (M5)
+Docker has two, and so does SatL. **`satl compose` runs the file on the node you
+are talking to; `satl stack deploy` spreads it over the cluster.** Same file,
+same planner, different scope — and each refuses what belongs to the other,
+naming the verb that would honour it.
 
 ```sh
 cd /srv/shop                 # compose.yaml is here; the project is "shop"
-satl compose config          # what would be created, as JSON -- reaches no daemon
-satl compose up              # networks first, then one service per compose service
-satl compose ps              # this project's tasks, across the cluster
-satl compose down            # removes exactly what up created, by label
+satl compose config          # what would be created, as JSON
+satl compose up              # deploys, then attaches to the output (^C detaches)
+satl compose up -d           # ... or returns instead. Scripts want this
+satl compose ps              # this project's tasks, all on this node
+satl compose logs --follow   # the project's output, prefixed <service>-<slot>
+satl compose stop            # every service to 0 replicas; nothing is removed
+satl compose start           # ... and back to what the file says
+satl compose restart         # replace the tasks, under each service's policy
+satl compose down -v         # remove what up created, volumes included
 satl compose down -p shop    # ... from anywhere, with no compose file at all
 ```
 
-**`satl compose up` is not `docker compose up`.** It deploys *services*: one per
-compose service, on an overlay network of its own, scheduled across the cluster.
-That is `docker stack deploy`'s model, and it is forced by SatL's own, there are
-no standalone containers here, every container is a task of a service. The
-consequences worth knowing before the first `up`:
+```sh
+satl stack deploy -c compose.yaml shop   # the same file, across the cluster
+satl stack ps shop
+satl stack rm shop
+```
 
-- **Names are namespaced, hostnames are not.** The service objects are
-  `<project>_<service>`, the networks `<project>_<key>`, the volumes
-  `<project>_<key>`; but every attachment carries the bare compose service name
-  as a DNS alias, so `redis:6379` inside the file resolves to `shop_redis`'s
-  tasks. Read the mapping with `satl compose config` before deploying, and note
-  that `satl service ls` shows the namespaced names.
+What does **not** change between them: every container is a task of a service
+(invariant #2), so either verb creates one service per compose service and
+honours `deploy:` rather than ignoring it. What changes is where the tasks run
+and what the file may say. The consequences worth knowing before the first `up`
+(`docs/api-compat.md` 110-124, 169-180):
+
+- **Names are namespaced, hostnames are not.** `satl compose` names objects
+  `<project>-<service>` (compose v2's hyphen), `satl stack` `<project>_<service>`
+  (docker stack's underscore) — docker's own split. Either way every attachment
+  carries the bare compose service name as a DNS alias, so `redis:6379` inside
+  the file resolves to the right tasks. Read the mapping with `config` before
+  deploying, and note that `satl service ls` shows the namespaced names.
+- **`satl compose` pins every service to this node**, with a `node.id==`
+  constraint, the way `satl run` does. So `deploy.placement:` is refused here
+  (there is nothing left to place), ports are published on *this* node rather
+  than on the routing mesh, and `deploy.replicas` above 1 with a fixed host port
+  is refused rather than left unschedulable — a host port can only be taken
+  once. `--scale web=3` is held to the same rule.
+- **Its networks are `bridge`, the stack's are `overlay`.** As docker's are.
+  `satl network ls` shows `bridge`/`local` for a compose project. One caveat
+  that has no docker equivalent: SatL programs **one bridge per node**, so two
+  projects share an L2 and can reach each other by address. Service *names* are
+  scoped per project; addresses are not. Use separate nodes, or an overlay
+  through `satl stack deploy`, when isolation is the requirement.
+- **A relative bind works under `satl compose`** (`./conf:/etc/nginx`), because
+  the project directory is a path on the node that will run the task — `satl`
+  speaks a unix socket only, so it cannot be talking to another host. Under
+  `satl stack` it is still refused: there, the nodes are not this filesystem.
 - **The project name decides what `down` removes.** It comes from `-p`, else
   `COMPOSE_PROJECT_NAME`, else the file's `name:`, else the directory name
   (lowercased, with anything outside `[a-z0-9_-]` deleted). `up` labels every
@@ -1716,13 +1747,11 @@ consequences worth knowing before the first `up`:
   on that label alone: an object with the right name but not the label is
   somebody else's and is refused, in both directions. Two projects can therefore
   share a cluster safely, and `down` can clean up without the file.
-- **Unsupported keys are refused, not ignored** (`docs/api-compat.md` 110-124).
-  The error names the file, the service and the key, and says why. If a stack you
-  brought from a single host is refused, the three usual causes are `build:`
-  (build and push the image first), a relative bind mount (`./conf:/etc/nginx`,
-  the path is on your workstation, not on the nodes; deliver the file as a
-  `config:` instead), and `${VAR}` interpolation (substitute it before
-  deploying).
+- **Unsupported keys are refused, not ignored.** The error names the file, the
+  service and the key, and says why. Bringing a file from a single host, the two
+  usual causes left are `build:` (build and push the image first) and `${VAR}`
+  interpolation (substitute it before deploying); relative binds are no longer
+  one of them under `satl compose`.
 - **Secrets and configs must exist first.** Only `external: true` is accepted:
   `satl secret create redis_auth ./auth.conf`, then refer to it. A `file:`
   declaration is refused because a secret is immutable, `up` could create it
@@ -1732,23 +1761,28 @@ consequences worth knowing before the first `up`:
   `deploy.update_config` policy; nothing is recreated from scratch and nothing
   else in the spec is lost. A service the file no longer declares is reported as
   an orphan and removed only with `--remove-orphans`.
-- **`down` waits, and does not touch volumes.** Removing a network while a task
-  still holds it is refused by the daemon, so `down` retries for up to 90 s while
-  the tasks stop (it says so on stderr). `-v/--volumes` is refused outright: a
-  volume is a node-local dataset on whichever nodes ran a task, and volume labels
-  are not persisted, so there is nothing to scope a cluster-wide removal by.
-  Remove them on each node that ran a task, where its daemon socket is:
-  `ssh node2 satl volume ls`, then `ssh node2 satl volume rm shop_redis-data`. The CLI
-  talks to a unix socket only (`--host tcp://...` is refused), so there is no remote
-  form of this.
-- **What to read when a stack does not come up.** `satl compose ps` gives the
-  task states and the nodes; then the daemon's own account on the node that holds
-  a failing task (`sudo grep -a satld /var/log/messages | tail -200`). A task
-  stuck in `Preparing` is usually an image the node cannot pull; a `Rejected`
-  one names the reason (a missing bind source, a secret whose uid is not
-  numeric); a task that starts and dies with a healthcheck is `Failed` with the
-  probe's exit code in `satl service ps`'s ERROR column.
-
+- **`stop`/`start`/`restart` are not docker's**, because a task is one-shot and
+  is never paused and resumed. `stop` scales the project to 0 and keeps
+  everything; `start` scales it back **from the file**, so it needs the file
+  where `stop` does not, and nothing is stashed in a hidden label; `restart`
+  bumps `ForceUpdate` and lets the updater replace the tasks, which come back
+  with new ids in the same slots.
+- **`down` waits; `-v` works on this node only.** Removing a network while a
+  task still holds it is refused by the daemon, so `down` retries for up to 90 s
+  while the tasks stop (it says so on stderr). `satl compose down -v` then
+  removes the volumes the *file* declares, by name — volume labels are not
+  persisted, so there is nothing to scope by, which is also why `-v` reads the
+  file when a plain `down` does not. `satl stack rm` has no `-v`: a stack's
+  datasets are on whichever nodes ran a task, and the CLI talks to one unix
+  socket. Remove those where each daemon is: `ssh node2 satl volume rm
+  shop_redis-data`.
+- **What to read when a project does not come up.** `satl compose ps` gives the
+  task states; `satl compose logs` gives their output; then the daemon's own
+  account (`sudo grep -a satld /var/log/messages | tail -200`). A task stuck in
+  `Preparing` is usually an image the node cannot pull; a `Rejected` one names
+  the reason (a missing bind source, a secret whose uid is not numeric); a task
+  that starts and dies with a healthcheck is `Failed` with the probe's exit code
+  in the ERROR column.
 ## Reclaiming disk: `satl system prune` (M5), `satl images rm` (M9)
 
 Before M5 nothing on a SatL node reclaimed anything. Every image layer a node ever

@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: BSD-2-Clause
 //! `satl stack` — Docker's `docker stack` verbs (M7c), on SatL's compose
 //! machinery. A stack is the set of services and networks one compose file
-//! created, labelled with the project name; `satl compose` already deploys
-//! with stack semantics, so `deploy`/`rm`/`config` delegate to it and only
-//! the read side (`ls`/`services`/`ps`) is new code.
+//! created, labelled with the project name.
+//!
+//! `deploy`/`rm`/`config` delegate to [`compose`] with
+//! [`compose::World::Cluster`], which is what makes them the cluster half of
+//! the split: free placement, overlay networks and ingress publishing, where
+//! `satl compose` pins to one node and publishes on it (M11a, api-compat 169).
+//! Only the read side (`ls`/`services`/`ps`) is code of its own.
 
 use std::collections::BTreeMap;
 
@@ -119,9 +123,11 @@ async fn deploy(host: &Host, args: &DeployArgs, streams: &mut Streams) -> anyhow
         command: compose::ComposeCommand::Up(compose::UpArgs {
             detach: true,
             remove_orphans: args.prune,
+            scale: Vec::new(),
+            build: false,
         }),
     };
-    compose::execute(host, &args, streams).await
+    compose::execute(host, &args, compose::World::Cluster, streams).await
 }
 
 /// `stack rm` is `compose down` per stack; down needs no file.
@@ -137,7 +143,7 @@ async fn rm(host: &Host, stacks: &[String], streams: &mut Streams) -> anyhow::Re
                 remove_orphans: true,
             }),
         };
-        if compose::execute(host, &args, streams).await? != 0 {
+        if compose::execute(host, &args, compose::World::Cluster, streams).await? != 0 {
             code = 1;
         }
     }
@@ -152,7 +158,7 @@ async fn config(host: &Host, args: &ConfigArgs, streams: &mut Streams) -> anyhow
         project_directory: None,
         command: compose::ComposeCommand::Config(compose::ConfigArgs { quiet: false }),
     };
-    compose::execute(host, &args, streams).await
+    compose::execute(host, &args, compose::World::Cluster, streams).await
 }
 
 /// The services of one stack, by project label.

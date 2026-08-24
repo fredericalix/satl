@@ -15,7 +15,7 @@
 //! inside the compose file keep working.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::api::cluster::{
     ConfigReference, ContainerSpec, EndpointSpec, FileTarget, NetworkAttachmentConfig, Placement,
@@ -39,8 +39,55 @@ pub const SERVICE_LABEL: &str = "com.docker.compose.service";
 /// The compose key a network came from (docker labels the key, not the name).
 pub const NETWORK_LABEL: &str = "com.docker.compose.network";
 
+/// Which of the two worlds a file is being planned for.
+///
+/// Docker has two: `docker compose` runs containers on one host, `docker stack
+/// deploy` runs services on a swarm. SatL has both, and the difference is
+/// *scope*, not execution model -- every container is a Task of a Service in
+/// either one (invariant 2). What moves is where the tasks land, how a port is
+/// published, what a name looks like, and which half of the Compose Spec the
+/// file may use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    /// `satl compose`: every task on the node the CLI is talking to, pinned
+    /// with a `node.id==` constraint. The client's filesystem is that node's
+    /// filesystem (the CLI speaks `unix://` only), so a relative bind means
+    /// what the file says it means (api-compat 169).
+    Local {
+        /// What the receiving daemon reported as its own node
+        /// (`GET /info`, `Swarm.NodeID`).
+        node_id: String,
+    },
+    /// `satl stack`: placed across the cluster by the scheduler, on an overlay,
+    /// published through the ingress mesh.
+    Cluster,
+}
+
+impl Scope {
+    /// Whether this is the node-local world.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local { .. })
+    }
+
+    /// The separator between the project and the key in an object's name.
+    ///
+    /// Docker's own split, and the reason it is a split: compose v2 names
+    /// *containers* `<project>-<service>`, docker stack names *services*
+    /// `<project>_<service>` (`Namespace.Scope` in docker/cli).
+    fn separator(self: &Scope) -> char {
+        match self {
+            Self::Local { .. } => '-',
+            Self::Cluster => '_',
+        }
+    }
+}
+
 /// What the caller must supply besides the file's text.
 pub struct Context<'a> {
+    /// Which world this file is planned for: `satl compose` is node-local,
+    /// `satl stack` spans the cluster.
+    pub scope: Scope,
     /// Path of the compose file, for error messages.
     pub path: &'a Path,
     /// Directory `env_file` paths are resolved against.
@@ -52,6 +99,16 @@ pub struct Context<'a> {
     pub env: &'a dyn Fn(&str) -> Option<String>,
     /// Reads an `env_file`. Injected so the parser stays pure in tests.
     pub read: &'a dyn Fn(&Path) -> anyhow::Result<String>,
+}
+
+impl Context<'_> {
+    /// The name an object created for compose key `key` carries.
+    ///
+    /// One place, because the separator is scope-dependent and a name that
+    /// disagreed with the label would leave `down` unable to find its own work.
+    fn name(&self, key: &str) -> String {
+        format!("{}{}{key}", self.project, self.scope.separator())
+    }
 }
 
 /// Everything `satl compose up` would create, in the order it creates it.
@@ -94,9 +151,31 @@ pub struct PlannedVolume {
     pub external: bool,
 }
 
+/// One image `satl compose build` (or `up --build`) produces before deploying.
+///
+/// Node-local only. The image lands in *this* node's store and nowhere else,
+/// which is exactly right here — the task that uses it is pinned to this node
+/// (api-compat 169) and the agent resolves a locally present image before
+/// considering a pull — and exactly wrong for a stack, where any node might be
+/// asked to run it (api-compat 144, 181).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedBuild {
+    /// Compose service key, for messages and for `--build <service>`.
+    pub key: String,
+    /// Directory the build reads, absolute, resolved against the project.
+    pub context: PathBuf,
+    /// The `Satlfile` to read, absolute.
+    pub file: PathBuf,
+    /// The reference the built image is registered under, which is also what
+    /// the service spec's `image:` says.
+    pub tag: String,
+}
+
 /// One service of the plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlannedService {
+    /// The image to build before deploying this service, if it declares one.
+    pub build: Option<PlannedBuild>,
     /// Key in the compose file (the DNS name inside the stack).
     pub key: String,
     /// Name of the service object: `<project>_<key>`.
@@ -192,11 +271,6 @@ pub fn validate_project_name(value: &str) -> anyhow::Result<()> {
 /// naming the supported keys — but these are the ones whose reason an operator
 /// needs, because they are the ones real compose files carry.
 const SERVICE_REFUSALS: &[(&str, &str)] = &[
-    (
-        "build",
-        "compose build: is not supported: build the image with `satl build` (or any builder \
-         that can push to a registry) and name the result with `image:`",
-    ),
     (
         "privileged",
         "a task never runs privileged: securelevel and the devfs ruleset are the \
@@ -366,9 +440,151 @@ const TOP_REFUSALS: &[(&str, &str)] = &[(
 )];
 
 /// The service keys `satl compose` does read, for the fallback message.
-const SERVICE_KEYS: &str = "command, configs, depends_on, deploy, entrypoint, env_file, \
+const SERVICE_KEYS: &str = "build, command, configs, depends_on, deploy, entrypoint, env_file, \
      environment, healthcheck, hostname, image, labels, networks, ports, restart, secrets, \
      stop_grace_period, stop_signal, user, volumes, working_dir";
+
+/// The image a service's tasks run.
+///
+/// `image:` when it is given; otherwise the reference `build:` will register,
+/// which is docker compose's rule too -- a service that builds its image does
+/// not have to name it twice.
+fn service_image(
+    ctx: &Context<'_>,
+    service_ctx: &ServiceContext<'_>,
+    service: &Service,
+    at: &str,
+) -> anyhow::Result<String> {
+    match (&service.image, &service.build) {
+        (Some(image), _) => Ok(image.clone()),
+        (None, Some(_)) => Ok(built_image_tag(ctx, service_ctx.key)),
+        (None, None) => Err(refuse(
+            ctx,
+            at,
+            if ctx.scope.is_local() {
+                "no `image:` and no `build:`: a service needs one or the other -- an image \
+                 this node can pull, or a Satlfile to build one from"
+            } else {
+                "no `image:` given: a stack's tasks are placed on any node, so every service \
+                 names an image every node can pull. `satl compose` can build one from a \
+                 Satlfile instead"
+            },
+        )),
+    }
+}
+
+/// The reference a service's built image is registered under.
+///
+/// `<project>-<service>` with the scope's separator, so it matches everything
+/// else the project names and cannot collide with another project's. No
+/// registry prefix: the image never leaves this node, and prefixing it with one
+/// would suggest it could be pulled from there.
+fn built_image_tag(ctx: &Context<'_>, key: &str) -> String {
+    format!("{}:latest", ctx.name(key))
+}
+
+/// The build a service declares, resolved against the project directory.
+///
+/// Refused outright under [`Scope::Cluster`]: `satl build` registers into the
+/// image store of the node it runs on, and a stack's tasks are placed on any
+/// node, so a stack that built its own images would deploy an image most of the
+/// cluster cannot pull (api-compat 144). The node-local world is the one where
+/// "built here" and "runs here" are the same node.
+fn planned_build(
+    ctx: &Context<'_>,
+    service_ctx: &ServiceContext<'_>,
+    service: &Service,
+) -> anyhow::Result<Option<PlannedBuild>> {
+    let Some(build) = &service.build else {
+        return Ok(None);
+    };
+    let at = format!("services.{}.build", service_ctx.key);
+    if !ctx.scope.is_local() {
+        return Err(refuse(
+            ctx,
+            &at,
+            "a stack's tasks are placed on any node, and a build registers the image in the \
+             store of the node that ran it, so most of the cluster could not pull the result. \
+             Build it once with `satl build -t <ref>`, `--push` it to a registry and name it \
+             with `image:`; or run this file on one node with `satl compose up --build`",
+        ));
+    }
+    let (context, file) = match build {
+        super::model::Build::Short(context) => (context.clone(), None),
+        super::model::Build::Long(long) => {
+            refuse_rest(ctx, &at, &long.rest, BUILD_REFUSALS, "context, dockerfile")?;
+            let context = long.context.clone().ok_or_else(|| {
+                refuse(
+                    ctx,
+                    &at,
+                    "no `context:`: the directory the build reads is required",
+                )
+            })?;
+            (context, long.dockerfile.clone())
+        }
+    };
+    let context = local_bind_source(ctx, &at, &context)?;
+    let file = match file {
+        Some(name) if name.starts_with('/') => name,
+        Some(name) => format!("{context}/{name}"),
+        None => format!("{context}/Satlfile"),
+    };
+    Ok(Some(PlannedBuild {
+        key: service_ctx.key.to_owned(),
+        context: PathBuf::from(context),
+        file: PathBuf::from(file),
+        tag: service
+            .image
+            .clone()
+            .unwrap_or_else(|| built_image_tag(ctx, service_ctx.key)),
+    }))
+}
+
+/// Keys of a service's `build:` mapping SatL refuses, each with its reason.
+///
+/// SatL's builder reads a `Satlfile`, not a Dockerfile (`docs/image-sources.md`),
+/// and the difference is not cosmetic: there is no `ARG`, and a multi-stage
+/// build always packs its *last* stage. So the compose keys that describe those
+/// two features cannot be half-honoured, and are named rather than dropped.
+const BUILD_REFUSALS: &[(&str, &str)] = &[
+    (
+        "args",
+        "a Satlfile has no `ARG`: build arguments are not substituted anywhere, so a value \
+         here would be silently ignored. Bake the value into the Satlfile, or generate it",
+    ),
+    (
+        "target",
+        "a Satlfile may hold several stages but always packs the last one, so a stage cannot \
+         be selected. Split the file, or make the wanted stage the last",
+    ),
+    (
+        "cache_from",
+        "the build cache is local and content-addressed (`--cache-dir`), not pulled from a \
+         registry",
+    ),
+    (
+        "ssh",
+        "there are no build secrets or ssh forwarding in a Satlfile build",
+    ),
+    (
+        "secrets",
+        "there are no build secrets in a Satlfile build; a runtime secret is the service's \
+         `secrets:` key",
+    ),
+    (
+        "platform",
+        "a Satlfile build produces an image for the node it runs on (api-compat 144)",
+    ),
+    (
+        "network",
+        "a build step's network is the host's; there is no build-time network mode",
+    ),
+    (
+        "tags",
+        "the image is tagged from `image:`, or `<project>-<service>` when that is absent; one \
+         tag, so that what `up` deploys is what was just built",
+    ),
+];
 
 /// An error naming the file, the place in it, and why.
 fn refuse(ctx: &Context<'_>, at: &str, reason: &str) -> anyhow::Error {
@@ -575,8 +791,9 @@ pub fn plan(file: &ComposeFile, ctx: &Context<'_>) -> anyhow::Result<Plan> {
         };
         let spec = service_spec(ctx, &context, service, &mut warnings)?;
         services.push(PlannedService {
+            build: planned_build(ctx, &context, service)?,
             key: key.clone(),
-            name: format!("{}_{key}", ctx.project),
+            name: ctx.name(key),
             spec,
         });
     }
@@ -646,14 +863,15 @@ fn planned_network(
 ) -> anyhow::Result<PlannedNetwork> {
     let at = format!("networks.{key}");
     let Some(declared) = declared else {
-        // An implicit or empty declaration: the stack's own overlay.
+        // An implicit or empty declaration: the project's own network, on
+        // whichever driver its world uses.
         return Ok(PlannedNetwork {
             key: key.to_owned(),
-            name: format!("{}_{key}", ctx.project),
+            name: ctx.name(key),
             external: false,
             body: Some(CreateNetworkBody {
-                name: format!("{}_{key}", ctx.project),
-                driver: "overlay".to_owned(),
+                name: ctx.name(key),
+                driver: default_network_driver(ctx).to_owned(),
                 ipam: None,
                 options: BTreeMap::new(),
                 labels: network_labels(ctx, key),
@@ -678,7 +896,7 @@ fn planned_network(
         // An external network keeps its own name, as compose-go's
         // `setNameFromKey` does; a created one is namespaced.
         (None, None) if external => key.to_owned(),
-        (None, None) => format!("{}_{key}", ctx.project),
+        (None, None) => ctx.name(key),
     };
     if external {
         if declared.driver.is_some() || declared.ipam.is_some() {
@@ -696,19 +914,16 @@ fn planned_network(
         });
     }
 
+    let default_driver = default_network_driver(ctx);
     let driver = declared
         .driver
         .clone()
-        .unwrap_or_else(|| "overlay".to_owned());
-    if driver != "overlay" {
+        .unwrap_or_else(|| default_driver.to_owned());
+    if driver != default_driver {
         return Err(refuse(
             ctx,
             &format!("{at}.driver"),
-            &format!(
-                "{driver:?} cannot carry a stack: a compose stack spans the cluster, and only \
-                 the overlay driver does (api-compat 60). `satl network create -d {driver}` \
-                 still exists for a node-local network"
-            ),
+            &driver_refusal(ctx, &driver),
         ));
     }
 
@@ -769,7 +984,7 @@ fn planned_volume(
     let Some(declared) = declared else {
         return Ok(PlannedVolume {
             key: key.to_owned(),
-            name: format!("{}_{key}", ctx.project),
+            name: ctx.name(key),
             external: false,
         });
     };
@@ -798,7 +1013,7 @@ fn planned_volume(
         (Some(name), _) => name.clone(),
         (None, Some(name)) => name,
         (None, None) if external => key.to_owned(),
-        (None, None) => format!("{}_{key}", ctx.project),
+        (None, None) => ctx.name(key),
     };
     Ok(PlannedVolume {
         key: key.to_owned(),
@@ -929,14 +1144,7 @@ fn container_spec(
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<ContainerSpec> {
     let at = format!("services.{}", service_ctx.key);
-    let image = service.image.clone().ok_or_else(|| {
-        refuse(
-            ctx,
-            &at,
-            "no `image:` given: SatL has no builder, so every service names an image a node \
-             can pull",
-        )
-    })?;
+    let image = service_image(ctx, service_ctx, service, &at)?;
 
     // Env files first, then `environment:` on top — docker's precedence. A name
     // set twice keeps its place and takes the later value, because compose
@@ -1110,8 +1318,9 @@ fn service_rest(
     }
 
     let ports = ports(ctx, &at, service, warnings)?;
+    refuse_host_port_conflict(ctx, &at, &deploy, &ports)?;
     Ok(ServiceSpec {
-        name: format!("{}_{key}", ctx.project),
+        name: ctx.name(key),
         labels,
         task_template: TaskTemplate {
             container_spec: container,
@@ -1139,6 +1348,84 @@ fn service_rest(
             rest: serde_json::Map::new(),
         }),
     })
+}
+
+/// Refuse replicas that would fight over one host port.
+///
+/// Host-mode publishing takes a host port exactly once on a node, and the
+/// node-local world has exactly one node: two replicas asking for the same
+/// fixed port would sit in `PENDING` for ever. This turns that into a sentence
+/// before anything is created (api-compat 174). An ephemeral published port
+/// (`0`, or a short `"80"`) has nothing to collide over, and `mode: global` is
+/// one task here because the pin leaves one eligible node.
+fn refuse_host_port_conflict(
+    ctx: &Context<'_>,
+    at: &str,
+    deploy: &Deploy,
+    ports: &[PortConfig],
+) -> anyhow::Result<()> {
+    let replicas = deploy.replicas.unwrap_or(1);
+    let Some(taken) = contended_host_port(&ctx.scope, replicas, ports) else {
+        return Ok(());
+    };
+    Err(refuse(ctx, at, &host_port_conflict(replicas, taken)))
+}
+
+/// The port two replicas would fight over, if there is one.
+///
+/// Only under [`Scope::Local`]: a host-mode port in the cluster world is taken
+/// once *per node*, and the scheduler spreads the replicas over nodes. Only a
+/// *fixed* published port conflicts -- an omitted or `0` one is ephemeral --
+/// and only a replicated service has a count to raise at all.
+fn contended_host_port<'a>(
+    scope: &Scope,
+    replicas: u64,
+    ports: &'a [PortConfig],
+) -> Option<&'a PortConfig> {
+    if !scope.is_local() || replicas < 2 {
+        return None;
+    }
+    ports.iter().find(|port| port.published_port != 0)
+}
+
+/// The sentence both the file-time and the `--scale` refusals print.
+fn host_port_conflict(replicas: u64, taken: &PortConfig) -> String {
+    format!(
+        "{replicas} replicas with host port {} published: a host port can only be taken once \
+         on a node, and `satl compose` runs every task on this one. Drop the fixed host port \
+         (`\"{}\"` alone publishes on an ephemeral one), ask for one replica, or spread the \
+         service over the cluster with `satl stack deploy`",
+        taken.published_port, taken.target_port
+    )
+}
+
+/// The same check, re-run after `--scale` overrode a service's replica count.
+///
+/// `up --scale web=3` must not get past what the planner would have refused had
+/// the file said `deploy.replicas: 3` (api-compat 174). The plan is already
+/// built here, so the message names the flag rather than a line in the file.
+///
+/// # Errors
+///
+/// When `replicas` above one would contend for a fixed host port.
+pub fn refuse_scaled_host_port(
+    scope: &Scope,
+    service: &PlannedService,
+    replicas: u64,
+) -> anyhow::Result<()> {
+    let ports = service
+        .spec
+        .endpoint_spec
+        .as_ref()
+        .map_or(&[][..], |endpoint| endpoint.ports.as_slice());
+    let Some(taken) = contended_host_port(scope, replicas, ports) else {
+        return Ok(());
+    };
+    anyhow::bail!(
+        "--scale {}={replicas}: {}",
+        service.key,
+        host_port_conflict(replicas, taken)
+    )
 }
 
 /// Keys of `deploy:` SatL refuses.
@@ -1274,7 +1561,7 @@ fn ports(
                     protocol: spec.protocol,
                     target_port: u32::from(spec.container_port),
                     published_port: u32::from(spec.host_port.unwrap_or(0)),
-                    publish_mode: "ingress".to_owned(),
+                    publish_mode: default_publish_mode(ctx).to_owned(),
                     rest: serde_json::Map::new(),
                 }
             }
@@ -1308,12 +1595,24 @@ fn ports(
                         &format!("{protocol:?} is not a protocol: tcp or udp"),
                     ));
                 }
-                let mode = long.mode.clone().unwrap_or_else(|| "ingress".to_owned());
+                let mode = long
+                    .mode
+                    .clone()
+                    .unwrap_or_else(|| default_publish_mode(ctx).to_owned());
                 if mode != "ingress" && mode != "host" {
                     return Err(refuse(
                         ctx,
                         &format!("{at}.mode"),
                         &format!("{mode:?} is not a publish mode: ingress or host"),
+                    ));
+                }
+                if mode == "ingress" && ctx.scope.is_local() {
+                    return Err(refuse(
+                        ctx,
+                        &format!("{at}.mode"),
+                        "the ingress routing mesh spans the cluster, and `satl compose` \
+                         publishes on the one node it runs on: use `mode: host` (the default \
+                         here), or deploy across the cluster with `satl stack deploy`",
                     ));
                 }
                 PortConfig {
@@ -1333,6 +1632,102 @@ fn ports(
         out.push(config);
     }
     Ok(out)
+}
+
+/// The driver a project network is created with.
+///
+/// Docker's own split: `docker compose` makes a bridge network per project,
+/// `docker stack deploy` makes an overlay. SatL's bridge is node-local and its
+/// overlay spans the cluster, so the drivers line up with the scopes exactly
+/// (api-compat 170).
+fn default_network_driver(ctx: &Context<'_>) -> &'static str {
+    if ctx.scope.is_local() {
+        "bridge"
+    } else {
+        "overlay"
+    }
+}
+
+/// Why a declared driver is not the one this world uses.
+///
+/// Each arm names the other verb, because "wrong driver" here almost always
+/// means the file was written for the other scope.
+fn driver_refusal(ctx: &Context<'_>, driver: &str) -> String {
+    if ctx.scope.is_local() {
+        format!(
+            "{driver:?} is not a driver `satl compose` can use: it runs the project on this \
+             node alone, so its networks are bridge networks (the default -- drop the key). \
+             An overlay spans the cluster: deploy with `satl stack deploy` to use one, or \
+             reference an existing overlay with `external: true`"
+        )
+    } else {
+        format!(
+            "{driver:?} cannot carry a stack: a compose stack spans the cluster, and only the \
+             overlay driver does (api-compat 60). Drop the key, or run the project on one node \
+             with `satl compose up`, whose networks are bridge networks"
+        )
+    }
+}
+
+/// How a port with no `mode:` of its own is published.
+///
+/// `docker compose` binds the port on the host it runs on; `docker stack
+/// deploy` puts it on the routing mesh. Same split here (api-compat 172).
+fn default_publish_mode(ctx: &Context<'_>) -> &'static str {
+    if ctx.scope.is_local() {
+        "host"
+    } else {
+        "ingress"
+    }
+}
+
+/// A relative bind source, resolved against the project directory.
+///
+/// Only reachable under [`Scope::Local`], where the project directory is a path
+/// on the very node that will run the task. `~` is expanded from the injected
+/// environment rather than read from the process, so the planner stays pure.
+/// The path is normalized textually (no symlink resolution, no `stat`): the
+/// planner never touches the filesystem, and a source that does not exist is
+/// the daemon's error to report, with the node's own view of it.
+fn local_bind_source(ctx: &Context<'_>, at: &str, path: &str) -> anyhow::Result<String> {
+    let expanded = if path == "~" || path.starts_with("~/") {
+        let home = (ctx.env)("HOME").ok_or_else(|| {
+            refuse(
+                ctx,
+                at,
+                &format!("the bind source {path:?} starts with `~` and HOME is not set"),
+            )
+        })?;
+        format!("{}{}", home.trim_end_matches('/'), &path[1..])
+    } else if path.starts_with('~') {
+        return Err(refuse(
+            ctx,
+            at,
+            &format!(
+                "the bind source {path:?} names another user's home directory, which is not \
+                 expanded: write the path out"
+            ),
+        ));
+    } else {
+        format!("{}/{path}", ctx.project_dir.display())
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in expanded.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return Err(refuse(
+                        ctx,
+                        at,
+                        &format!("the bind source {path:?} climbs above the filesystem root"),
+                    ));
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    Ok(format!("/{}", parts.join("/")))
 }
 
 /// One port number of the long form.
@@ -1776,6 +2171,29 @@ fn resources(
 
 /// `deploy.placement:` as the task template's placement.
 fn placement(ctx: &Context<'_>, at: &str, deploy: &Deploy) -> anyhow::Result<Option<Placement>> {
+    // The node-local world places nothing: every task runs on the node the CLI
+    // spoke to, pinned the way `satl run` pins its anonymous service
+    // (api-compat 168). A `placement:` block would be asking the scheduler for
+    // something the pin has already decided, so it is refused rather than
+    // silently ANDed into unschedulability (api-compat 171).
+    if let Scope::Local { node_id } = &ctx.scope {
+        if deploy.placement.is_some() {
+            return Err(refuse(
+                ctx,
+                &format!("{at}.placement"),
+                "`satl compose` runs every task on the node you are talking to, so there is \
+                 nothing left to place: a constraint or a preference here could only make the \
+                 service unschedulable. Deploy across the cluster with `satl stack deploy` to \
+                 use it",
+            ));
+        }
+        return Ok(Some(Placement {
+            constraints: vec![format!("node.id=={node_id}")],
+            max_replicas: 0,
+            preferences: Vec::new(),
+            rest: serde_json::Map::new(),
+        }));
+    }
     let Some(placement) = &deploy.placement else {
         return Ok(None);
     };
@@ -2170,13 +2588,21 @@ fn mount_source(
                 refuse(ctx, at, "a bind mount needs a `source:` naming a host path")
             })?;
             if !path.starts_with('/') {
+                // In the node-local world the task runs on the node the CLI is
+                // talking to, and the CLI only speaks `unix://` -- so the
+                // project directory *is* a path on that node and a relative
+                // bind means what the file says it means (api-compat 173).
+                if ctx.scope.is_local() {
+                    return Ok(Some(local_bind_source(ctx, at, &path)?));
+                }
                 return Err(refuse(
                     ctx,
                     at,
                     &format!(
                         "the bind source {path:?} is relative to the project directory, which is \
                          this client's filesystem and not the nodes': give an absolute path that \
-                         exists on every node, or deliver the file as a config (`configs:`)"
+                         exists on every node, or deliver the file as a config (`configs:`). \
+                         `satl compose` runs on one node and does honour a relative bind"
                     ),
                 ));
             }
@@ -2208,8 +2634,30 @@ mod tests {
     /// with every supported key used at least once.
     const STACK: &str = include_str!("../../../tests/fixtures/compose/stack.yaml");
 
+    /// The node id every `Scope::Local` test plans against.
+    const TEST_NODE: &str = "n0d31d";
+
     /// `env_file` and `${...}`-free environment inheritance, injected.
+    ///
+    /// Defaults to [`Scope::Cluster`], so every test written before the two
+    /// worlds were split still asserts what `satl stack` produces -- which is
+    /// exactly the regression guard that says `satl stack` did not move.
     fn build_project(text: &str, project: &str) -> anyhow::Result<Plan> {
+        build_scoped(text, project, Scope::Cluster)
+    }
+
+    /// The same, planned for the node-local world (`satl compose`).
+    fn local_of(text: &str) -> anyhow::Result<Plan> {
+        build_scoped(
+            text,
+            "demo",
+            Scope::Local {
+                node_id: TEST_NODE.to_owned(),
+            },
+        )
+    }
+
+    fn build_scoped(text: &str, project: &str, scope: Scope) -> anyhow::Result<Plan> {
         let path = Path::new("./compose.yaml");
         let env = |name: &str| match name {
             "FROM_ENV" => Some("from-the-client".to_owned()),
@@ -2223,8 +2671,9 @@ mod tests {
             }
         };
         let ctx = Context {
+            scope,
             path,
-            project_dir: Path::new("."),
+            project_dir: Path::new("/srv/demo"),
             project,
             env: &env,
             read: &read,
@@ -2527,7 +2976,7 @@ mod tests {
         for (body, needle) in [
             (
                 "    build: .\n",
-                "services.web.build: compose build: is not supported",
+                "services.web.build: a stack's tasks are placed on any node",
             ),
             (
                 "    privileged: true\n",
@@ -2586,7 +3035,7 @@ mod tests {
             (
                 "    annotations:\n      a: b\n",
                 "services.web.annotations: not supported by satl compose; supported keys are \
-                 command, configs",
+                 build, command, configs",
             ),
             (
                 "    deploy:\n      preferences:\n        - spread: node.labels.zone\n",
@@ -3056,12 +3505,308 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // The two worlds (M11a)
+    //
+    // Every test above plans with `Scope::Cluster`, so between them they are
+    // the guard that `satl stack` did not move. These are what `satl compose`
+    // does differently.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn local_names_with_a_hyphen_and_cluster_with_an_underscore() {
+        let text = "services:\n  web:\n    image: nginx\n    networks: [front]\n\
+                    networks:\n  front:\nvolumes:\n  data:\n";
+        let cluster = build_project(text, "demo").expect("cluster plans");
+        assert_eq!(service(&cluster, "web").name, "demo_web");
+        assert_eq!(cluster.networks[0].name, "demo_front");
+        assert_eq!(cluster.volumes[0].name, "demo_data");
+
+        let local = local_of(text).expect("local plans");
+        assert_eq!(service(&local, "web").name, "demo-web");
+        assert_eq!(local.networks[0].name, "demo-front");
+        assert_eq!(local.volumes[0].name, "demo-data");
+    }
+
+    #[test]
+    fn local_pins_every_service_to_the_receiving_node() {
+        let plan = local_of(&one_service("")).expect("local plans");
+        let placement = service(&plan, "web")
+            .spec
+            .task_template
+            .placement
+            .as_ref()
+            .expect("the pin is always there");
+        assert_eq!(placement.constraints, [format!("node.id=={TEST_NODE}")]);
+
+        // The cluster world places nothing of its own.
+        let cluster = build_project(&one_service(""), "demo").expect("cluster plans");
+        assert!(
+            service(&cluster, "web")
+                .spec
+                .task_template
+                .placement
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn local_refuses_a_placement_block_and_points_at_stack_deploy() {
+        let body = concat!(
+            "    deploy:\n",
+            "      placement:\n",
+            "        constraints:\n",
+            "          - node.role == worker\n",
+        );
+        let err = local_of(&one_service(body)).expect_err("nothing left to place");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("services.web.deploy.placement")
+                && message.contains("satl stack deploy"),
+            "{message}"
+        );
+        // The same file is fine in the world that has somewhere to place it.
+        build_project(&one_service(body), "demo").expect("cluster honours placement");
+    }
+
+    #[test]
+    fn local_publishes_on_the_host_and_cluster_on_the_ingress_mesh() {
+        let body = "    ports:\n      - \"8080:80\"\n";
+        let local = local_of(&one_service(body)).expect("local plans");
+        let ports = &service(&local, "web")
+            .spec
+            .endpoint_spec
+            .as_ref()
+            .expect("a published port")
+            .ports;
+        assert_eq!(ports[0].publish_mode, "host");
+        assert_eq!(ports[0].published_port, 8080);
+
+        let cluster = build_project(&one_service(body), "demo").expect("cluster plans");
+        assert_eq!(
+            cluster.services[0]
+                .spec
+                .endpoint_spec
+                .as_ref()
+                .expect("a published port")
+                .ports[0]
+                .publish_mode,
+            "ingress"
+        );
+    }
+
+    #[test]
+    fn local_refuses_an_explicit_ingress_publish_mode() {
+        let body = concat!(
+            "    ports:\n",
+            "      - target: 80\n",
+            "        published: 8080\n",
+            "        mode: ingress\n",
+        );
+        let err = local_of(&one_service(body)).expect_err("no mesh on one node");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("ingress routing mesh") && message.contains("satl stack deploy"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn local_refuses_a_fixed_host_port_with_more_than_one_replica() {
+        let body = "    ports:\n      - \"8080:80\"\n    deploy:\n      replicas: 3\n";
+        let err = local_of(&one_service(body)).expect_err("a host port is taken once");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("services.web: 3 replicas with host port 8080")
+                && message.contains("satl stack deploy"),
+            "{message}"
+        );
+
+        // An ephemeral host port has nothing to collide over.
+        let ephemeral = "    ports:\n      - \"80\"\n    deploy:\n      replicas: 3\n";
+        local_of(&one_service(ephemeral)).expect("no fixed port, no conflict");
+
+        // And the cluster world spreads them over nodes, so it is fine.
+        build_project(&one_service(body), "demo").expect("cluster spreads the replicas");
+    }
+
+    #[test]
+    fn local_resolves_a_relative_bind_against_the_project_directory() {
+        for (written, expected) in [
+            ("./conf:/etc/nginx", "/srv/demo/conf"),
+            ("conf/nginx:/etc/nginx", "/srv/demo/conf/nginx"),
+            ("../shared:/etc/nginx", "/srv/shared"),
+        ] {
+            let body = format!("    volumes:\n      - \"{written}\"\n");
+            let plan = local_of(&one_service(&body)).expect("local resolves the bind");
+            let mounts = &service(&plan, "web")
+                .spec
+                .task_template
+                .container_spec
+                .mounts;
+            assert_eq!(mounts[0]["Source"], expected, "{written}");
+            assert_eq!(mounts[0]["Type"], "bind", "{written}");
+
+            // The cluster world still refuses it, and now says where it works.
+            let err = build_project(&one_service(&body), "demo").expect_err("not on the nodes");
+            let message = format!("{err:#}");
+            assert!(message.contains("satl compose"), "{message}");
+        }
+    }
+
+    #[test]
+    fn each_world_creates_its_own_driver_and_refuses_the_others() {
+        // Declared explicitly, each in the world it belongs to.
+        let bridge = "services:\n  web:\n    image: nginx\n    networks: [front]\n\
+                      networks:\n  front:\n    driver: bridge\n";
+        let overlay = "services:\n  web:\n    image: nginx\n    networks: [front]\n\
+                       networks:\n  front:\n    driver: overlay\n";
+        let implicit = "services:\n  web:\n    image: nginx\n    networks: [front]\n\
+                        networks:\n  front:\n";
+
+        let driver_of = |plan: &Plan| {
+            plan.networks[0]
+                .body
+                .as_ref()
+                .expect("a created network")
+                .driver
+                .clone()
+        };
+        assert_eq!(driver_of(&local_of(bridge).expect("local plans")), "bridge");
+        assert_eq!(
+            driver_of(&local_of(implicit).expect("local plans")),
+            "bridge"
+        );
+        assert_eq!(
+            driver_of(&build_project(overlay, "demo").expect("cluster plans")),
+            "overlay"
+        );
+        assert_eq!(
+            driver_of(&build_project(implicit, "demo").expect("cluster plans")),
+            "overlay"
+        );
+
+        // And each refuses the other's, naming the verb that would work.
+        let err = format!(
+            "{:#}",
+            local_of(overlay).expect_err("no overlay on one node")
+        );
+        assert!(
+            err.contains("satl stack deploy") && err.contains("bridge networks"),
+            "{err}"
+        );
+        let err = format!(
+            "{:#}",
+            build_project(bridge, "demo").expect_err("a stack spans the cluster")
+        );
+        assert!(
+            err.contains("cannot carry a stack") && err.contains("satl compose up"),
+            "{err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build:  (M11e)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_built_service_needs_no_image_and_is_tagged_after_the_project() {
+        let plan = local_of("services:\n  web:\n    build: ./web\n").expect("build plans");
+        let service = service(&plan, "web");
+        let build = service.build.as_ref().expect("a planned build");
+        assert_eq!(build.context, std::path::Path::new("/srv/demo/web"));
+        // The build file is the Satlfile in the context, not a Dockerfile.
+        assert_eq!(build.file, std::path::Path::new("/srv/demo/web/Satlfile"));
+        assert_eq!(build.tag, "demo-web:latest");
+        // And what the service deploys is exactly what the build registers.
+        assert_eq!(
+            service.spec.task_template.container_spec.image,
+            "demo-web:latest"
+        );
+    }
+
+    #[test]
+    fn an_explicit_image_wins_over_the_derived_tag() {
+        let plan = local_of(
+            "services:\n  web:\n    image: registry.example.com/web:7\n    build: ./web\n",
+        )
+        .expect("build plans");
+        let service = service(&plan, "web");
+        assert_eq!(
+            service.build.as_ref().expect("a planned build").tag,
+            "registry.example.com/web:7"
+        );
+        assert_eq!(
+            service.spec.task_template.container_spec.image,
+            "registry.example.com/web:7"
+        );
+    }
+
+    #[test]
+    fn the_long_form_takes_a_context_and_a_build_file() {
+        let body = concat!(
+            "services:\n",
+            "  web:\n",
+            "    build:\n",
+            "      context: ./web\n",
+            "      dockerfile: Satlfile.prod\n",
+        );
+        let plan = local_of(body).expect("the long form plans");
+        let build = service(&plan, "web").build.as_ref().expect("a build");
+        assert_eq!(build.context, std::path::Path::new("/srv/demo/web"));
+        assert_eq!(
+            build.file,
+            std::path::Path::new("/srv/demo/web/Satlfile.prod")
+        );
+    }
+
+    #[test]
+    fn build_keys_the_builder_cannot_honour_are_refused_by_name() {
+        for (key, needle) in [
+            ("      args:\n        VERSION: '7'\n", "has no `ARG`"),
+            ("      target: builder\n", "always packs the last one"),
+            ("      platform: linux/amd64\n", "the node it runs on"),
+        ] {
+            let body = format!("services:\n  web:\n    build:\n      context: ./web\n{key}");
+            let err = local_of(&body).expect_err("the builder cannot honour it");
+            let message = format!("{err:#}");
+            assert!(message.contains("services.web.build"), "{message}");
+            assert!(message.contains(needle), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_stack_refuses_to_build_and_says_where_the_image_must_come_from() {
+        let err = build_project("services:\n  web:\n    build: ./web\n", "demo")
+            .expect_err("a stack's tasks are placed on any node");
+        let message = format!("{err:#}");
+        assert!(message.contains("could not pull the result"), "{message}");
+        assert!(message.contains("--push"), "{message}");
+        assert!(message.contains("satl compose up --build"), "{message}");
+    }
+
+    #[test]
+    fn a_service_with_neither_image_nor_build_is_refused_in_both_worlds() {
+        let err = format!(
+            "{:#}",
+            local_of("services:\n  web: {}\n").expect_err("nothing to run")
+        );
+        assert!(err.contains("no `image:` and no `build:`"), "{err}");
+
+        let err = format!(
+            "{:#}",
+            build_project("services:\n  web: {}\n", "demo").expect_err("nothing to run")
+        );
+        assert!(err.contains("no `image:` given"), "{err}");
+        assert!(err.contains("satl compose"), "{err}");
+    }
+
     #[test]
     fn an_env_file_that_does_not_exist_names_the_path() {
         let err = plan_of(&one_service("    env_file: nope.env\n")).expect_err("no such file");
         let message = format!("{err:#}");
         assert!(
-            message.contains("services.web.env_file: cannot read ./nope.env"),
+            message.contains("services.web.env_file: cannot read /srv/demo/nope.env"),
             "{message}"
         );
     }

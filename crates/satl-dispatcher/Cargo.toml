@@ -16,11 +16,11 @@ workspace = true
 ciborium = "0.2.2"
 prost-types = "0.14.4"
 rand = "0.10.2"
-satl-agent = { version = "0.1.0", path = "../satl-agent" }
-satl-ca = { version = "0.1.0", path = "../satl-ca" }
-satl-cluster = { version = "0.1.0", path = "../satl-cluster" }
-satl-core = { version = "0.1.0", path = "../satl-core" }
-satl-proto = { version = "0.1.0", path = "../satl-proto" }
+satl-agent = { version = "0.2.0", path = "../satl-agent" }
+satl-ca = { version = "0.2.0", path = "../satl-ca" }
+satl-cluster = { version = "0.2.0", path = "../satl-cluster" }
+satl-core = { version = "0.2.0", path = "../satl-core" }
+satl-proto = { version = "0.2.0", path = "../satl-proto" }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt", "sync", "time", "macros"] }

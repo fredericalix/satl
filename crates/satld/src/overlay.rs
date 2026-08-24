@@ -455,6 +455,63 @@ impl OverlayManager {
             .collect()
     }
 
+    /// DNS for this node's bridge networks: endpoint records, and the source
+    /// addresses their tasks' queries will carry.
+    ///
+    /// Neither the dispatcher's endpoint tables nor the store can supply these.
+    /// A bridge network's addressing never reaches Raft (architecture §11.1),
+    /// so the task objects carry no address and the assignment stream ships no
+    /// endpoints; the node's own IPAM is the only source. That costs nothing in
+    /// completeness, because every task on a node-local bridge *is* local by
+    /// construction -- there is no remote peer whose endpoints could be missed.
+    ///
+    /// The record is derived exactly as the dispatcher derives an overlay one
+    /// (`satl_dispatcher::manager`), field for field, so a service name means
+    /// the same thing whichever driver answers it. The persisted status is
+    /// canonical over the task's own copy (architecture §7.2), so it is what
+    /// decides whether the endpoint is answered at all.
+    ///
+    /// Returns the records, and per task the addresses to add to its scope --
+    /// without which the task's queries match no local task, are forwarded
+    /// upstream, and come back `NXDOMAIN` (`satl_overlay::scopes`).
+    pub async fn node_local_dns(
+        &self,
+        tasks: &[satl_agent::TaskRecord],
+    ) -> (Vec<satl_overlay::EndpointRecord>, BTreeMap<Id, Vec<IpAddr>>) {
+        let inner = self.inner.lock().await;
+        if inner.node_local.is_empty() {
+            return (Vec::new(), BTreeMap::new());
+        }
+        let network = self.net.local_network();
+        let mut records = Vec::new();
+        let mut scoped: BTreeMap<Id, Vec<IpAddr>> = BTreeMap::new();
+        for record in tasks {
+            let task = &record.task;
+            let Some(addr) = self.net.address_of(network, task.id.as_str()) else {
+                continue;
+            };
+            let mut on_bridge = false;
+            for attachment in &task.networks {
+                if !inner.node_local.contains(&attachment.network_id) {
+                    continue;
+                }
+                on_bridge = true;
+                records.push(satl_overlay::EndpointRecord {
+                    network_id: attachment.network_id.clone(),
+                    service_name: task.service_annotations.name.clone(),
+                    task_name: task.annotations.name.clone(),
+                    addresses: vec![IpAddr::V4(addr)],
+                    aliases: attachment.aliases.clone(),
+                    state: record.status.state,
+                });
+            }
+            if on_bridge {
+                scoped.insert(task.id.clone(), vec![IpAddr::V4(addr)]);
+            }
+        }
+        (records, scoped)
+    }
+
     /// Reconciles host overlay state against a `COMPLETE` snapshot's network
     /// set, **once per process** — the restarted-worker hole: interfaces a
     /// previous daemon programmed for networks this snapshot no longer
@@ -1127,8 +1184,17 @@ impl OverlayManager {
     pub async fn apply_network(&self, assignment: NetworkAssignment) -> Result<(), OverlayError> {
         if !is_overlay(&assignment.network) {
             tracing::debug!("not an overlay network; nothing to program on this node");
-            let mut inner = self.inner.lock().await;
-            inner.node_local.insert(assignment.network.id);
+            {
+                let mut inner = self.inner.lock().await;
+                inner.node_local.insert(assignment.network.id);
+            }
+            // Nothing to program, but the responder still has to learn that
+            // this node now carries a bridge network: its gateway is where
+            // those tasks' `resolv.conf` points (M11b). Before this the
+            // refresh only ran on the overlay path, so a node hosting bridge
+            // networks alone -- every node whose underlay cannot be measured,
+            // and any single-node install -- never bound a DNS socket at all.
+            self.refresh_dns().await;
             return Ok(());
         }
         let (network_id, identity) = {
@@ -1249,12 +1315,38 @@ impl OverlayManager {
     async fn refresh_dns(&self) {
         let binds = {
             let inner = self.inner.lock().await;
-            match inner.identity.as_ref() {
+            let mut binds = match inner.identity.as_ref() {
+                // No overlay identity is not "no DNS": a node whose underlay
+                // cannot be measured hosts no overlay but still runs bridge
+                // networks, and their tasks need service names just as much
+                // (M11b). Only the overlay half is skipped.
                 None => BTreeMap::new(),
                 Some(identity) => gateway_binds(&inner, &identity.node_id),
+            };
+            if let Some(gateway) = self.node_bridge_bind(&inner) {
+                binds.insert(gateway, BindOwner::NodeBridge);
             }
+            binds
         };
         self.dns.set_binds(binds).await;
+    }
+
+    /// The node-local bridge's gateway, when it should be answering.
+    ///
+    /// Two conditions, and both matter. **A bridge network must have been
+    /// shipped here**, or the responder would bind an address nothing queries
+    /// and a node that only ever runs overlays would grow a socket it does not
+    /// need. And **the gateway must already exist**, because `DnsServer::bind`
+    /// reports a failure to its caller instead of retrying, so offering it an
+    /// address that is not on an interface yet takes the whole responder down —
+    /// including the overlay sockets that were working. `local_gateway` answers
+    /// `Some` only after `ensure_host_network` put the address on the bridge,
+    /// which is exactly the permission to try.
+    fn node_bridge_bind(&self, inner: &Inner) -> Option<Ipv4Addr> {
+        if inner.node_local.is_empty() {
+            return None;
+        }
+        self.net.local_gateway()
     }
 
     /// Destroy every overlay interface on this node that no wanted network
@@ -1883,14 +1975,14 @@ impl SweepReport {
 /// cannot bind an address that is not on an interface, and `DnsServer::bind`
 /// reports a bind failure to its caller rather than retrying, so offering it an
 /// address that does not exist yet would take the whole responder down with it.
-fn gateway_binds(inner: &Inner, node_id: &Id) -> BTreeMap<Ipv4Addr, Id> {
+fn gateway_binds(inner: &Inner, node_id: &Id) -> BTreeMap<Ipv4Addr, BindOwner> {
     inner
         .networks
         .values()
         .filter(|state| state.ensured)
         .filter_map(|state| {
             let gateway: Ipv4Addr = state.network.node_gateways.get(node_id)?.parse().ok()?;
-            Some((gateway, state.network.id.clone()))
+            Some((gateway, BindOwner::Overlay(state.network.id.clone())))
         })
         .collect()
 }
@@ -2226,14 +2318,38 @@ impl TaskOverlay for OverlayManager {
     async fn resolv_conf(&self, task: &Task) -> Option<String> {
         let nameservers: Vec<IpAddr> = {
             let inner = self.inner.lock().await;
-            let node_id = inner.identity.as_ref()?.node_id.clone();
-            task.networks
-                .iter()
-                .filter_map(|attachment| inner.networks.get(&attachment.network_id))
-                .filter_map(|state| state.network.node_gateways.get(&node_id))
-                .filter_map(|text| text.parse::<Ipv4Addr>().ok())
-                .map(IpAddr::V4)
-                .collect()
+            // Attachment order is resolution order (`satl_overlay::scopes`),
+            // so the walk is over the task's attachments, not over the
+            // network maps. An overlay contributes its per-node gateway; a
+            // bridge network contributes the node bridge's gateway, which
+            // every bridge network on this node shares -- hence the dedup.
+            //
+            // The overlay node id is looked up lazily rather than demanded up
+            // front: a node with no overlay identity (an unmeasurable
+            // underlay -- a /32 address is the ordinary case) hosts no overlay
+            // but does host bridge networks, and its tasks used to fall all
+            // the way through to a copy of the host's resolv.conf and resolve
+            // no service name at all (M11b).
+            let node_id = inner.identity.as_ref().map(|identity| &identity.node_id);
+            let bridge_gateway = self.net.local_gateway();
+            let mut nameservers = Vec::with_capacity(task.networks.len());
+            for attachment in &task.networks {
+                let address = if let Some(state) = inner.networks.get(&attachment.network_id) {
+                    node_id
+                        .and_then(|node_id| state.network.node_gateways.get(node_id))
+                        .and_then(|text| text.parse::<Ipv4Addr>().ok())
+                } else if inner.node_local.contains(&attachment.network_id) {
+                    bridge_gateway
+                } else {
+                    None
+                };
+                if let Some(address) = address.map(IpAddr::V4)
+                    && !nameservers.contains(&address)
+                {
+                    nameservers.push(address);
+                }
+            }
+            nameservers
         };
         if nameservers.is_empty() {
             return None;
@@ -2407,10 +2523,24 @@ struct DnsSupervisor {
     state: tokio::sync::Mutex<DnsState>,
 }
 
+/// What a bound gateway address belongs to, for logs and change detection.
+///
+/// Never a scope: every socket answers from the *querying task's* networks
+/// (`satl_overlay::scopes`), which is why one address can serve many networks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BindOwner {
+    /// One overlay network's per-node gateway.
+    Overlay(Id),
+    /// The node-local bridge's gateway, which carries **every** bridge network
+    /// on this node: SatL programs one bridge per node, so they share it
+    /// (M11b, api-compat 170).
+    NodeBridge,
+}
+
 #[derive(Default)]
 struct DnsState {
-    /// Gateway address → the network every query arriving on it belongs to.
-    binds: BTreeMap<Ipv4Addr, Id>,
+    /// Gateway address → what it belongs to.
+    binds: BTreeMap<Ipv4Addr, BindOwner>,
     running: Option<RunningDns>,
 }
 
@@ -2430,7 +2560,7 @@ impl DnsSupervisor {
     }
 
     /// Bind exactly `binds`, if that is not already what is bound.
-    async fn set_binds(&self, binds: BTreeMap<Ipv4Addr, Id>) {
+    async fn set_binds(&self, binds: BTreeMap<Ipv4Addr, BindOwner>) {
         let mut state = self.state.lock().await;
         if state.binds == binds && (state.running.is_some() || binds.is_empty()) {
             return;
@@ -2438,11 +2568,11 @@ impl DnsSupervisor {
         if let Some(previous) = state.running.take() {
             previous.cancel.cancel();
             previous.server.join().await;
-            tracing::info!("stopped the overlay DNS responder to rebind it");
+            tracing::info!("stopped the DNS responder to rebind it");
         }
         state.binds = binds;
         if state.binds.is_empty() {
-            tracing::info!("no overlay network on this node; DNS responder stopped");
+            tracing::info!("no network with a gateway on this node; DNS responder stopped");
             return;
         }
 
@@ -2487,16 +2617,16 @@ impl DnsSupervisor {
                     // not the scope: every socket answers from the querying
                     // task's networks.
                     gateways = ?state.binds,
-                    "overlay DNS responder listening"
+                    "DNS responder listening"
                 );
                 state.running = Some(RunningDns { server, cancel });
             }
             Err(error) => {
                 tracing::error!(
                     %error,
-                    "cannot bind the overlay DNS responder; containers on this \
-                     node will not resolve service names. The gateway address \
-                     must be on the overlay bridge before the socket can bind"
+                    "cannot bind the DNS responder; containers on this node will not \
+                     resolve service names. The gateway address must be on its \
+                     bridge before the socket can bind"
                 );
                 // Leave `binds` recorded but `running` empty so the next pass
                 // retries instead of comparing equal and doing nothing.
@@ -2582,18 +2712,28 @@ pub fn spawn_dns_feed(
                 }
                 () = tokio::time::sleep(DNS_SAFETY_TICK) => {}
             }
-            let records = overlay.dns_records().await;
+            let mut records = overlay.dns_records().await;
             // An unreadable task DB must not wipe the scope table — a
             // momentary read failure would cut every container's name
             // resolution. Keep answering from the last good projection.
-            let Some(task_scopes) = local_scopes(&task_db).await else {
+            let Some(local) = local_records(&task_db).await else {
                 continue;
             };
+            // The bridge half (M11b): its records and scope addresses come
+            // from the node's own IPAM, because Raft never sees them.
+            let (bridge_records, bridge_addresses) = overlay.node_local_dns(&local).await;
+            let bridge_count = bridge_records.len();
+            records.extend(bridge_records);
+            let task_scopes: Vec<satl_overlay::TaskScope> = local
+                .into_iter()
+                .filter_map(|record| scope_of_record(record, &bridge_addresses))
+                .collect();
             let (record_count, scope_count) = (records.len(), task_scopes.len());
             overlay.table().update(records);
             overlay.scopes().update(task_scopes);
             tracing::debug!(
                 records = record_count,
+                bridge_records = bridge_count,
                 local_tasks = scope_count,
                 "DNS endpoint and scope tables rebuilt"
             );
@@ -2620,16 +2760,22 @@ fn record_of(
 /// One local task's scope from its persisted record. The persisted status is
 /// canonical over the assignment's copy (architecture §7.2), so it is what
 /// decides "terminal, scope withdrawn".
-fn scope_of_record(record: satl_agent::TaskRecord) -> Option<satl_overlay::TaskScope> {
+fn scope_of_record(
+    record: satl_agent::TaskRecord,
+    bridge_addresses: &BTreeMap<Id, Vec<IpAddr>>,
+) -> Option<satl_overlay::TaskScope> {
+    let local = bridge_addresses
+        .get(&record.task.id)
+        .map_or(&[][..], Vec::as_slice);
     let mut task = record.task;
     task.status = record.status;
-    satl_overlay::scope_for_task(&task)
+    satl_overlay::scope_for_task_with(&task, local)
 }
 
-/// One scope per local task, from the task DB.
-async fn local_scopes(task_db: &satl_agent::TaskDb) -> Option<Vec<satl_overlay::TaskScope>> {
+/// Every local task's record, from the task DB.
+async fn local_records(task_db: &satl_agent::TaskDb) -> Option<Vec<satl_agent::TaskRecord>> {
     match task_db.list().await {
-        Ok(records) => Some(records.into_iter().filter_map(scope_of_record).collect()),
+        Ok(records) => Some(records),
         Err(error) => {
             tracing::warn!(%error, "cannot read the local task db for the DNS scope table");
             None
@@ -2890,6 +3036,100 @@ mod tests {
         );
     }
 
+    /// A node that can host no overlay at all must still resolve service names
+    /// on its bridge networks.
+    ///
+    /// Same host as the test below, and the same degradation: an unmeasurable
+    /// underlay leaves `adopt_identity` with no identity. `resolv_conf`
+    /// demanded that identity before it looked at what the task attached to,
+    /// so on such a node *every* task fell through to a copy of the host's
+    /// `/etc/resolv.conf` and resolved no service name at all — measured on a
+    /// host whose only address is a /32, which is an ordinary way for a single
+    /// public server to be configured, not a misconfiguration (M11b).
+    ///
+    /// The IPAM is seeded rather than programmed: `ensure_host_network` and an
+    /// attach both need root, and what this asserts is the projection, not the
+    /// plumbing. Seeding is faithful because the manager reloads that file
+    /// verbatim.
+    #[tokio::test]
+    async fn a_bridge_task_resolves_through_the_node_bridge_with_no_overlay_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // One task, built once: `tests::task()` generates a fresh id per call,
+        // and the seeded allocation has to be for the id under test.
+        let mut task = crate::overlay::tests::task();
+        let task_id = task.id.clone();
+        {
+            let mut ipam = satl_net::LocalIpam::open_with_pool(
+                dir.path(),
+                satl_net::DEFAULT_LOCAL_BRIDGE_POOL,
+            )
+            .expect("ipam");
+            ipam.ensure_network("satl").expect("the node's subnet");
+            ipam.allocate("satl", task_id.as_str())
+                .expect("the task's address");
+        }
+        let net = satl_net::NetworkManager::open(satl_net::NetworkManagerConfig {
+            state_dir: dir.path().to_owned(),
+            pf_mode: satl_net::PfMode::Disabled,
+            ..satl_net::NetworkManagerConfig::default()
+        })
+        .expect("network manager");
+        let gateway = net
+            .local_gateway()
+            .expect("the seeded network has a gateway");
+        let address = net
+            .address_of("satl", task_id.as_str())
+            .expect("the seeded allocation");
+
+        let overlay = OverlayManager::new(
+            "satl".to_owned(),
+            None,
+            Arc::new(net),
+            CancellationToken::new(),
+        )
+        .expect("overlay manager");
+        assert!(overlay.inner.lock().await.identity.is_none());
+
+        let bridge = network("shop-front", NetworkDriver::Bridge);
+        overlay
+            .inner
+            .lock()
+            .await
+            .node_local
+            .insert(bridge.id.clone());
+
+        task.status.state = satl_core::TaskState::Running;
+        task.networks.push(satl_core::NetworkAttachment {
+            network_id: bridge.id.clone(),
+            // A bridge attachment carries no address in the store: that is
+            // exactly what the node's IPAM is here to supply.
+            addresses: Vec::new(),
+            aliases: vec!["cache".to_owned()],
+        });
+
+        let rendered = satl_agent::TaskOverlay::resolv_conf(overlay.as_ref(), &task)
+            .await
+            .expect("a bridge task points at the node bridge's responder");
+        assert!(
+            rendered.contains(&format!("nameserver {gateway}")),
+            "{rendered}"
+        );
+
+        // And the projection that lets that responder answer: one record for
+        // the attachment, and the source address its queries will carry.
+        let records = vec![satl_agent::TaskRecord {
+            task: task.clone(),
+            status: task.status.clone(),
+        }];
+        let (endpoints, scoped) = overlay.node_local_dns(&records).await;
+        assert_eq!(endpoints.len(), 1, "{endpoints:?}");
+        assert_eq!(endpoints[0].network_id, bridge.id);
+        assert_eq!(endpoints[0].addresses, vec![IpAddr::V4(address)]);
+        assert_eq!(endpoints[0].aliases, ["cache"]);
+        assert_eq!(endpoints[0].state, satl_core::TaskState::Running);
+        assert_eq!(scoped.get(&task.id), Some(&vec![IpAddr::V4(address)]));
+    }
+
     /// A node that can host no overlay at all must still run node-local
     /// containers.
     ///
@@ -3042,8 +3282,8 @@ mod tests {
         assert_eq!(
             binds,
             BTreeMap::from([
-                (ip("10.100.0.5"), first_id.clone()),
-                (ip("10.100.1.7"), second_id),
+                (ip("10.100.0.5"), BindOwner::Overlay(first_id.clone())),
+                (ip("10.100.1.7"), BindOwner::Overlay(second_id)),
             ]),
             "one socket per (node, network), on that network's own gateway"
         );
@@ -3114,7 +3354,7 @@ mod tests {
             status: mine.status.clone(),
             task: mine.clone(),
         };
-        let scope = scope_of_record(record).expect("a running local task scopes");
+        let scope = scope_of_record(record, &BTreeMap::new()).expect("a running local task scopes");
         assert_eq!(scope.task_id, mine.id);
         assert_eq!(
             scope.networks,
@@ -3135,7 +3375,7 @@ mod tests {
             status: satl_core::TaskStatus::new(satl_core::TaskState::Shutdown, "stopped"),
             task: stale_assignment,
         };
-        assert!(scope_of_record(record).is_none());
+        assert!(scope_of_record(record, &BTreeMap::new()).is_none());
     }
 
     fn attachment(network: &Id, address: &str) -> satl_core::NetworkAttachment {

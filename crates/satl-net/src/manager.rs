@@ -1061,6 +1061,27 @@ impl<R: CommandRunner> NetworkManager<R> {
         }
     }
 
+    /// The node-local bridge network this manager programs.
+    ///
+    /// There is exactly one (`network_name` in `satld.toml`): every bridge
+    /// network object in the store maps onto it, which is why a bridge network
+    /// gets no network of its own (`create_warning`). Callers that need a
+    /// task's node-local address need this name to ask [`Self::address_of`].
+    #[must_use]
+    pub fn local_network(&self) -> &str {
+        &self.config.network
+    }
+
+    /// The gateway address of the node-local bridge, once it has a subnet.
+    ///
+    /// `None` before [`Self::ensure_host_network`] has run, which is also
+    /// exactly when the address is not yet on the bridge -- so a caller that
+    /// binds a socket to it can use `Some` as the permission to try.
+    #[must_use]
+    pub fn local_gateway(&self) -> Option<std::net::Ipv4Addr> {
+        self.ipam().gateway(&self.config.network)
+    }
+
     /// The address this manager has on record for a task, if any.
     ///
     /// Lets the daemon rebuild per-task networking state (published ports in

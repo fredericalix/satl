@@ -261,9 +261,14 @@ pub struct ComposeFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Service {
-    /// Image reference; required (SatL has no builder).
+    /// Image reference. Required unless the service declares `build:`, which
+    /// names the image it produces.
     #[serde(default)]
     pub image: Option<String>,
+    /// Build this service's image from a `Satlfile` before deploying it
+    /// (`satl compose` only, M11e).
+    #[serde(default)]
+    pub build: Option<Build>,
     /// `command:` overrides the image's `CMD`.
     #[serde(default)]
     pub command: Option<ScalarList>,
@@ -460,6 +465,61 @@ impl<'de> Deserialize<'de> for VolumeMount {
         }
 
         deserializer.deserialize_any(MountVisitor)
+    }
+}
+
+/// A service's `build:`, in either of compose's two spellings.
+///
+/// The long form's keys are deliberately few: what SatL's builder can honour
+/// is a context and a build file, and the rest of compose's `build:` describes
+/// a Dockerfile build that this builder is not (api-compat 181). Everything
+/// else lands in `rest` and is refused by name.
+#[derive(Debug, Clone)]
+pub enum Build {
+    /// A bare context path.
+    Short(String),
+    /// The mapping form.
+    Long(BuildLong),
+}
+
+/// The long form of a service's `build:`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BuildLong {
+    /// Directory the build reads from, relative to the project directory.
+    #[serde(default)]
+    pub context: Option<String>,
+    /// Build file to read, relative to the context. Compose's key name; the
+    /// file it points at is a `Satlfile`, which is what the refusal below
+    /// explains when it is not.
+    #[serde(default)]
+    pub dockerfile: Option<String>,
+    /// Everything else, refused by name.
+    #[serde(flatten)]
+    pub rest: Rest,
+}
+
+impl<'de> Deserialize<'de> for Build {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BuildVisitor;
+
+        impl<'de> Visitor<'de> for BuildVisitor {
+            type Value = Build;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a build context path, or a mapping with a context")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Build, E> {
+                Ok(Build::Short(value.to_owned()))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Build, A::Error> {
+                long_form(map).map(Build::Long)
+            }
+        }
+
+        deserializer.deserialize_any(BuildVisitor)
     }
 }
 

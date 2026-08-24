@@ -14,7 +14,7 @@
 #       global_service  global_update   global_node_loss
 #       constraint_enforcer   restart_budget   ca_rotate   compose_stack
 #       mesh_failed_start   build_push_run   stack_verbs   jobs_and_prefs
-#       hot_resize
+#       hot_resize      compose_local
 #       cleanup
 #
 #   With scenario names: the readiness gate (it always gates), then just
@@ -74,7 +74,7 @@ usage() {
 SCENARIOS="init_and_join worker_join replicas_spread node_kill leader_kill overlay_dns \
 overlay_dns_multinet publish_port rolling_update global_service global_update \
 global_node_loss constraint_enforcer restart_budget ca_rotate compose_stack \
-mesh_failed_start build_push_run stack_verbs jobs_and_prefs hot_resize images_rm cleanup"
+mesh_failed_start build_push_run stack_verbs jobs_and_prefs hot_resize images_rm compose_local cleanup"
 
 READINESS_ONLY=0
 while [ "$#" -gt 0 ]; do
@@ -248,10 +248,11 @@ CR_LABEL=${SATL_TEST_CA_LABEL:-satl-rot}
 # nothing; the load is held (pre-soak, rotation, post-soak) until it is met.
 CR_MIN_REQUESTS=${SATL_TEST_CA_MIN_REQUESTS:-150}
 
-# compose_stack (M5 DoD) deploys a three-service stack from a Compose file. The
-# project name is *derived from the directory*, which is part of what the
-# scenario tests, so the directory's base name is the project: keep the two in
-# step. Its own port and service prefix so it cannot collide with the rest of
+# compose_stack (M5 DoD, driven through `satl stack` since M11a) deploys a
+# three-service stack from a Compose file across the cluster; compose_local is
+# the node-local half of the same split. The project name is *derived from the
+# directory*, which is part of what the scenario tests, so the directory's base
+# name is the project: keep the two in step. Its own port and service prefix so it cannot collide with the rest of
 # the suite, and its own secret, created outside the file because compose never
 # creates one (api-compat 120).
 CS_PROJECT=${SATL_TEST_COMPOSE_PROJECT:-cstack}
@@ -5005,9 +5006,11 @@ follower (new node id, as documented)"
 # deployed from a Compose file across the cluster, one service consuming a
 # secret, and a `down` that leaves nothing.
 #
-# `satl compose up` has *stack* semantics (docs/api-compat.md 110): it creates
-# one service per compose service on a project overlay, so what this scenario
-# asserts is the mechanism behind each of those words, never the outcome alone:
+# Driven through `satl stack` (M11a): this is the *cluster* half of Docker's
+# two worlds, where a Compose file becomes one service per compose service on a
+# project overlay, spread by the scheduler. `satl compose` runs the same file on
+# a single node and is asserted by `compose_local`. What this scenario asserts
+# is the mechanism behind each of those words, never the outcome alone:
 #
 #   - the project name comes from the directory, and every object it creates is
 #     namespaced *and labelled* with it (`satl compose config` before anything
@@ -5036,15 +5039,34 @@ follower (new node id, as documented)"
 # cs_svc <short name> — the namespaced service name `up` creates.
 cs_svc() { printf '%s_%s' "$CS_PROJECT" "$1"; }
 
-# cs_compose <args...> — `satl compose <args>` in the project directory, on the
-# control node. The project name is derived from that directory, so cd-ing into
-# it is part of what is being tested.
+# cs_compose <verb> [args...] — this scenario's compose verbs, driven through
+# `satl stack` (M11a).
+#
+# The scenario is the *cluster* definition of done — a stack spread over three
+# nodes, on an overlay, resolving across it — and since M11a that is `satl
+# stack`'s world; `satl compose` runs the same file on one node and refuses the
+# `deploy.placement:` this file needs. The verb mapping is docker's own:
+# `stack deploy` is `up`, `stack rm` is `down`, `stack ps` and `stack config`
+# are themselves. `compose_local` below is the other half of the split.
+#
+# `stack config` takes no stack name, so the project still comes from the
+# directory the command runs in, which is why cd-ing into it is still part of
+# what is being tested: it has to agree with the name `deploy` was given.
 cs_compose() {
+	_cs_verb=$1
+	shift
+	case $_cs_verb in
+	up) set -- deploy "$@" "$CS_PROJECT" ;;
+	down) set -- rm "$CS_PROJECT" ;;
+	ps) set -- ps "$CS_PROJECT" ;;
+	config) set -- config "$@" ;;
+	*) fail "cs_compose: unmapped verb $_cs_verb" ;;
+	esac
 	node_sh "$CTL" "$CS_DIR" "$@" <<'REMOTE'
 dir=$1
 shift
 cd "$dir" || exit 1
-satl compose "$@"
+satl stack "$@"
 REMOTE
 }
 
@@ -5266,13 +5288,18 @@ would resolve (api-compat 111)"
 	node_ssh "$CTL" "awk '{ print } /freebsd-nginx/ { print \"    build: .\" }' \
 	    $CS_DIR/compose.yaml > $CS_DIR/broken.yaml" ||
 	    fail "could not write the deliberately broken compose file"
-	if cs_compose -f "$CS_DIR/broken.yaml" up >"$TMPD/csbroken" 2>&1; then
+	if cs_compose up -c "$CS_DIR/broken.yaml" >"$TMPD/csbroken" 2>&1; then
 		show "$TMPD/csbroken"
-		fail "a compose file with build: was accepted; an unsupported key must be refused \
-(api-compat 113)"
+		fail "a compose file with build: was accepted; a stack cannot build its own images \
+(api-compat 181)"
 	fi
-	grep -q 'compose build: is not supported' "$TMPD/csbroken" ||
+	# Since M11e the refusal is not "unsupported" but "not here": a built image
+	# lands in one node's store and a stack's tasks are placed on any node, so
+	# the message names both ways out.
+	grep -q 'could not pull the result' "$TMPD/csbroken" ||
 	    fail "the refusal does not say why: $(tail -1 "$TMPD/csbroken")"
+	grep -q 'satl compose up --build' "$TMPD/csbroken" ||
+	    fail "the refusal does not name where a build does work: $(tail -1 "$TMPD/csbroken")"
 	grep -q 'broken.yaml' "$TMPD/csbroken" ||
 	    fail "the refusal does not name the file: $(tail -1 "$TMPD/csbroken")"
 	[ -z "$(cs_services)" ] ||
@@ -6465,6 +6492,314 @@ instance's 'startup reconciliation complete' must carry rctl_rules_purged >= 1 (
 }
 
 # ===========================================================================
+
+# ===========================================================================
+# Scenario 24 — compose_local (M11 DoD, the node-local half)
+#
+# The other half of the split compose_stack now covers. Docker has two worlds
+# and SatL has both: `satl stack deploy` spreads a Compose file over the
+# cluster, `satl compose up` runs the same shape of file on the one node the
+# CLI is talking to. This asserts the second, and it runs on the *three-node*
+# cluster deliberately — on one node "everything landed here" is true for free,
+# and every assertion below would pass on a broken pin.
+#
+# What each step catches, in the order a defect would reach an operator:
+#
+#   - the plan itself, before anything is created: a `node.id==` constraint
+#     naming the receiving node, `<project>-<service>` names with compose v2's
+#     hyphen, host-mode publishing, and a relative bind resolved to an absolute
+#     path (api-compat 169, 172, 173);
+#   - the network is a **bridge**, scope local, which is what `docker compose`
+#     makes and what SatL's compose makes since M11b gave bridge networks a DNS
+#     responder (api-compat 170);
+#   - **every task is on the control node.** This is the assertion that cannot
+#     pass by accident: three nodes are Ready and the scheduler would spread a
+#     two-service file across them, as compose_stack proves it does under
+#     `satl stack`;
+#   - **one service reaches the other by its compose name**, from inside the
+#     jail, through `fetch` — so a pass means the name resolved *and* the bridge
+#     carried the frames. Before M11b a bridge task got a copy of the host's
+#     /etc/resolv.conf and this answered NXDOMAIN;
+#   - a `deploy.placement:` in the file is refused, naming `satl stack deploy`,
+#     because a pinned task has nothing left to place (api-compat 171);
+#   - **`stop` is not docker's `stop`**: a task is one-shot, so nothing is
+#     paused and resumed. It scales the project to zero and *keeps* the
+#     services and the volume, which is what distinguishes it from `down`;
+#     `start` puts the counts back from the file, with nothing stashed in a
+#     label (api-compat 176);
+#   - **`restart` replaces**: every task id must be new and in the same slot,
+#     which is what invariant 2 means by restart (api-compat 177);
+#   - `down -v` removes the project's volume, which was refused before there
+#     was a single node to remove it from (api-compat 118), and leaves no jail,
+#     epair or dataset behind.
+# ===========================================================================
+
+CL_PROJECT=${SATL_TEST_COMPOSE_LOCAL_PROJECT:-clocal}
+CL_PORT=${SATL_TEST_COMPOSE_LOCAL_PORT:-18092}
+CL_DIR=${SATL_TEST_COMPOSE_LOCAL_DIR:-/tmp/$CL_PROJECT}
+
+# cl_svc <short name> — the name `satl compose` gives that service. A hyphen,
+# where `satl stack` uses an underscore: docker's own split (api-compat 110).
+cl_svc() { printf '%s-%s' "$CL_PROJECT" "$1"; }
+
+# cl_compose <args...> — `satl compose <args>` in the project directory, on the
+# control node. The project name comes from that directory, and the node it runs
+# on is the node it must deploy to, so both are part of what is tested.
+cl_compose() {
+	node_sh "$CTL" "$CL_DIR" "$@" <<'REMOTE'
+dir=$1
+shift
+cd "$dir" || exit 1
+satl compose "$@"
+REMOTE
+}
+
+# cl_services — this project's service names, as the daemon holds them.
+cl_services() {
+	node_ssh "$CTL" "satl service ls 2>/dev/null" |
+	    tcols - 'NAME' | awk -v p="$CL_PROJECT-" 'index($1, p) == 1 { print $1 }'
+}
+
+# cl_task_nodes — the hostnames running a live task of this project, sorted.
+cl_task_nodes() {
+	for _clt in web peer; do
+		node_ssh "$CTL" "satl service ps $(cl_svc "$_clt") 2>/dev/null" \
+		    >"$TMPD/cltasks" 2>/dev/null || return 1
+		tcols "$TMPD/cltasks" 'NODE,DESIRED STATE,CURRENT STATE' |
+		    awk -F'\t' '$2 == "Running" && $3 ~ /^Running/ { print $1 }'
+	done | sort -u
+}
+
+# cl_live_ids — the ids of this project's *running* tasks, sorted,
+# space-separated. Filtered on state, not just listed: `satl service ps` keeps
+# the terminal tasks of a slot, so after a restart the same service has both the
+# task that went away and the one that replaced it.
+cl_live_ids() {
+	for _cll in web peer; do
+		node_ssh "$CTL" "satl service ps $(cl_svc "$_cll") --no-trunc 2>/dev/null" \
+		    >"$TMPD/cllive" 2>/dev/null || return 1
+		tcols "$TMPD/cllive" 'ID,DESIRED STATE,CURRENT STATE' |
+		    awk -F'\t' '$2 == "Running" && $3 ~ /^Running/ { print $1 }'
+	done | sort | tr '\n' ' '
+}
+
+cl_rm() { cl_compose down -v >/dev/null 2>&1 || true; }
+
+scenario_compose_local() {
+	require_swarm
+	build_hostmap
+	wait_until "$T_JOIN" "all nodes Ready" \
+	    'state_fetch "$CTL" && [ "$(nodes_ready)" = "$(cluster_nodes | countl)" ]'
+
+	_cl_nodes=$(cluster_nodes | countl)
+	[ "$_cl_nodes" -ge 2 ] ||
+	    fail "compose_local needs at least two nodes: on one node the pin is true for free"
+	_cl_host=$(host_of "$CTL")
+
+	cl_rm
+	wait_until "$T_CLEAN" "no leftover $CL_PROJECT services" '[ -z "$(cl_services)" ]'
+
+	# --- the file -----------------------------------------------------------
+	# A relative bind and a relative env_file are the point of the node-local
+	# world: the project directory is a path on the node that will run the
+	# task, because satl speaks a unix socket and cannot be talking to another
+	# host (api-compat 173).
+	node_sh "$CTL" "$CL_DIR" "$IMAGE" "$CL_PORT" <<'REMOTE' ||
+dir=$1
+image=$2
+port=$3
+rm -rf "$dir"
+mkdir -p "$dir/conf"
+printf 'served-from-a-relative-bind\n' > "$dir/conf/marker"
+cat > "$dir/compose.yaml" <<YAML
+services:
+  web:
+    image: $image
+    ports:
+      - "$port:80"
+    volumes:
+      - "./conf:/mnt/conf"
+      - "data:/mnt/data"
+  peer:
+    image: $image
+volumes:
+  data:
+YAML
+REMOTE
+	    fail "could not write the compose file on $CTL"
+	info "compose.yaml written to $CL_DIR on $CTL (web publishes :$CL_PORT, peer is unpublished)"
+
+	# --- the plan, before anything exists -----------------------------------
+	cl_compose config >"$TMPD/clconfig" 2>&1 || {
+		show "$TMPD/clconfig"
+		fail "satl compose config was refused"
+	}
+	_cl_node_id=$(node_ssh "$CTL" "satl info 2>/dev/null" |
+	    sed -n 's/.*NodeID: *//p' | tr -d '\r' | head -1)
+	[ -n "$_cl_node_id" ] || fail "could not read $CTL's own node id from satl info"
+	grep -q "node.id==$_cl_node_id" "$TMPD/clconfig" ||
+	    fail "the plan carries no node.id==$_cl_node_id constraint: satl compose must pin every \
+service to the node it is talking to (api-compat 169)"
+	grep -q "\"$(cl_svc web)\"" "$TMPD/clconfig" ||
+	    fail "the plan does not name the service $(cl_svc web): compose names with a hyphen \
+(api-compat 110)"
+	grep -q '"PublishMode": *"host"' "$TMPD/clconfig" ||
+	    fail "the plan does not publish in host mode (api-compat 172)"
+	grep -q "\"Source\": *\"$CL_DIR/conf\"" "$TMPD/clconfig" ||
+	    fail "the relative bind ./conf was not resolved against $CL_DIR (api-compat 173)"
+	info "the plan pins to node.id==$_cl_node_id, names $(cl_svc web), publishes host-mode and \
+resolved ./conf"
+
+	# --- a cluster-only key is refused, and says where it works -------------
+	node_ssh "$CTL" "sed -e 's|^  peer:|  peer:\\
+    deploy:\\
+      placement:\\
+        constraints: [\"node.role == worker\"]|' $CL_DIR/compose.yaml > $CL_DIR/placed.yaml" ||
+	    fail "could not write the placement variant"
+	if cl_compose -f "$CL_DIR/placed.yaml" config >"$TMPD/clplaced" 2>&1; then
+		show "$TMPD/clplaced"
+		fail "deploy.placement was accepted by satl compose; a pinned task has nothing left \
+to place (api-compat 171)"
+	fi
+	grep -q 'satl stack deploy' "$TMPD/clplaced" ||
+	    fail "the refusal does not name satl stack deploy: $(tail -1 "$TMPD/clplaced")"
+	info "deploy.placement is refused, naming satl stack deploy"
+
+	# --- up -----------------------------------------------------------------
+	# `-d` is load-bearing since M11d: `satl compose up` attaches to the
+	# project's output and does not return until Ctrl-C (api-compat 124), so a
+	# script that wants it to come back has to ask.
+	cl_compose up -d >"$TMPD/clup" 2>"$TMPD/cluperr" || {
+		show "$TMPD/clup"
+		show "$TMPD/cluperr"
+		fail "satl compose up failed"
+	}
+	show "$TMPD/clup"
+
+	wait_until "$T_CONVERGE" "$(cl_svc web) and $(cl_svc peer) both running" '
+		_clr=$(node_ssh "$CTL" "satl service ls 2>/dev/null" |
+		    tcols - "NAME,REPLICAS" |
+		    awk -F"\t" -v p="'"$CL_PROJECT"'-" "index(\$1, p) == 1 { print \$2 }" | sort -u)
+		[ "$_clr" = "1/1" ]'
+
+	# --- the network is a bridge, scope local -------------------------------
+	node_ssh "$CTL" "satl network ls 2>/dev/null" >"$TMPD/clnet" 2>&1 ||
+	    fail "satl network ls failed on $CTL"
+	_cl_netrow=$(tcols "$TMPD/clnet" 'NAME,DRIVER,SCOPE' |
+	    awk -F'\t' -v n="$(cl_svc default)" '$1 == n { print $2 "/" $3 }')
+	[ "$_cl_netrow" = "bridge/local" ] ||
+	    fail "$(cl_svc default) is '$_cl_netrow', not bridge/local: satl compose creates the \
+network docker compose creates (api-compat 170)"
+	info "$(cl_svc default) is a bridge network, scope local"
+
+	# --- every task is on the node the CLI spoke to -------------------------
+	_cl_on=$(cl_task_nodes | tr '\n' ' ')
+	[ "$(printf %s "$_cl_on" | wc -w | tr -d ' ')" = "1" ] && [ "${_cl_on% }" = "$_cl_host" ] ||
+	    fail "this project's tasks are on '$_cl_on', not on $CTL ($_cl_host) alone: satl \
+compose runs the whole file on the node you are talking to, and $_cl_nodes nodes are Ready \
+(api-compat 169)"
+	info "every task is on $_cl_host, with $_cl_nodes nodes Ready to have taken them"
+
+	# --- the compose service name resolves, on the bridge -------------------
+	_cl_jid=$(ovl_task_jid "$CTL" "$(cl_svc peer)")
+	[ -n "$_cl_jid" ] || fail "no jail found on $CTL for $(cl_svc peer)"
+	ovl_wait_fetch "$CTL" "$_cl_jid" "web"
+	info "peer reached web by its bare compose name over the bridge (api-compat 111, 170)"
+
+	# --- logs (M11d) --------------------------------------------------------
+	# Node-local scope is what makes this possible at all: logs are node-local
+	# (api-compat 81), so a project spread over the cluster could not be
+	# followed from one place. The prefix is the assertion -- it proves the
+	# multiplexer attributed the line to the right task, not just that some
+	# output arrived.
+	cl_compose logs --tail 5 >"$TMPD/cllogs" 2>&1 || {
+		show "$TMPD/cllogs"
+		fail "satl compose logs failed"
+	}
+	grep -q '^web-1 *| ' "$TMPD/cllogs" ||
+	    fail "satl compose logs printed no web-1 prefixed line (api-compat 179): \
+$(head -3 "$TMPD/cllogs")"
+	grep -q '^peer-1 *| ' "$TMPD/cllogs" ||
+	    fail "satl compose logs printed no peer-1 prefixed line: only one service was read"
+	info "logs read both services, each line prefixed <service>-<slot> (api-compat 179)"
+
+	# --- stop, start, restart (M11c) ----------------------------------------
+	# None of the three is docker's, because a task is one-shot: nothing is
+	# paused and resumed. What is asserted is that difference, not the verb.
+	cl_compose stop >"$TMPD/clstop" 2>&1 || {
+		show "$TMPD/clstop"
+		fail "satl compose stop failed"
+	}
+	wait_until "$T_CONVERGE" "both services at 0/0, and still there" '
+		_clz=$(node_ssh "$CTL" "satl service ls 2>/dev/null" |
+		    tcols - "NAME,REPLICAS" |
+		    awk -F"\t" -v p="'"$CL_PROJECT"'-" "index(\$1, p) == 1 { print \$2 }" | sort -u)
+		[ "$_clz" = "0/0" ]'
+	# The distinction from `down`: the services, and the volume, survive.
+	[ "$(cl_services | countl)" = 2 ] ||
+	    fail "stop removed services; it scales to zero and keeps them (api-compat 176)"
+	node_ssh "$CTL" "satl volume ls 2>/dev/null" | grep -q "$(cl_svc data)" ||
+	    fail "stop removed the volume $(cl_svc data); only down -v does that"
+	info "stop scaled both services to 0/0 and left the services and the volume in place"
+
+	cl_compose start >"$TMPD/clstart" 2>&1 || {
+		show "$TMPD/clstart"
+		fail "satl compose start failed"
+	}
+	wait_until "$T_CONVERGE" "both services back at 1/1, from the file" '
+		_clr=$(node_ssh "$CTL" "satl service ls 2>/dev/null" |
+		    tcols - "NAME,REPLICAS" |
+		    awk -F"\t" -v p="'"$CL_PROJECT"'-" "index(\$1, p) == 1 { print \$2 }" | sort -u)
+		[ "$_clr" = "1/1" ]'
+	info "start restored 1/1 from the file, with nothing stashed in a label"
+
+	# `restart` replaces: the task ids must all be new, in the same slots.
+	CL_BEFORE=$(cl_live_ids)
+	[ -n "$CL_BEFORE" ] || fail "no live task ids before restart"
+	cl_compose restart >"$TMPD/clrestart" 2>&1 || {
+		show "$TMPD/clrestart"
+		fail "satl compose restart failed"
+	}
+	wait_until "$T_CONVERGE" "every task replaced by a new one in the same slot" '
+		_clnow=$(cl_live_ids)
+		_cloverlap=0
+		for _clid in $CL_BEFORE; do
+			case " $_clnow " in
+			*" $_clid "*) _cloverlap=1 ;;
+			esac
+		done
+		[ "$(printf %s "$_clnow" | wc -w | tr -d " ")" = 2 ] && [ "$_cloverlap" = 0 ]'
+	info "restart replaced both tasks: new ids in the same slots, which is what invariant 2 \
+means by restart (api-compat 177)"
+
+	# --- down leaves nothing ------------------------------------------------
+	CL_IDS=$(for _cli in web peer; do
+		node_ssh "$CTL" "satl service ps $(cl_svc "$_cli") --quiet --no-trunc 2>/dev/null" |
+		    tr -d '\r'
+	done | grep -v '^$' | sort -u | tr '\n' ' ')
+
+	cl_compose down -v >"$TMPD/cldown" 2>"$TMPD/cldownerr" || {
+		show "$TMPD/cldown"
+		show "$TMPD/cldownerr"
+		fail "satl compose down -v failed"
+	}
+	grep -q "^volume $(cl_svc data) removed$" "$TMPD/cldown" ||
+	    fail "down -v did not report removing $(cl_svc data): there is one node to remove from \
+now, which is the whole reason it is no longer refused (api-compat 118)"
+	node_ssh "$CTL" "satl volume ls 2>/dev/null" >"$TMPD/clvols" 2>&1 || true
+	if grep -q "$(cl_svc data)" "$TMPD/clvols"; then
+		show "$TMPD/clvols"
+		fail "$(cl_svc data) is still there after down -v"
+	fi
+	info "down -v removed the project's volume, after its services and its network"
+	# Audited per task rather than with the suite-wide sweep: this scenario
+	# runs while the rest of the suite's services are deliberately still up.
+	wait_until "$T_CLEAN" "the project's services, network and tasks all gone" '
+		[ -z "$(cl_services)" ] &&
+		    ! node_ssh "$CTL" "satl network inspect $(cl_svc default) >/dev/null 2>&1" &&
+		    [ "$(ru_leftovers "$CL_IDS")" = 0 ]'
+	info "compose project deployed on one node, proven and removed; cluster left as it was"
+}
 # Scenario 10 — cleanup
 #
 # Removes what the suite created and audits every node for leftovers, the same

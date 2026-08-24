@@ -10,13 +10,13 @@ description.workspace = true
 publish.workspace = true
 
 [dependencies]
-satl-cluster = { version = "0.1.0", path = "../satl-cluster" }
-satl-core = { version = "0.1.0", path = "../satl-core" }
+satl-cluster = { version = "0.2.0", path = "../satl-cluster" }
+satl-core = { version = "0.2.0", path = "../satl-core" }
 # For the node-only half of the placement decision (`PlacementRequirements`,
 # `accepts_new_tasks`): the global orchestrator must pick exactly the nodes the
 # scheduler would accept, and a second reading of "schedulable" would drift.
 # See docs/architecture.md §2.
-satl-sched = { version = "0.1.0", path = "../satl-sched" }
+satl-sched = { version = "0.2.0", path = "../satl-sched" }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["sync", "rt", "time", "macros"] }
 tokio-util = "0.7.19"

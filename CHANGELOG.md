@@ -3,12 +3,107 @@
 All notable changes to SatL are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-SatL is pre-1.0: the API and the on-disk formats may still move. The `-beta`
-qualifier lives on the git tag only, `Cargo.toml` and the FreeBSD package stay
-numeric (`0.1.0`), because a hyphen in a `pkg(8)` version is read as the
-name/version separator.
+SatL is pre-1.0: the API and the on-disk formats may still move. The
+pre-release qualifier (`-beta`, `-alpha`) lives on the **git tag only**;
+`Cargo.toml` and the FreeBSD package stay numeric (`0.2.0`), because a hyphen in
+a `pkg(8)` version is read as the name/version separator.
 
 ## [Unreleased]
+
+## [0.2.0-alpha] - 2026-08-24
+
+Docker's two worlds, both of them. `satl compose` now runs a Compose file on the
+node you are talking to, the way `docker compose` does; `satl stack deploy`
+keeps the cluster, the way `docker stack deploy` does. Until 0.1.0 both verbs
+did the second thing.
+
+**Read the two BREAKING entries below before upgrading.** `satl compose up`
+changes what it deploys *and* stops returning on its own.
+
+### Changed
+
+- **BREAKING: `satl compose` now deploys to the node you are talking to.**
+  Docker has two worlds and SatL now has both: `satl compose` is
+  `docker compose`'s scope (everything on one host) and `satl stack deploy` is
+  `docker stack deploy`'s (spread over the cluster). Until 0.1.0 both verbs did
+  the second thing. **For the old behaviour of `satl compose up`, use
+  `satl stack deploy`**; `satl stack` itself is unchanged in every respect.
+
+  What changes when you run `satl compose up`: every service is pinned to the
+  receiving node, ports are published on that node instead of the cluster's
+  ingress mesh, objects are named `<project>-<service>` instead of
+  `<project>_<service>`, and a relative bind source such as `./conf:/etc/nginx`
+  is honoured against the project directory instead of being refused. Newly
+  refused, each naming `satl stack deploy` as where it works: `deploy.placement`,
+  an explicit `mode: ingress` on a port, and `deploy.replicas` above 1 sharing a
+  fixed host port (a host port can only be taken once on one node). `driver:
+  bridge` is now the default, and `driver: overlay` is refused with a pointer to
+  `satl stack deploy`.
+
+- **`satl compose` gained the verbs node-local scope makes possible**: `down -v`
+  removes the volumes the file declares, on the node it runs on; `up --scale
+  web=3` overrides the file's replica count; and `stop` / `start` / `restart`
+  manage a running project without removing it.
+
+  None of the three lifecycle verbs is docker's, and the reason is invariant
+  #2: a task is one-shot, so nothing is ever paused and resumed. `stop` scales
+  every service to zero and leaves the services, networks and volumes in place;
+  `start` scales them back **from the compose file**, so it needs the file where
+  `stop` does not, and nothing is stashed in a hidden label; `restart` bumps
+  `ForceUpdate` and lets the rolling updater replace the tasks under each
+  service's own policy, so the tasks come back with new ids. See
+  `docs/api-compat.md` 176-178.
+
+- **`satl compose` can build its own images.** A service may declare `build:`
+  instead of `image:`; `satl compose build` builds without deploying and
+  `satl compose up --build` builds first. The image is tagged
+  `<project>-<service>:latest` and used straight from this node's store, with no
+  registry — which works because the task is pinned to the node that built it.
+
+  Two things to know. It builds a **`Satlfile`**, not a Dockerfile
+  (`docs/image-sources.md`): `dockerfile:` names which file to read, but its
+  contents must be Satlfile syntax, and `args:`/`target:` are refused with the
+  reason rather than ignored. And both verbs need **root**, because writing to
+  the image store does. Under `satl stack`, `build:` is still refused: a stack's
+  tasks are placed on any node and a built image exists on one. See
+  `docs/api-compat.md` 181-182.
+
+- **BREAKING: `satl compose up` now attaches to its project's output** and does
+  not return until Ctrl-C; `-d/--detach` stops being a no-op and is how a script
+  gets the old behaviour. Anything non-interactive that calls `satl compose up`
+  will hang without it — this caught the project's own cluster test suite, which
+  is why it is called out here rather than left to the release notes. There is a
+  new `satl compose logs [--follow] [--tail N] [SERVICE…]`, with docker's
+  `<service>-<slot>` line prefixes, one colour per service on a terminal and
+  none when redirected.
+
+  Two differences from `docker compose` worth knowing. `--follow` has **no
+  `-f`**: at this level `-f` is the compose file, and it is global so every
+  subcommand reads the same one. And **Ctrl-C detaches rather than stopping the
+  project** — a script relying on docker's behaviour to clean up will leave it
+  running; `satl compose stop` is the verb that stops it. `satl stack deploy`
+  stays detached, because following a project spread over the cluster needs a
+  log broker that does not exist. See `docs/api-compat.md` 124, 179, 180.
+
+- **The embedded DNS responder now serves bridge networks.** Before this a task
+  on a bridge network received a copy of the host's `/etc/resolv.conf` and every
+  service name answered `NXDOMAIN`; only overlay networks had service discovery.
+  This is what lets `satl compose` use bridge networks, and it fixes name
+  resolution for any bridge-network service, compose or not. It also means a
+  node that can host no overlay at all -- one whose underlay address is a `/32`,
+  an ordinary way for a single public server to be configured -- now runs
+  containers with working service discovery instead of none.
+
+  Note the isolation this does *not* give you: SatL programs one bridge per
+  node, so two projects on "different" bridge networks share one L2 and can
+  reach each other by address. Names are scoped per network, addresses are not
+  (`docs/api-compat.md` 175).
+
+  Because the object names change, a project deployed with 0.1.0's
+  `satl compose up` is not adopted by 0.2.0's: run `satl compose down` (or
+  `satl stack rm <project>`) with the old binary first, or keep it on the
+  cluster with `satl stack deploy`. Deviations 110 and 112 rewritten, 169-174
+  added in `docs/api-compat.md`.
 
 ### Added
 

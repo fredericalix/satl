@@ -132,7 +132,7 @@ pub use program::{
 };
 pub use resolv::{DNS_PORT, HostResolvConf, MAX_NAMESERVERS, OverlayResolvConf, ResolvConfError};
 pub use runner::{CommandOutput, CommandRunner, Failure, PipedRunner, SystemRunner};
-pub use scopes::{QueryScope, ScopeTable, TaskScope, scope_for_task};
+pub use scopes::{QueryScope, ScopeTable, TaskScope, scope_for_task, scope_for_task_with};
 pub use server::{DnsServer, DnsServerConfig, DnsServerError, DnsStats, Upstream};
 pub use vxlan::{
     DEFAULT_OVERLAY_MTU, DEFAULT_OVERLAY_MTU_ENCRYPTED, DEFAULT_UNDERLAY_MTU,

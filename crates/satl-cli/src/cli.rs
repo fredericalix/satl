@@ -159,22 +159,31 @@ pub enum Command {
         command: cmd::node::NodeCommand,
     },
 
-    /// Deploy a Compose file as cluster services (stack semantics, not `docker compose`'s).
+    /// Deploy a Compose file on this node (use `satl stack` for the cluster).
     ///
-    /// `satl compose up` creates one *service* per compose service on a shared
-    /// overlay network, scheduled across the whole cluster -- the semantics of
-    /// `docker stack deploy`, not of `docker compose`, because SatL has no
-    /// standalone containers: every container is a task of a service.
+    /// `satl compose up` runs the whole file on the node you are talking to:
+    /// every service is pinned there with a node.id== constraint, ports are
+    /// published on that node rather than on the cluster's routing mesh, and a
+    /// relative bind or an `env_file` means a path on that node -- which is the
+    /// same machine as this client, since satl speaks a unix socket only. That
+    /// is `docker compose`'s scope. For `docker stack deploy`'s, spreading the
+    /// same file over the cluster on an overlay, use `satl stack deploy`.
     ///
-    /// Services are named <project>_<service> and answer to the compose service
-    /// name as a DNS alias, so the hostnames inside the file keep working. The
-    /// project name comes from -p, else `COMPOSE_PROJECT_NAME`, else the file's
-    /// `name:`, else the directory; `down` removes exactly the objects `up`
-    /// labelled with it, and nothing else.
+    /// What does not change between the two: every container is a task of a
+    /// service either way (there is no standalone container), so `up` creates
+    /// one service per compose service and `deploy:` is honoured rather than
+    /// ignored. Services are named <project>-<service> here and
+    /// <project>_<service> under `satl stack`, docker's own split; both answer
+    /// to the bare compose service name as a DNS alias, so the hostnames
+    /// inside the file keep working.
+    ///
+    /// The project name comes from -p, else `COMPOSE_PROJECT_NAME`, else the
+    /// file's `name:`, else the directory; `down` removes exactly the objects
+    /// `up` labelled with it, and nothing else.
     ///
     /// Anything outside the supported subset is refused with the file, the
     /// service and the key named, never silently ignored. The subset and every
-    /// deviation are in docs/api-compat.md (entries 110-124).
+    /// deviation are in docs/api-compat.md (entries 110-124, 169-174).
     #[command(verbatim_doc_comment)]
     Compose(cmd::compose::ComposeArgs),
 
@@ -185,8 +194,9 @@ pub enum Command {
         command: cmd::service::ServiceCommand,
     },
 
-    /// Manage stacks -- Docker's `docker stack` verbs on SatL's compose
-    /// machinery (a stack is one compose file's services and networks).
+    /// Manage stacks -- deploy a Compose file across the cluster (use
+    /// `satl compose` for this node alone). A stack is one compose file's
+    /// services and networks, on a shared overlay, placed by the scheduler.
     #[command(subcommand)]
     Stack(cmd::stack::StackCommand),
 
@@ -257,7 +267,9 @@ pub async fn dispatch(cli: &Cli, streams: &mut Streams) -> anyhow::Result<u8> {
         Command::Swarm { command } => cmd::swarm::execute(&host, command, streams).await,
         Command::Ca(args) => cmd::ca::execute(&host, args, streams).await,
         Command::Node { command } => cmd::node::execute(&host, command, streams).await,
-        Command::Compose(args) => cmd::compose::execute(&host, args, streams).await,
+        Command::Compose(args) => {
+            cmd::compose::execute(&host, args, cmd::compose::World::Local, streams).await
+        }
         Command::Service { command } => cmd::service::execute(&host, command, streams).await,
         Command::Stack(command) => cmd::stack::execute(&host, command, streams).await,
         Command::Secret { command } => cmd::secret::execute(&host, command, streams).await,
@@ -1244,10 +1256,22 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["satl", "compose", "config", "-q"]).is_ok());
-        // A verb is required, and there is no `logs`: a cluster-wide log stream
-        // needs the log broker (SWK 19), which is deferred.
+        // A verb is required.
         assert!(Cli::try_parse_from(["satl", "compose"]).is_err());
-        assert!(Cli::try_parse_from(["satl", "compose", "logs"]).is_err());
+
+        // `logs` exists since M11d, because a node-local project's tasks are
+        // all on the node this CLI talks to. `--follow` is long-only: `-f` is
+        // the compose file at this level (api-compat 179).
+        assert!(Cli::try_parse_from(["satl", "compose", "logs"]).is_ok());
+        assert!(Cli::try_parse_from(["satl", "compose", "logs", "--follow", "web"]).is_ok());
+        assert!(Cli::try_parse_from(["satl", "compose", "logs", "-f"]).is_err());
+        for verb in ["stop", "start", "restart"] {
+            assert!(
+                Cli::try_parse_from(["satl", "compose", verb]).is_ok(),
+                "compose {verb} should parse"
+            );
+        }
+        assert!(Cli::try_parse_from(["satl", "compose", "up", "--scale", "web=3"]).is_ok());
     }
 
     #[test]

@@ -124,7 +124,7 @@ edge requires updating this table in the same PR.
 | `satl-image` | OCI distribution client, manifest/platform resolution, content store | `satl-core` |
 | `satl-storage` | ZFS layer store: datasets, snapshots, clones, GC | `satl-core` |
 | `satl-net` | node-local networking: VNET, epair, bridge, pf, local IPAM | `satl-core` |
-| `satl-overlay` | VXLAN VTEP/FDB programming, embedded DNS responder | `satl-core`, `satl-net` |
+| `satl-overlay` | VXLAN VTEP/FDB programming, embedded DNS responder (both drivers, §11.5) | `satl-core`, `satl-net` |
 | `satl-ca` | root CA, cert issuance/rotation, join tokens, rustls config | `satl-core` |
 | `satl-cluster` | openraft FSM + store + watch feed, log/snapshot persistence, membership | `satl-core`, `satl-proto`, `satl-ca` |
 | `satl-sched` | scheduler: filter pipeline + ranking | `satl-core`, `satl-cluster` |
@@ -133,7 +133,7 @@ edge requires updating this table in the same PR.
 | `satl-dispatcher` | **both** sides of the manager↔worker protocol: the `Dispatcher` service and the worker's session client, in one crate so the wire format cannot drift (added in M2) | `satl-core`, `satl-proto`, `satl-ca`, `satl-cluster`, `satl-agent` |
 | `satl-api` | Docker REST API server (axum): routes, types, translation to store ops | `satl-core`, `satl-cluster` |
 | `satld` | daemon binary: config, wiring, rc.d entrypoint | everything |
-| `satl-cli` | `satl` binary: docker-compatible CLI + compose | `satl-core` |
+| `satl-cli` | `satl` binary: docker-compatible CLI + compose (both scopes, §13) | `satl-core` |
 
 Notes:
 
@@ -1080,6 +1080,21 @@ consequence is in `docs/api-compat.md`). Task `resolv.conf` points there, one
 `<service>` and `<task-name>` with the healthy tasks' overlay IPs, shuffled
 round-robin; forwards everything else upstream (host resolver).
 
+**Both drivers are served (M11b).** An overlay network contributes its per-node
+gateway; a bridge network contributes the node bridge's gateway, which every
+bridge network on that node shares, because SatL programs one bridge per node
+(§11.1). The two halves differ only in where the data comes from: an overlay's
+endpoints and addresses arrive on the assignment stream, while a bridge's
+addressing never reaches Raft (§11.1), so its records and query scopes are built
+from the node's own IPAM. That is not a partial view — every task on a
+node-local bridge is local by construction — and the record is derived field for
+field the way the dispatcher derives an overlay endpoint, so a name means the
+same thing on either driver. Two consequences worth stating: a node that can
+host no overlay (an unmeasurable underlay, §11.2) still has full service
+discovery on its bridge networks; and because bridge networks share one bridge,
+*names* are scoped per network but *addresses* are not, so a bridge network is
+not an isolation boundary (`docs/api-compat.md` 175).
+
 **Scope is the querying task, not the socket.** The chain is source address → local
 task → that task's networks, walked in **attachment order** (the order of
 `TaskTemplate.Networks`), and the first network that holds the name answers it,
@@ -1269,6 +1284,13 @@ requires a client certificate from the cluster CA.
   M9 `DELETE /images/{name}` and `GET /images/{name}/json`.
 - `satl` CLI verbs map 1:1 to docker's; `satl compose` (M5) consumes Compose Spec
   files (services, networks, volumes, secrets, deploy.{replicas,resources,placement}).
+  Since M11a it consumes them in **two scopes**, as docker does: `satl compose` is
+  node-local (every service pinned to the node that served the request, host-mode
+  publishing, relative binds honoured) and `satl stack` spans the cluster (free
+  placement, ingress publishing). One planner serves both. This is a scope split,
+  not a second execution model: a container is a Task of a Service in either
+  (invariant #2, §4), all of it in the Raft store (invariant #1), and no REST route
+  is added (invariant #8). api-compat 110 and 169-174.
 - **Every intentional deviation gets an entry in `docs/api-compat.md` in the same PR**
   (invariant #8). Already-known deviations to record when implemented: auto-initialized
   single-node swarm (§1.2); DNSRR-only endpoint mode (§11.5); ingress ports not

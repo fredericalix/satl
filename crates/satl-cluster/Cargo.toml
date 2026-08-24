@@ -23,9 +23,9 @@ rand = "0.10.2"
 redb = "4.1.0"
 rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs", "std", "logging", "tls12"] }
 rustls-pki-types = "1"
-satl-ca = { version = "0.1.0", path = "../satl-ca" }
-satl-core = { version = "0.1.0", path = "../satl-core" }
-satl-proto = { version = "0.1.0", path = "../satl-proto" }
+satl-ca = { version = "0.2.0", path = "../satl-ca" }
+satl-core = { version = "0.2.0", path = "../satl-core" }
+satl-proto = { version = "0.2.0", path = "../satl-proto" }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["sync", "rt", "rt-multi-thread", "macros", "fs", "io-util", "time", "net"] }

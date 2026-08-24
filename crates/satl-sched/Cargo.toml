@@ -10,8 +10,8 @@ description.workspace = true
 publish.workspace = true
 
 [dependencies]
-satl-cluster = { version = "0.1.0", path = "../satl-cluster" }
-satl-core = { version = "0.1.0", path = "../satl-core" }
+satl-cluster = { version = "0.2.0", path = "../satl-cluster" }
+satl-core = { version = "0.2.0", path = "../satl-core" }
 tokio = { version = "1.53.1", features = ["sync", "rt", "time", "macros"] }
 tokio-util = "0.7.19"
 tracing = "0.1.44"

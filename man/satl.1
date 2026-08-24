@@ -90,13 +90,13 @@ certificate operations deserve better than a flag pile).
 .It Cm node
 Manage swarm nodes.
 .It Cm compose
-Deploy a Compose file as cluster services (stack semantics, not
-docker compose's).
+Deploy a Compose file on this node (use satl stack for the cluster).
 .It Cm service
 Manage services.
 .It Cm stack
-Manage stacks \-\- Docker's docker stack verbs on SatL's compose machinery
-(a stack is one compose file's services and networks).
+Manage stacks \-\- deploy a Compose file across the cluster (use satl compose
+for this node alone). A stack is one compose file's services and networks, on
+a shared overlay, placed by the scheduler.
 .It Cm secret
 Manage secrets.
 .It Cm config

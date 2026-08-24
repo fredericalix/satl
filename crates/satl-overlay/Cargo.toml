@@ -12,8 +12,8 @@ publish.workspace = true
 [dependencies]
 libc = "0.2"
 rand = "0.10.2"
-satl-core = { version = "0.1.0", path = "../satl-core" }
-satl-metrics = { version = "0.1.0", path = "../satl-metrics" }
+satl-core = { version = "0.2.0", path = "../satl-core" }
+satl-metrics = { version = "0.2.0", path = "../satl-metrics" }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
 tokio-util = "0.7.19"
