@@ -1361,10 +1361,14 @@ consensus engine -- the reason it is not optional.
       the only honest way to write one is to check it first. The remaining
       commits (the proposal-retry fix, the soak work and this correction) were
       pushed as a fast-forward, nothing to pull.
-- [ ] **The `v0.2.0-alpha` tag is still local**, deliberately: pushing a
-      release tag is a louder act than pushing a branch, and it is the kind of
-      thing to do on purpose rather than as a side effect. `git push origin
-      v0.2.0-alpha` when the release is meant to be visible as one.
+- [x] **`v0.2.0-alpha` is on the remote too**, pointing at `cc8054a`.
+      Recorded with some embarrassment: the line above this one, written in the
+      same sitting, said the tag was still local, and it was written the same
+      way as the claim it was correcting -- from what the roadmap said rather
+      than from `git ls-remote --tags origin`. The rule survives the mistake
+      intact and is worth restating for it: **a claim about a remote is only
+      worth writing after the command that checks it.** Note the tag is behind
+      the branch by design, it marks the release rather than the tip.
 - [x] No signed releases and no FreeBSD port. `README.md` now says so where the
       package is built, rather than leaving it to be discovered: unsigned, no
       pkg repository, not in the ports tree, verify against
