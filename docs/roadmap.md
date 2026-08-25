@@ -55,7 +55,7 @@ remain done; of the M6 backlog only plugin volumes are unscheduled.
 | M6 | Backlog (routing mesh, dataplane encryption, build, metrics) | `[~]` partially done (`plan-m6.md`: M6a–M6g ✅; dataplane encryption ✅ 2026-08-16 on `m6-encryption`; jobs/placement prefs/autolock landed in M7; only plugin volumes remain, unscheduled) |
 | M10 | Field fixes and man pages | ✅ done (DoD verified 2026-08-23) |
 | M11 | The two worlds: node-local `satl compose`, cluster `satl stack` | ✅ done (2026-08-24, shipped as 0.2.0) |
-| M12 | Launch readiness: the two cluster defects, scenario independence, credibility fixes | 🔨 in progress (Phases 1-6 done; `make check`, `sudo make integration` and `make cluster-test` **25/25 twice**, the encrypted suite 7/7, and `demote_leader` + `ca_rotate` pass in isolation. Five further defects were found by stressing the fixed paths -- an evicted node campaigning against a blacklist for ever, a doubled rebuild, a raced container clone that rolled back a whole update, an unkillable shutdown, and a suite ssh that could hang -- all fixed, and `make cluster-test` is 25/25 on the fleet carrying them, with `demote_leader` and `ca_rotate` green in isolation. Left: soak, tag, push) |
+| M12 | Launch readiness: the two cluster defects, scenario independence, credibility fixes | 🔨 in progress (Phases 1-6 done; `make check`, `sudo make integration` and `make cluster-test` **25/25 twice**, the encrypted suite 7/7, and `demote_leader` + `ca_rotate` pass in isolation. Five further defects were found by stressing the fixed paths -- an evicted node campaigning against a blacklist for ever, a doubled rebuild, a raced container clone that rolled back a whole update, an unkillable shutdown, and a suite ssh that could hang -- all fixed, and `make cluster-test` is 25/25 on the fleet carrying them, with `demote_leader` and `ca_rotate` green in isolation. Left: soak and push; `main` now carries M12 and is tagged `v0.2.0-alpha`) |
 
 Legend: ⏳ not started · 🔨 in progress · 🔍 in review · ✅ done · 🧊 frozen · `[~]` partially done
 
@@ -1299,12 +1299,17 @@ consensus engine -- the reason it is not optional.
       cover (integration, cluster).
 - [x] `README.md` and `docs/operations.md`: `satl-0.1.0.pkg` -> `0.2.0`.
 - [x] The merged `m11-two-worlds` branch is gone locally.
-- [ ] Tag `v0.2.0-alpha`. `Cargo.toml` stays numeric (`0.2.0`): a hyphen in a
-      `pkg(8)` version is read as the name/version separator. Note that
-      `roadmap.md` claimed a local `v0.1.0-beta` tag that does not exist --
-      `git tag -l` is empty.
-- [ ] Push. Nothing is pushed yet, and `main` is level with `origin/main`; the
-      M12 work is on `m12-openraft-0.10`.
+- [x] **Tagged `v0.2.0-alpha`**, on `main` after the M12 branch fast-forwarded
+      into it. `Cargo.toml` stays numeric (`0.2.0`): a hyphen in a `pkg(8)`
+      version is read as the name/version separator, so the package and the tag
+      deliberately differ. The tag is annotated and local only -- nothing is
+      pushed. Note that `roadmap.md` had claimed a local `v0.1.0-beta` tag that
+      never existed; `git tag -l` was empty until this one.
+- [ ] Push. Nothing is pushed yet. `main` now carries M12 and the
+      `v0.2.0-alpha` tag and is **two commits ahead of `origin/main`**, which is
+      still at `a264fa3`; the tag exists only locally. Pushing is the one step
+      that makes any of this visible outside this host, so it stays a deliberate
+      act rather than a side effect of finishing the work.
 - [x] No signed releases and no FreeBSD port. `README.md` now says so where the
       package is built, rather than leaving it to be discovered: unsigned, no
       pkg repository, not in the ports tree, verify against
