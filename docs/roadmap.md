@@ -1323,12 +1323,34 @@ consensus engine -- the reason it is not optional.
       start time stayed put**, which is re-adoption (architecture §7.2) visible
       at a glance rather than inferred. A changed jail id under an unchanged
       count is the silent restart this line exists to catch.
+- [x] **Re-based again, 2026-08-25T19:14Z, and this time the soak also soaks
+      the lo0 publish path.** The previous baseline died twice in one
+      afternoon: the fleet moved to the 0.2.1 build (a different commit is a
+      different soak, this phase's own rule), and the `make cluster-test` run
+      that validated 0.2.1 re-initialized the cluster, which destroyed the
+      tutorial stack that was the workload. Redeployed by replaying the
+      getting-started page (images rebuilt on each node, secret, `stack
+      deploy`; `tuto_web` 3/3 spread one per node, `tuto_db` pinned with its
+      volume) and re-baselined with `soak-report.sh`, saved under
+      `~/soak-reports/` on alpha so the re-read has a file to diff, not a
+      memory. Alpha's half runs the report's own observation block locally
+      (`~/soak-reports/alpha-block.sh`), because alpha does not ssh to itself.
+      Baseline: satld 73-77 MiB RSS across the fleet, zero leadership churn,
+      zero panics, zero DYING prisons, all layer datasets `@final`, and
+      alpha's `web` jail still jid 6 since Aug 10 -- three package upgrades
+      today and the container never restarted. The window's handful of
+      WARN/ERROR lines are today's suite churn (node kills are part of the
+      scenarios); the J+3 diff is what must stay flat. New in this soak:
+      every node now answers `curl localhost:18090` through the lo0 NAT
+      (0.2.1), so the route, the TXCSUM flag and the extra pf rules are under
+      real uptime for the first time.
 - [ ] **Re-read it in a few days** with the same command and diff the numbers.
       This is the only item in this phase that cannot be compressed: it needs
       time to pass, not work to be done. The specific questions the baseline
       makes answerable: does RSS grow, do the epair and layer counts return to
       where they started once tasks churn, does any node stop appearing in the
       leadership lines, and does anything at all show up under `crashes`.
+      Compare against `~/soak-reports/baseline-20260825T191410Z-{cluster,alpha}.txt`.
 
 ### Phase 8: launch mechanics 🔨
 
