@@ -916,9 +916,9 @@ the cluster-wide pool from. Operator consequences:
   back through the relay, same trade Docker's mesh makes). Where the real
   client address matters (logs, rate limiting, fail2ban), use the opt-in
   PROXY-protocol mode below;
-- reach a published port from **another host**. pf applies `rdr` to packets *entering*
-  an interface, so `curl localhost:18080` on the publishing node itself does not work
-  and never did (`docs/api-compat.md` #35).
+- `curl localhost:18080` on the publishing node itself works when
+  `pf_mode = enforce` and pf does not `set skip on lo0` (`docs/api-compat.md`
+  #35 has the mechanism; satld warns at startup when lo0 is skipped).
 
 ### Proxy mode: `satl.publish.proxy_protocol=v2` (M6e)
 

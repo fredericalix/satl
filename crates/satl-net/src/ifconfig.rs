@@ -295,6 +295,10 @@ fn args_set_mtu(iface: &str, mtu: u32) -> Vec<String> {
     vec![iface.to_owned(), "mtu".to_owned(), mtu.to_string()]
 }
 
+fn args_disable_txcsum(iface: &str) -> Vec<String> {
+    to_args([iface, "-txcsum"])
+}
+
 fn args_move_to_jail(iface: &str, jail: &str) -> Vec<String> {
     to_args([iface, "vnet", jail])
 }
@@ -445,6 +449,22 @@ fn parse_groups(stdout: &str) -> Vec<String> {
         .flat_map(str::split_whitespace)
         .map(str::to_owned)
         .collect()
+}
+
+/// Whether `ifconfig <iface>` show output carries `TXCSUM` in its interface
+/// options line (`\toptions=680003<RXCSUM,TXCSUM,LINKSTATE,...>`).
+///
+/// The match is against the exact token: `TXCSUM_IPV6` is a different
+/// capability and must not count (SatL assigns no IPv6, and the measured
+/// fix left it untouched). The `nd6 options=...` line does not match
+/// because its trimmed line starts with `nd6`, not `options=`.
+fn options_have_txcsum(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("options="))
+        .filter_map(|rest| rest.trim_end_matches('>').split_once('<'))
+        .flat_map(|(_, names)| names.split(','))
+        .any(|name| name == "TXCSUM")
 }
 
 /// The `u32` following `key` on a whitespace-separated line.
@@ -910,6 +930,38 @@ impl<R: CommandRunner> Ifconfig<R> {
         Err(Self::fail(&context, argv, &output))
     }
 
+    /// Turn IPv4 TX checksum offload off on `iface` if it is on:
+    /// `ifconfig <iface>` to read the options line, then
+    /// `ifconfig <iface> -txcsum` only when it carries `TXCSUM`.
+    ///
+    /// Exists for `lo0` (api-compat #35, measured on the cluster): a
+    /// loopback-originated packet never carries a real TCP checksum — the
+    /// stack sets "already verified" mbuf flags instead — and vxlan
+    /// encapsulation to a remote node loses those flags, so a
+    /// localhost-to-published-port connection relayed over the mesh arrives
+    /// with a wrong inner checksum and is silently dropped. `-txcsum` makes
+    /// the stack compute real checksums; `TXCSUM_IPV6` is deliberately left
+    /// alone (SatL assigns no IPv6, and the measured fix did not touch it).
+    ///
+    /// Returns `Ok(true)` when the flag was cleared, `Ok(false)` when it was
+    /// already off (idempotent — the caller re-ensures it every pass).
+    pub async fn disable_txcsum_if_set(&self, iface: &str) -> Result<bool, IfconfigError> {
+        let context = format!("read TXCSUM offload on interface '{iface}'");
+        let (argv, output) = self.exec(&context, args_show(iface)).await?;
+        if !output.success() {
+            return Err(Self::fail(&context, argv, &output));
+        }
+        if !options_have_txcsum(&output.stdout) {
+            return Ok(false);
+        }
+        let context = format!("disable TXCSUM offload on interface '{iface}'");
+        let (argv, output) = self.exec(&context, args_disable_txcsum(iface)).await?;
+        if output.success() {
+            return Ok(true);
+        }
+        Err(Self::fail(&context, argv, &output))
+    }
+
     /// Bring `iface` up: `ifconfig <iface> up`.
     pub async fn up(&self, iface: &str) -> Result<(), IfconfigError> {
         let context = format!("bring interface '{iface}' up");
@@ -1059,6 +1111,8 @@ mod tests {
         include_str!("../tests/fixtures/ifconfig_jail_not_found_stderr.txt");
     const FIXTURE_ETHER_MALFORMED: &str =
         include_str!("../tests/fixtures/ifconfig_ether_malformed_stderr.txt");
+    // Captured on this host on 2026-08-25 (`ifconfig lo0`), TXCSUM set.
+    const FIXTURE_SHOW_LO0: &str = include_str!("../tests/fixtures/ifconfig_lo0.txt");
 
     // ---- argv builders ------------------------------------------------------
 
@@ -1624,5 +1678,72 @@ mod tests {
         assert!(text.contains("/nonexistent/ifconfig satl0 up"), "{text}");
         assert!(text.contains("bring interface 'satl0' up"), "{text}");
         assert!(text.contains("no such file"), "{text}");
+    }
+
+    // ---- lo0 TXCSUM offload (api-compat #35) --------------------------------
+
+    /// The fixture is a real `ifconfig lo0` from this host with
+    /// `options=680003<RXCSUM,TXCSUM,LINKSTATE,RXCSUM_IPV6,TXCSUM_IPV6>`.
+    /// The parser must match the exact `TXCSUM` token in the options line:
+    /// `TXCSUM_IPV6` — present in the fixture, and left on during the
+    /// measured fix — must not count, and neither must the `nd6 options=`
+    /// line.
+    #[test]
+    fn txcsum_is_parsed_as_an_exact_options_token() {
+        assert!(options_have_txcsum(FIXTURE_SHOW_LO0));
+        // The same output with the TXCSUM token removed: TXCSUM_IPV6 stays,
+        // and must not satisfy the parser.
+        let without = FIXTURE_SHOW_LO0.replacen("TXCSUM,", "", 1);
+        assert!(without.contains("TXCSUM_IPV6"), "{without}");
+        assert!(!options_have_txcsum(&without));
+        // No options line at all (the header alone) is "off".
+        assert!(!options_have_txcsum(
+            FIXTURE_SHOW_LO0.lines().next().unwrap()
+        ));
+        assert!(!options_have_txcsum(""));
+    }
+
+    #[tokio::test]
+    async fn txcsum_present_is_disabled_and_reported() {
+        let mock = MockRunner::new();
+        mock.push_output(0, FIXTURE_SHOW_LO0, "");
+        mock.push_ok();
+        let ifc = Ifconfig::with_runner(&mock);
+        assert!(ifc.disable_txcsum_if_set("lo0").await.unwrap());
+        assert_eq!(
+            mock.calls(),
+            ["/sbin/ifconfig lo0", "/sbin/ifconfig lo0 -txcsum"]
+        );
+    }
+
+    #[tokio::test]
+    async fn txcsum_already_off_is_a_read_only_no_op() {
+        let mock = MockRunner::new();
+        mock.push_output(0, &FIXTURE_SHOW_LO0.replacen("TXCSUM,", "", 1), "");
+        let ifc = Ifconfig::with_runner(&mock);
+        assert!(!ifc.disable_txcsum_if_set("lo0").await.unwrap());
+        // The read alone: nothing was written.
+        assert_eq!(mock.calls(), ["/sbin/ifconfig lo0"]);
+    }
+
+    #[tokio::test]
+    async fn txcsum_disable_failure_carries_argv_and_stderr() {
+        let mock = MockRunner::new();
+        mock.push_output(0, FIXTURE_SHOW_LO0, "");
+        mock.push_output(
+            1,
+            "",
+            "ifconfig: ioctl (SIOCSIFCAP): Operation not permitted\n",
+        );
+        let ifc = Ifconfig::with_runner(&mock);
+        let err = ifc.disable_txcsum_if_set("lo0").await.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("disable TXCSUM offload on interface 'lo0'"),
+            "{text}"
+        );
+        assert!(text.contains("/sbin/ifconfig lo0 -txcsum"), "{text}");
+        assert!(text.contains("exit code 1"), "{text}");
+        assert!(text.contains("Operation not permitted"), "{text}");
     }
 }

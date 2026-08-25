@@ -661,6 +661,8 @@ async fn reconcile_ports_over(
                     "no published ports on this node; the satl/rdr anchor is empty"
                 );
             }
+            ensure_loopback_snat_route(network, &report).await;
+            ensure_lo0_txcsum_off(network, &report).await;
             Some(report)
         }
         Err(error) => {
@@ -673,6 +675,87 @@ async fn reconcile_ports_over(
             None
         }
     }
+}
+
+/// Keep the loopback-publish host route in place while the `satl/rdr` anchor
+/// holds redirects: `198.18.0.1 -> 127.0.0.1`
+/// (`satl_core::defaults::LOOPBACK_PUBLISH_SNAT`), the return path of the
+/// `nat on lo0` rules that make a published port reachable from the
+/// publishing host itself (api-compat #35, measured in
+/// `hack/experiments/lo0rdr`). Re-ensured on every pass that leaves the
+/// anchor non-empty, because the route survives nothing — not a reboot, not
+/// an operator `route flush` — and the rules are dead weight without it.
+async fn ensure_loopback_snat_route(
+    network: &satl_net::NetworkManager,
+    report: &satl_net::PortReconcile,
+) {
+    // Same gating as the anchor load itself: only enforce mode touches the
+    // host — in check/disabled mode the rules the route serves are never
+    // loaded — and an empty anchor needs no return path.
+    if report.redirects == 0 || network.pf_mode() != satl_net::PfMode::Enforce {
+        return;
+    }
+    match satl_net::Route::system().ensure_loopback_snat_route().await {
+        // Info only when the route actually landed: every later pass finds it
+        // in the table and comes back false, so this logs once per boot (or
+        // once per whoever removed it).
+        Ok(true) => tracing::info!(
+            snat = %satl_core::defaults::LOOPBACK_PUBLISH_SNAT,
+            "added the loopback-publish host route to 127.0.0.1; published ports \
+             are reachable from this host via localhost"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "cannot install the loopback-publish host route; published ports answer \
+             from other hosts but not from this one via localhost"
+        ),
+    }
+    // The route is never deleted, deliberately: its destination is inside the
+    // RFC 2544 benchmark block, which is never routable, so a node with no
+    // published port carries it harmlessly — and a delete would race the
+    // edge-triggered publish path and concurrent sweeps re-adding it.
+}
+
+/// Keep lo0's IPv4 TX checksum offload off while the anchor holds redirects —
+/// the fourth part of the localhost-publish mechanism (api-compat #35),
+/// measured on the cluster: a loopback-originated packet carries no real TCP
+/// checksum (the stack sets "already verified" mbuf flags instead), and vxlan
+/// encapsulation to a remote node loses those flags, so a localhost
+/// connection relayed over the mesh arrives with a wrong inner checksum and
+/// the task's stack silently drops it. `-txcsum` makes the stack compute real
+/// checksums; the local-replica path only ever worked without it because
+/// epair propagates the mbuf flags in software.
+async fn ensure_lo0_txcsum_off(
+    network: &satl_net::NetworkManager,
+    report: &satl_net::PortReconcile,
+) {
+    // Same gating as the anchor load and the host route above.
+    if report.redirects == 0 || network.pf_mode() != satl_net::PfMode::Enforce {
+        return;
+    }
+    match satl_net::Ifconfig::system()
+        .disable_txcsum_if_set("lo0")
+        .await
+    {
+        // Info on the transition only: every later pass reads the flag as
+        // already off and comes back false.
+        Ok(true) => tracing::info!(
+            "disabled TX checksum offload on lo0; localhost connections to published \
+             ports relayed over the mesh now carry real checksums"
+        ),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "cannot disable TX checksum offload on lo0; localhost access to published \
+             ports of remote (mesh-relayed) tasks will not work"
+        ),
+    }
+    // Never re-enabled, deliberately: the packets that need real checksums are
+    // indistinguishable per-flow, the measured failure is an inner checksum
+    // that is wrong on the wire after vxlan encapsulation, and flapping an
+    // interface flag with concurrent sweeps is the same race the route
+    // comment above already refuses.
 }
 
 /// The local bridge address IPAM has on record for a task, with the one line

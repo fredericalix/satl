@@ -1,0 +1,4 @@
+== curl 127.0.0.1:8080 (v4: ip factice hors sous-reseau) ==
+http_code=200
+== curl 51.38.30.173:8080 ==
+http_code=200

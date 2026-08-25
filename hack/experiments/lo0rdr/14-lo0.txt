@@ -1,0 +1,8 @@
+tcpdump: verbose output suppressed, use -v[v]... for full protocol decode
+listening on lo0, link-type NULL (BSD loopback), snapshot length 262144 bytes
+15:53:22.590529 IP 198.18.0.1.60798 > 127.0.0.1.8080: Flags [S], seq 2864908819, win 65535, options [mss 16344,nop,wscale 8,sackOK,TS val 950384957 ecr 0], length 0
+15:53:22.590547 IP 127.0.0.1.8080 > 198.18.0.1.60798: Flags [R.], seq 0, ack 2864908820, win 0, length 0
+
+2 packets captured
+2 packets received by filter
+0 packets dropped by kernel

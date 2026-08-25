@@ -5,7 +5,7 @@
 > definition of done). Milestone definitions come from `docs/project-brief.md`; this
 > file tracks progress against them.
 
-**Last updated:** 2026-08-24
+**Last updated:** 2026-08-25
 **Current focus:** **M12, launch readiness.** Two cluster defects found during the M11
 verification runs kept `make cluster-test` red on `ca_rotate`, and both were masked by
 scenario ordering, so the previous green was partly luck. Both are now closed and the
@@ -1382,12 +1382,64 @@ consensus engine -- the reason it is not optional.
       to. Fixed on both sides, in `satl` and in `satl-website-v2`; see the
       decision log.
 
+### Phase 9: localhost access to published ports (#35)
+
+The 2026-08-25 decision-log entry measured the whole mechanism on alpha
+(`hack/experiments/lo0rdr/`): the old #35 explanation was wrong -- pf's `rdr`
+*is* consulted on lo0, what dies is forwarding a loopback-source packet -- and
+a three-part pf-only recipe fixes it (per-pool `nat on lo0` to `198.18.0.1`,
+the rdr rule duplicated `on lo0`, and a host route `198.18.0.1 -> 127.0.0.1`).
+This phase turns that measurement into code.
+
+- [x] Rule generation: `rdr_rules` emits, per pool, the table declaration, the
+      `nat on lo0` to `satl_core::defaults::LOOPBACK_PUBLISH_SNAT` (new
+      default: RFC 2544 block, never routable, outside every container
+      subnet), the redirect, and its `on lo0` duplicate -- the measured-working
+      order. All golden tests updated, and the generated ruleset passes a real
+      `pfctl -nf -` on alpha through the existing parse tests.
+- [x] The host route: `Route::ensure_loopback_snat_route` (idempotent,
+      "already in table" is success), re-ensured by the port sweep whenever
+      the anchor holds redirects in enforce mode -- never in check/disabled --
+      and never deleted (the block is never routable, so it is harmless, and a
+      delete would race concurrent sweeps re-adding it).
+- [x] Startup probe: `PfCtl::interface_is_skipped("lo0")` (`pfctl -s
+      Interfaces -v`, pure parser against a provisional fixture) warns in
+      enforce mode that localhost access cannot work under `set skip on lo0`.
+- [x] lo0 TX checksum offload off, the fourth part, from the cluster
+      measurement: on a mesh-relay node the reflected SYN was perfectly
+      translated but arrived remote with a wrong inner checksum -- a
+      loopback-originated packet carries "already verified" mbuf flags
+      instead of a real checksum, epair propagates them in software, vxlan
+      encapsulation loses them. `Ifconfig::disable_txcsum_if_set("lo0")`
+      (read the options line, `-txcsum` only when `TXCSUM` is set --
+      `TXCSUM_IPV6` untouched, per the measurement), re-ensured by the port
+      sweep next to the host route with the same gating, never re-enabled.
+- [x] Docs: api-compat #35 rewritten (remaining deviations: check/disabled
+      modes, skip-on-lo0), `networking.md`'s published-ports material and
+      tester note, architecture section 15's defaults table, `operations.md`.
+- [x] alpha end-to-end via the package: `pkg add -f` + restart, jail re-adopted
+      (same jid, uptime kept), the daemon-generated anchor carries the three
+      rules, the route and the TXCSUM clear land from the sweep, and
+      `curl 127.0.0.1:8080` answers 200 alongside the host's own address.
+      `sudo make integration` green (46 tests).
+- [x] cluster suite green: 25/25 on fbsd{1,2,3} with the upgraded package,
+      including the extended `publish_port` (every node answers its own
+      localhost, the relay node included, and service removal retracts the
+      lo0 rules). One pre-existing harness assertion updated on the way:
+      "two tasks pool into one rdr rule" became "one rdr pool" -- the pool's
+      constant text is now two rdr rules (the interface-less one and its lo0
+      twin) plus the lo0 nat, membership still lives in the table. External
+      publishing verified unregressed from the dev host on all three public
+      addresses before the suite ran.
+
 ---
 
 ## Decision log
 
 | Date | Decision |
 |---|---|
+| 2026-08-25 | **The localhost publish relay dies on a mesh node with a checksum nobody computed, and the fix is one interface flag.** Found by deploying the lo0 recipe (entry below, now implemented) to the 3-VM cluster and testing what the alpha experiment could not: a mesh-relay node with no local replica. External relay: no regression (200 from the dev host on all three public addresses). Local replica on the node: 200 on its own localhost. Relay node: timeout -- with every rule present and the whole translation chain verified correct in states and on the wire (lo0 nat -> 198.18.0.1, rdr -> overlay task IP, mesh SNAT -> the node's ingress gateway, the SYN leaving `satl-br4096` well-formed). The receiving node told the rest: `cksum 0xbc65 (incorrect)`, constant across retransmits, and the container's stack drops such a segment silently. A packet born on loopback never carries a real TCP checksum: with TXCSUM on lo0 the stack stamps "already verified" mbuf flags instead of computing one, epair *propagates* those flags in software (which is why the single-node path worked and why alpha could never have caught this), and vxlan encapsulation to a remote node strips them, so the wire carries the unfinished pseudo-header value. Fix measured before it was code: `ifconfig lo0 -txcsum` on the relay node -> 3/3 HTTP 200, immediately; IPv4 TXCSUM alone (TXCSUM_IPV6 stayed on during the passing test). satld's port sweep now owns that flag next to the loopback-publish route, same gating (enforce, redirects present), disabled once and never re-enabled -- per-flow discrimination is impossible (checksums are per-packet mbuf state) and flapping an interface flag would race concurrent sweeps exactly like deleting the route would. The cost is software checksums for all loopback TCP on a publishing node, accepted knowingly: the alternative was documenting that `curl localhost:port` works or not depending on where the scheduler put the replica, which is the kind of coin-flip behavior #35 existed to avoid |
+| 2026-08-25 | **A published port can be reached from the publishing host through localhost -- measured on alpha, three pf-only additions, no userland proxy** (`hack/experiments/lo0rdr/`, not yet code). The #35 explanation was wrong about the mechanism: the generated interface-less `rdr pass` rule *is* consulted on lo0 (locally generated traffic to a local address re-enters there, and the state table showed the translation), what dies is the next step -- the kernel refuses to forward a packet whose *source* is 127.0.0.1 (`packets not forwardable` incremented per SYN). Every two-state repair fails structurally: with source-NAT and rdr in separate states, the SYN-ACK arriving on satl0 is delivered to a local address after at most one un-translation, so the second is never undone and the host RSTs -- captured on the epair as SYN / SYN-ACK / RST. (FreeBSD 15.1 pfctl parses OpenBSD's `rdr-to X nat-to Y` on one rule but applies them on different hooks as two states, so the single-state semantics that would fix this is not actually available.) The working recipe makes the reply non-local so it re-traverses lo0 and both states get their reverse pass in order: `nat on lo0 ... port 8080 -> 198.18.0.1` (a dummy from the RFC 2544 benchmark block; it must be **outside the container subnet**, or the container ARPs for it on its own link and the reply never leaves -- measured with 10.88.0.254), a host route `198.18.0.1 -> 127.0.0.1`, and the existing generated rdr rule duplicated with `on lo0`, same table, same `round-robin`. The duplicate is not decorative: the interface-less rule does not match the NATed packet re-entering lo0 even though it matched the un-NATed one, pinned by A/B both ways (alone it fails with an instant RST; added second in first-match order it wins). Result: HTTP 200 on `127.0.0.1:8080` **and** on the host's own public address, five for five, while internet scanners kept completing sessions against the externally published port mid-experiment, so the external path is untouched. Alpha restored to generated rules afterwards and the baseline failure re-verified. Before this becomes code: UDP untested, the dummy address needs one owner (satld must reconcile the route; it survives nothing), `set skip on lo0` deserves the same startup warning as the forwarding sysctl, and the ingress/mesh case (table entries on overlay IPs, reply over vxlan at MTU 1450) is unmeasured |
 | 2026-08-25 | **A retry loop that could not make progress, and reported a cause it had ruled out by construction.** Found while answering "so no more bugs?", by reading `propose_from_view` rather than trusting yesterday's conclusion -- which was wrong, or rather half right. The `worker_join` failure *was* a weak precondition in the scenario **and** a real defect in the daemon, and I had recorded only the first. `Backend::propose_from_view` retries a sequence conflict five times, rebuilding each attempt from `self.store()`, which is **this node's** applied store, and with no pause between attempts. So for the one case where a retry could ever help -- this node being a few raft entries behind -- all five attempts read the identical stale version in microseconds and the handler gives up with *"the object kept changing underneath (5 attempts)"*. Nothing was changing; the caller was behind. That sends an operator hunting a concurrent writer that does not exist, which is the same defect shape as the quorum guard's refusal (2026-08-24) and the platform error (#183): **a message naming a cause it cannot distinguish**. Two changes. A linear pause between attempts (50 ms x attempt, ~500 ms worst case) so a store that is merely behind can advance and the retry becomes worth making, bounded because this is a REST handler and waiting out a badly lagging node is not on offer. And the exhaustion error now tells the two cases apart from evidence it already had: the version *this node* read on each attempt. If it never moved, the message says the node's copy is stale, names both versions, says why (reads are answered from each node's own store) and what to do (retry, or run it against the leader). If it moved, the object really is contended and the original wording stands. The decision is a pure function, `exhausted_conflict_error`, so all three arms are unit-tested without a cluster. `make check` and `sudo make integration` green |
 | 2026-08-25 | **Two smaller things closed in the same pass.** **(1)** `--format` exists on `satl events` and on nothing else -- not on `ps`, `images`, `service ls`/`ps`, `stack ps`, `node ls`, nor any of the seven `inspect` verbs, where docker carries it everywhere. That is deliberate for the reason #162 already gives (no template engine, and half of one is worse than none) and it had **no api-compat entry**, which is an invariant #8 gap rather than a design question. Recorded as #184, with what replaces it: `inspect` already prints the API's JSON verbatim so `jq` needs nothing from the CLI, and the listing verbs carry `-q`. Both checked against the running daemon before the entry was written. **(2)** The `health_pool` timeout that did not reproduce is still unexplained, and the reason it stayed unexplained is now fixed: its failure dump grepped `/var/log/messages` for the *node name*, which appears only in the startup banner and the cluster-init line, so the one chance at diagnosing a non-reproducing failure printed two irrelevant lines. It now greps `satld[<pid>]`, the tag syslog stamps on every line of that daemon, plus everything logged about the task by id, and `log_lines` uses `grep -aF` because `satld[1234]` as a basic regex is a character class matching three digits anywhere. The suite passed on the next full run, so the improved dump is unexercised by design |
 | 2026-08-25 | **`make cluster-test` 25/25 on the fixed build, after the run found two defects in the harness and none in the product.** First full run on the reinstalled fleet, carrying the layer-reclaim fix. It stopped twice before going green, both times on `tests/cluster/`. **(1) The readiness gate told three healthy nodes they were NOT READY**, counting `pf satl anchors 2 (expected 3)`. Its regex demanded exactly one space between the keyword and the quoted anchor, and the `pf.conf` that the *published* `install-satl.sh` writes -- the file the website tells an operator to create -- aligns the third anchor for readability (`anchor     "satl/*"`). pf(5) does not care, and the install script's own counter, which uses `[[:space:]]+`, had reported 3/3 on the same file. Two counters over one file disagreeing is the shape of thing that costs an afternoon; the gate now uses the same expression. **(2) `worker_join` failed on `scaling web back through node3`**, with `sequence conflict on service ...: store has version 65, caller wrote from version 14` in every node's log. Not a product defect: `satl service scale` is a read-modify-write and reads are answered from the node's **own** applied store (§7), while the scenario waited only for the *leader* to show the previous scale committed before writing through the freshly promoted node again. The node had not applied it yet, so the second scale submitted a stale version and the leader correctly refused. Confirmed by re-running the scenario alone, where it passed in 88 s -- the signature of a precondition weaker than what it guards, which is exactly the mistake already removed from `node_kill`, `leader_kill` and `demote_leader`. It now waits for the writer's own reading, and the failing branch shows the CLI output instead of discarding it, which is why the first diagnosis had to be made from the daemon log. Green run: 25/25, `rolling_update` 101 s and `hot_resize` 24 s among them, so the path the reclaim fix touches is exercised end to end |

@@ -1,0 +1,6 @@
+== curl 127.0.0.1:8080 (v3: nat vers ip factice routee lo0) ==
+curl: (28) Connection timed out after 4003 milliseconds
+http_code=000
+== curl 51.38.30.173:8080 ==
+curl: (28) Connection timed out after 4003 milliseconds
+http_code=000

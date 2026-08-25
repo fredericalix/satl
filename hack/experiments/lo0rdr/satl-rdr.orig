@@ -1,0 +1,1 @@
+rdr pass inet proto tcp from any to any port = http-alt -> <satl_p8080_tcp_80> port 80 round-robin

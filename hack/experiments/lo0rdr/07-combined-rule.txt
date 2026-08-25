@@ -1,0 +1,6 @@
+== curl 127.0.0.1:8080 (regle combinee rdr-to+nat-to) ==
+curl: (7) Failed to connect to 127.0.0.1:8080 after 0 ms: Could not connect to server
+http_code=000
+== curl 51.38.30.173:8080 ==
+curl: (7) Failed to connect to 51.38.30.173:8080 after 0 ms: Could not connect to server
+http_code=000

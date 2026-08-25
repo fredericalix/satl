@@ -200,6 +200,33 @@ async fn probe_ip_forwarding(sysctl: &crate::sysctl::Sysctl) {
     }
 }
 
+/// Probe pf's interface skip list and warn when `lo0` is skipped.
+///
+/// The lo0 half of published-port access (api-compat #35, measured in
+/// `hack/experiments/lo0rdr`) is a `nat on lo0` plus an `rdr ... on lo0` per
+/// pool: with `set skip on lo0` in `/etc/pf.conf` pf never consults either,
+/// so localhost access to published ports cannot work while external access
+/// still does — the same shape of easy misdiagnosis as the forwarding
+/// sysctl above. Like the other probes this only warns; and when pf is
+/// unavailable it stays quiet (the caller only runs it in enforce mode,
+/// where an unusable pf already fails the anchor loads loudly).
+async fn probe_lo0_skip() {
+    match satl_net::PfCtl::system().interface_is_skipped("lo0").await {
+        Ok(true) => tracing::warn!(
+            "pf is set to 'skip on lo0': localhost access to published ports CANNOT \
+             work (the lo0 nat and rdr rules are never consulted). Remove lo0 from \
+             the 'set skip' line in /etc/pf.conf and reload the ruleset."
+        ),
+        Ok(false) => {
+            tracing::debug!("pf does not skip lo0; published ports are reachable via localhost");
+        }
+        Err(error) => tracing::debug!(
+            %error,
+            "cannot read pf's interface skip list; skipping the lo0 probe"
+        ),
+    }
+}
+
 /// Probe `kern.racct.enable` and warn loudly when limits cannot be enforced
 /// (architecture §8.3: degrade with an explicit log, never crash).
 async fn probe_racct() -> bool {
@@ -268,6 +295,12 @@ pub async fn build(
 
     install_devfs_ruleset().await;
     probe_ip_forwarding(sysctl).await;
+    // Only where the anchors are actually loaded: in check/disabled mode no
+    // published port redirects at all, so a warning about its lo0 half would
+    // point at the wrong knob.
+    if cfg.pf_mode.as_pf_mode() == satl_net::PfMode::Enforce {
+        probe_lo0_skip().await;
+    }
     // Startup probe, logged once here; the periodic re-probe
     // (`crate::reconcile::spawn_linux_probe`) then logs transitions only.
     let linux = LinuxEmulation::new(match linux_osrelease(sysctl).await {

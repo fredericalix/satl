@@ -147,10 +147,11 @@ SVC_Y=${SATL_TEST_SVC_Y:-mn-y}
 SVC_BOTH=${SATL_TEST_SVC_BOTH:-mn-both}
 
 # publish_port (api-compat 75) runs its own service with an ingress-published
-# port, asserted from *outside* the cluster: this dev host reaches the VMs on
-# their public addresses and on nothing else, which is exactly the vantage point
-# a published port exists for (and the only one that works — api-compat 35: pf
-# does not redirect a host's own localhost traffic).
+# port, asserted from *outside* the cluster (this dev host reaches the VMs on
+# their public addresses, which is exactly the vantage point a published port
+# exists for) and from each node's own loopback: api-compat 35 now records that
+# a node reaches its own published ports through 127.0.0.1, via the lo0
+# NAT-plus-route relay measured in hack/experiments/lo0rdr/.
 #
 # Two replicas over three nodes, deliberately: with fewer replicas than nodes at
 # least one node runs no task, whatever the scheduler decides, and that node is
@@ -2123,13 +2124,16 @@ attached to both overlay networks, so nothing below tests two-network scoping"
 # ===========================================================================
 # Scenario 8 — publish_port
 #
-# `satl service create --publish <port>:80` and what it is worth from outside the
-# cluster. Everything here is asserted from the dev host against the VMs' public
-# addresses, because that is the only vantage point where a published port means
-# anything: api-compat 35 (pf redirects packets *entering* an interface, so the
-# publishing host's own localhost is not redirected) rules out asserting it from
-# the node itself, and the routing-mesh question is by definition about which
-# node answers.
+# `satl service create --publish <port>:80` and what it is worth from outside
+# the cluster and from the nodes themselves. The external assertions run from
+# the dev host against the VMs' public addresses, because the routing-mesh
+# question is by definition about which node answers. The host-local ones run
+# over ssh on each node's own 127.0.0.1: api-compat 35 used to record that pf
+# never redirects a host's own loopback traffic, but the mechanism was
+# remeasured in hack/experiments/lo0rdr/ and satld now publishes to the host
+# too, with a `nat on lo0` source rewrite to a routed dummy address so the
+# reply traverses both pf states. #35 records the new behaviour; this scenario
+# pins it.
 #
 # Until M3 this was accepted, allocated, documented — and published nowhere:
 # ingress is the default publish mode and the node-side filter only ever looked
@@ -2140,11 +2144,14 @@ attached to both overlay networks, so nothing below tests two-network scoping"
 # meaningful:
 #
 #   1. every node running a task of the service answers on the published port,
-#      with the body the image bakes in — DNS-free, straight at the port;
-#   2. a node running *no* task does **not** answer, and holds no rule in its
-#      `satl/rdr` anchor. This is the routing-mesh gap pinned as behaviour
-#      rather than as a sentence in a document: implementing the mesh later must
-#      start by deleting a failing assertion, deliberately;
+#      with the body the image bakes in (DNS-free, straight at the port), from
+#      outside the cluster and from its own 127.0.0.1, and its `satl/rdr`
+#      anchor holds both the redirect and the `nat on lo0` marker of the
+#      host-local relay;
+#   2. a node running *no* task answers too, from outside and from its own
+#      loopback: the M6d routing mesh, whose return-path SNAT the host-local
+#      relay chains with. Both markers (the mesh SNAT and the lo0 NAT) are
+#      asserted alongside the answer;
 #   3. the redirect survives its anchor being destroyed behind the daemon's
 #      back — first with satld running (the periodic level pass repairs it with
 #      no event and no restart), then across a `satld` restart (the startup pass
@@ -2170,6 +2177,20 @@ pub_answers() {
 	printf %s "$(pub_get "$1")" | grep -q "$OVL_BODY"
 }
 
+# pub_get_local <node> — fetch the published port from the node itself, over
+# its own loopback (the lo0 relay of api-compat 35, hack/experiments/lo0rdr).
+# Same contract as pub_get: an unreachable port is data here, not an error.
+pub_get_local() {
+	node_ssh "$1" "curl -s --max-time 5 http://127.0.0.1:$PUB_PORT/ 2>/dev/null" \
+	    2>/dev/null || true
+}
+
+# pub_answers_local <node> — whether the node serves the service to itself on
+# 127.0.0.1. The body is checked, exactly as in pub_answers.
+pub_answers_local() {
+	printf %s "$(pub_get_local "$1")" | grep -q "$OVL_BODY"
+}
+
 # pub_rdr <node> — the node's live satl/rdr rules, one per line. An anchor that
 # was never loaded prints "pfctl: DIOCGETRULES: Invalid argument" on stderr and
 # exits 0, so stderr is dropped and only `rdr` lines are kept: "no anchor" and
@@ -2183,6 +2204,21 @@ REMOTE
 # pub_rdr_count <node> — how many of those rules mention the published port.
 pub_rdr_count() {
 	pub_rdr "$1" | awk -v p="port = $PUB_PORT " '$0 ~ p { n++ } END { print n + 0 }'
+}
+
+# pub_lo0_nat <node> — the node's live `nat on lo0` rules in satl/rdr, one per
+# line: the marker of the host-local relay (hack/experiments/lo0rdr), the way
+# `nat pass` is the marker of the mesh SNAT. Same "no anchor and empty anchor
+# are the same observation" contract as pub_rdr.
+pub_lo0_nat() {
+	node_root_sh "$1" <<'REMOTE' 2>/dev/null
+pfctl -a satl/rdr -s nat 2>/dev/null | grep '^nat on lo0' || true
+REMOTE
+}
+
+# pub_lo0_nat_count <node> — how many of those rules mention the published port.
+pub_lo0_nat_count() {
+	pub_lo0_nat "$1" | awk -v p="port = $PUB_PORT " '$0 ~ p { n++ } END { print n + 0 }'
 }
 
 # pub_hosts — hostnames running a live task of $PUB, one per line, read from
@@ -2260,7 +2296,7 @@ scenario_publish_port() {
 (SATL_TEST_PUB replicas must stay below the node count)"
 	info "tasks on: $PUB_WITH — no task on: $PUB_WITHOUT"
 
-	# --- 1. every node with a task answers, from outside the cluster --------
+	# --- 1. every node with a task answers, from outside and from itself ----
 	for _n in $PUB_WITH; do
 		PUB_NODE=$_n
 		wait_until "$T_QUICK" \
@@ -2269,8 +2305,16 @@ scenario_publish_port() {
 		_rules=$(pub_rdr_count "$_n")
 		[ "$_rules" -ge 1 ] ||
 		    fail "$_n answers on $PUB_PORT but its satl/rdr anchor has no rule for it"
+		# The host-local relay (api-compat 35, hack/experiments/lo0rdr): the
+		# node reaches its own published port over loopback, and carries the
+		# `nat on lo0` rule that makes the reply traversable.
+		wait_until "$T_QUICK" \
+		    "$_n answers http://127.0.0.1:$PUB_PORT/ from itself" \
+		    'pub_answers_local "$PUB_NODE"'
+		[ "$(pub_lo0_nat_count "$_n")" -ge 1 ] ||
+		    fail "$_n answers itself on $PUB_PORT without the lo0 NAT rule in satl/rdr"
 	done
-	info "every node running a task publishes the port, and holds the rule for it"
+	info "every node running a task publishes the port, to the outside and to itself"
 
 	# --- 2. and a node without a task answers too — the M6d mesh -----------
 	# Only meaningful now that the nodes that *should* answer do: before
@@ -2294,8 +2338,16 @@ REMOTE
 )
 		[ -n "$_nat" ] ||
 		    fail "$_n relays on $PUB_PORT without the mesh SNAT rule in satl/rdr"
+		# And the relay works from the node itself too: the lo0 redirect
+		# chains with the mesh SNAT above (hack/experiments/lo0rdr), so even
+		# a node running no task serves its own 127.0.0.1.
+		wait_until "$T_QUICK" \
+		    "$_n relays http://127.0.0.1:$PUB_PORT/ from itself" \
+		    'pub_answers_local "$PUB_NODE"'
+		[ "$(pub_lo0_nat_count "$_n")" -ge 1 ] ||
+		    fail "$_n relays its own loopback on $PUB_PORT without the lo0 NAT rule in satl/rdr"
 	done
-	info "a node with no task of $PUB answers by relaying (the M6d mesh)"
+	info "a node with no task of $PUB answers by relaying (the M6d mesh), even to itself"
 
 	# --- 3a. the anchor is a level: destroy it and it comes back ------------
 	PUB_NODE=$(echo "$PUB_WITH" | awk '{ print $1 }')
@@ -2339,8 +2391,13 @@ the level was faster than the check"
 	[ -n "$PUB_CROWDED_NODE" ] ||
 	    fail "$PUB_CROWDED replicas over $(cluster_nodes | countl) nodes and no node \
 has two: nothing here can test the round-robin pool"
-	wait_until "$T_QUICK" "$PUB_CROWDED_NODE pools its two tasks into one rdr rule" '
-		[ "$(pub_rdr_count "$PUB_CROWDED_NODE")" = 1 ] &&
+	# One pool per published triple, whatever the member count: the two rdr
+	# rules (the interface-less one and its lo0 twin, api-compat 35) are the
+	# pool's constant text, membership lives in the table. Two tasks must not
+	# grow the ruleset.
+	wait_until "$T_QUICK" "$PUB_CROWDED_NODE pools its two tasks into one rdr pool" '
+		[ "$(pub_rdr_count "$PUB_CROWDED_NODE")" = 2 ] &&
+		[ "$(pub_rdr "$PUB_CROWDED_NODE" | grep -c "on lo0")" = 1 ] &&
 		pub_rdr "$PUB_CROWDED_NODE" | grep -q "round-robin"'
 	pub_rdr "$PUB_CROWDED_NODE" | sed 's/^/    /'
 	wait_until "$T_QUICK" "and still answers" 'pub_answers "$PUB_CROWDED_NODE"'
@@ -2351,7 +2408,9 @@ has two: nothing here can test the round-robin pool"
 		_left=""
 		for _n in $(cluster_nodes); do
 			[ "$(pub_rdr_count "$_n")" = 0 ] || _left="$_left $_n"
+			[ "$(pub_lo0_nat_count "$_n")" = 0 ] || _left="$_left $_n"
 			! pub_answers "$_n" || _left="$_left $_n"
+			! pub_answers_local "$_n" || _left="$_left $_n"
 		done
 		[ -z "$_left" ]'
 	info "the satl/rdr anchor is empty on every node and the port answers nowhere"

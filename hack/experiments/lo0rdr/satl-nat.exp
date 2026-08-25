@@ -1,0 +1,2 @@
+nat on ice0 inet from 10.88.0.0/24 to any -> (ice0) round-robin
+nat on satl0 inet from { 127.0.0.0/8, 51.38.30.173 } to 10.88.0.0/24 -> (satl0)

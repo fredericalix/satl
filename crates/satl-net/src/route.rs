@@ -83,6 +83,19 @@ fn args_get_default() -> Vec<String> {
         .collect()
 }
 
+fn args_add_host(destination: Ipv4Addr, gateway: Ipv4Addr) -> Vec<String> {
+    [
+        "-n",
+        "add",
+        "-host",
+        &destination.to_string(),
+        &gateway.to_string(),
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 /// Whether a failed `route add` means the route was already present.
 /// Real capture: stdout `add net default: gateway 10.77.77.1 fib 0: route
 /// already in table`, stderr `route: message indicates error: File exists`.
@@ -189,6 +202,44 @@ impl<R: CommandRunner> Route<R> {
         }
         if output_says_route_exists(&output) {
             tracing::debug!(jail = %jail, gateway = %gateway, "default route already in table");
+            return Ok(false);
+        }
+        Err(RouteError::Failed {
+            context,
+            failure: Failure::new(argv, &output),
+        })
+    }
+
+    /// Install the host route that closes the loopback-publish loop
+    /// (`docs/api-compat.md` #35, measured in `hack/experiments/lo0rdr`):
+    /// `route -n add -host 198.18.0.1 127.0.0.1`, the destination being
+    /// [`satl_core::defaults::LOOPBACK_PUBLISH_SNAT`].
+    ///
+    /// The `nat on lo0` rule in `satl/rdr` rewrites a host-local client's
+    /// source to that dummy; this route makes the task's reply to it
+    /// non-local, so the reply is forwarded back out `lo0`, re-enters it, and
+    /// both pf states get their reverse traversal in order (un-rdr, then
+    /// un-nat). Without the route the reply is unroutable and the connection
+    /// hangs.
+    ///
+    /// Returns `Ok(true)` when the route was added, `Ok(false)` when it was
+    /// already in the table (idempotent — the caller re-ensures it every
+    /// pass, because the route survives nothing).
+    pub async fn ensure_loopback_snat_route(&self) -> Result<bool, RouteError> {
+        let destination = satl_core::defaults::LOOPBACK_PUBLISH_SNAT;
+        let gateway = Ipv4Addr::LOCALHOST;
+        let context = format!("add the loopback-publish host route {destination} -> {gateway}");
+        let (argv, output) = self
+            .exec(&context, args_add_host(destination, gateway))
+            .await?;
+        if output.success() {
+            return Ok(true);
+        }
+        if output_says_route_exists(&output) {
+            tracing::debug!(
+                destination = %destination,
+                "loopback-publish host route already in table"
+            );
             return Ok(false);
         }
         Err(RouteError::Failed {
@@ -345,6 +396,53 @@ mod tests {
         let route = Route::with_runner(&mock);
         route.delete_default_in_jail("42").await.unwrap();
         assert_eq!(mock.calls(), ["/sbin/route -j 42 delete default"]);
+    }
+
+    // ---- the loopback-publish host route -------------------------------------
+
+    #[tokio::test]
+    async fn loopback_snat_route_builds_expected_argv_on_fresh_add() {
+        let mock = MockRunner::new();
+        mock.push_output(0, "add host 198.18.0.1: gateway 127.0.0.1\n", "");
+        let route = Route::with_runner(&mock);
+        assert!(route.ensure_loopback_snat_route().await.unwrap());
+        assert_eq!(
+            mock.calls(),
+            ["/sbin/route -n add -host 198.18.0.1 127.0.0.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_snat_route_is_idempotent_when_already_in_table() {
+        let mock = MockRunner::new();
+        // Same failure shape as the default-route re-add: exit 1, the
+        // "already in table" note on stdout, "File exists" on stderr.
+        mock.push_output(
+            1,
+            "add host 198.18.0.1: gateway 127.0.0.1 fib 0: route already in table\n",
+            "route: message indicates error: File exists\n",
+        );
+        let route = Route::with_runner(&mock);
+        assert!(!route.ensure_loopback_snat_route().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn loopback_snat_route_failure_carries_argv_and_stderr() {
+        let mock = MockRunner::new();
+        mock.push_output(
+            1,
+            "",
+            "route: writing to routing socket: Operation not permitted\n",
+        );
+        let route = Route::with_runner(&mock);
+        let err = route.ensure_loopback_snat_route().await.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("/sbin/route -n add -host 198.18.0.1 127.0.0.1"),
+            "{text}"
+        );
+        assert!(text.contains("exit code 1"), "{text}");
+        assert!(text.contains("Operation not permitted"), "{text}");
     }
 
     /// Real `route -n get default` output captured on the dev host.

@@ -1,0 +1,2 @@
+== v7: regle 'on lo0' SEULE (test de l'ingredient actif) ==
+200 200 200 

@@ -1,0 +1,15 @@
+tcpdump: verbose output suppressed, use -v[v]... for full protocol decode
+listening on epair3a, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+15:43:52.753318 IP 10.88.0.1.51596 > 10.88.0.5.80: Flags [S], seq 3485241622, win 65535, options [mss 16344,nop,wscale 8,sackOK,TS val 2579508240 ecr 0], length 0
+15:43:52.753340 IP 10.88.0.5.80 > 10.88.0.1.51596: Flags [S.], seq 261556209, ack 3485241623, win 65535, options [mss 1460,nop,wscale 8,sackOK,TS val 2498900289 ecr 2579508240], length 0
+15:43:52.753353 IP 10.88.0.1.51596 > 10.88.0.5.80: Flags [R], seq 3485241623, win 0, length 0
+15:43:53.755081 IP 10.88.0.1.51596 > 10.88.0.5.80: Flags [S], seq 3485241622, win 65535, options [mss 16344,nop,wscale 8,sackOK,TS val 2579509243 ecr 0], length 0
+15:43:53.755096 IP 10.88.0.5.80 > 10.88.0.1.51596: Flags [S.], seq 261556209, ack 3485241623, win 65535, options [mss 1460,nop,wscale 8,sackOK,TS val 2498901292 ecr 2579509243], length 0
+15:43:53.755107 IP 10.88.0.1.51596 > 10.88.0.5.80: Flags [R], seq 3485241623, win 0, length 0
+15:43:55.954402 IP 10.88.0.1.51596 > 10.88.0.5.80: Flags [S], seq 3485241622, win 65535, options [mss 16344,nop,wscale 8,sackOK,TS val 2579511442 ecr 0], length 0
+15:43:55.954423 IP 10.88.0.5.80 > 10.88.0.1.51596: Flags [S.], seq 261556209, ack 3485241623, win 65535, options [mss 1460,nop,wscale 8,sackOK,TS val 2498903491 ecr 2579511442], length 0
+15:43:55.954438 IP 10.88.0.1.51596 > 10.88.0.5.80: Flags [R], seq 3485241623, win 0, length 0
+
+9 packets captured
+9 packets received by filter
+0 packets dropped by kernel

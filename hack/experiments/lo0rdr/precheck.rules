@@ -1,0 +1,4 @@
+table <satl_p8080_tcp_80> persist { 10.88.0.5 }
+nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1
+rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin
+rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin

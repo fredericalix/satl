@@ -222,6 +222,12 @@ FreeBSD behaviors that have each cost a debugging session:
   `/var/log/messages`.
 - `route -j` installs routes only, it can never install an ARP entry (it never sets
   `RTF_LLDATA`), on any stack.
+- **A packet born on loopback carries no real TCP checksum** (lo0's TXCSUM stamps
+  "already verified" mbuf flags instead). epair propagates the flags in software, so
+  reflecting lo0 traffic into a local jail works; vxlan encapsulation strips them, so the
+  same flow to a remote node arrives `cksum incorrect` and is dropped *silently* by the
+  receiver. The signature is a one-sided tcpdump: perfect SYNs out, nothing back. satld
+  disables lo0 TXCSUM on publishing nodes for exactly this (api-compat #35).
 - `ocijail list -f json` prints `null`, not `[]`, for an empty state db.
 - `rctl -r` returning ESRCH means "the filter matched no rule", not "the jail is gone".
 - `rctl` enforcement needs `kern.racct.enable=1`; without it `satld` degrades gracefully and

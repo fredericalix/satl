@@ -1061,6 +1061,17 @@ impl<R: CommandRunner> NetworkManager<R> {
         }
     }
 
+    /// How this manager applies pf rules (`pf_mode` in `satld.toml`).
+    ///
+    /// Exposed for the callers that must gate *their own* pf-adjacent side
+    /// effects the way `apply_pf` gates the anchor loads — the port sweep's
+    /// loopback-publish host route in particular, which only makes sense
+    /// where the anchor is actually loaded ([`PfMode::Enforce`]).
+    #[must_use]
+    pub fn pf_mode(&self) -> PfMode {
+        self.config.pf_mode
+    }
+
     /// The node-local bridge network this manager programs.
     ///
     /// There is exactly one (`network_name` in `satld.toml`): every bridge
@@ -1554,15 +1565,21 @@ mod tests {
         assert_eq!(
             mgr.rdr_ruleset(),
             "table <satl_p8053_udp_53> persist\n\
+             nat on lo0 inet proto udp from any to any port 8053 -> 198.18.0.1\n\
              rdr pass inet proto udp from any to any port 8053 -> <satl_p8053_udp_53> port 53 round-robin\n\
+             rdr pass on lo0 inet proto udp from any to any port 8053 -> <satl_p8053_udp_53> port 53 round-robin\n\
              table <satl_p8080_tcp_80> persist\n\
-             rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n"
+             nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1\n\
+             rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n\
+             rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n"
         );
         mgr.unpublish_ports("task1").await.unwrap();
         assert_eq!(
             mgr.rdr_ruleset(),
             "table <satl_p8053_udp_53> persist\n\
-             rdr pass inet proto udp from any to any port 8053 -> <satl_p8053_udp_53> port 53 round-robin\n"
+             nat on lo0 inet proto udp from any to any port 8053 -> 198.18.0.1\n\
+             rdr pass inet proto udp from any to any port 8053 -> <satl_p8053_udp_53> port 53 round-robin\n\
+             rdr pass on lo0 inet proto udp from any to any port 8053 -> <satl_p8053_udp_53> port 53 round-robin\n"
         );
         // Unknown task: no pfctl call.
         mgr.unpublish_ports("never-published").await.unwrap();
@@ -1628,9 +1645,13 @@ mod tests {
         assert_eq!(
             mgr.rdr_ruleset(),
             "table <satl_p8080_tcp_80> persist\n\
+             nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1\n\
              rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n\
+             rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n\
              table <satl_p9090_tcp_80> persist\n\
-             rdr pass inet proto tcp from any to any port 9090 -> <satl_p9090_tcp_80> port 80 round-robin\n"
+             nat on lo0 inet proto tcp from any to any port 9090 -> 198.18.0.1\n\
+             rdr pass inet proto tcp from any to any port 9090 -> <satl_p9090_tcp_80> port 80 round-robin\n\
+             rdr pass on lo0 inet proto tcp from any to any port 9090 -> <satl_p9090_tcp_80> port 80 round-robin\n"
         );
 
         // task2 is gone from the store and nothing on the node claims it.
@@ -1647,7 +1668,9 @@ mod tests {
         assert_eq!(
             mgr.rdr_ruleset(),
             "table <satl_p8080_tcp_80> persist\n\
-             rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n"
+             nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1\n\
+             rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n\
+             rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n"
         );
 
         // Nothing left at all: the anchor is emptied.
@@ -1682,7 +1705,9 @@ mod tests {
         assert_eq!(
             mgr.rdr_ruleset(),
             "table <satl_p8080_tcp_80> persist\n\
-             rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n"
+             nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1\n\
+             rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n\
+             rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n"
         );
 
         // Once the node stops claiming it, the same pass removes it.
@@ -1729,9 +1754,13 @@ mod tests {
             assert_eq!(
                 mgr.rdr_ruleset(),
                 "table <satl_p7070_tcp_70> persist\n\
+                 nat on lo0 inet proto tcp from any to any port 7070 -> 198.18.0.1\n\
                  rdr pass inet proto tcp from any to any port 7070 -> <satl_p7070_tcp_70> port 70 round-robin\n\
+                 rdr pass on lo0 inet proto tcp from any to any port 7070 -> <satl_p7070_tcp_70> port 70 round-robin\n\
                  table <satl_p8080_tcp_80> persist\n\
-                 rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n",
+                 nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1\n\
+                 rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n\
+                 rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n",
                 "controller_last = {controller_last}"
             );
         }

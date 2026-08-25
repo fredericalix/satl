@@ -1389,6 +1389,7 @@ Adopted from SwarmKit (SWK §22) unless stated; single source of truth will be
 | Secret / config max size | 500 KiB / 1000 KiB |
 | ID format | 25 chars base36 |
 | Default local bridge pool | `10.88.0.0/16` |
+| Loopback-publish SNAT source (host-local access to published ports, api-compat #35) | `198.18.0.1` (`satl_core::defaults::LOOPBACK_PUBLISH_SNAT`; RFC 2544 benchmark block, never routable, must stay outside every container subnet) |
 | Default overlay address pool / subnet size | `10.100.0.0/14` / 24 |
 | VXLAN UDP port | 4789 |
 | Encrypted-overlay VTEP UDP port range (per network, allocator-assigned) | 4790–4999 (`satl_core::defaults::OVERLAY_VXLAN_PORT_RANGE`) |

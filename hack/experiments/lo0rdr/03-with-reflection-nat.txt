@@ -1,0 +1,6 @@
+== curl 127.0.0.1:8080 avec nat de reflexion ==
+curl: (28) Connection timed out after 4002 milliseconds
+http_code=000
+== curl 51.38.30.173:8080 avec nat de reflexion ==
+curl: (28) Connection timed out after 4002 milliseconds
+http_code=000

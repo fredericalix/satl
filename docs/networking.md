@@ -135,15 +135,48 @@ Rules generated per network/task:
 - `satl/nat`, `nat on <egress> inet from <subnet> to any -> (<egress>)` so containers
   reach the outside world. The parenthesised form makes pf re-evaluate the interface's
   address, so the rule survives a DHCP renewal or an interface that comes up later.
-- `satl/rdr`, one **table declaration plus one static rule** per
-  `(published port, protocol, container port)` triple: `table
-  <satl_p8080_tcp_80> persist` and `rdr pass inet proto {tcp|udp} from any to
-  any port <host> -> <satl_p8080_tcp_80> port <container> round-robin`. The
-  task addresses live in the table, not in the rule, so a membership change
-  (task started, dead, rescheduled) goes through `pfctl -T replace` and the
-  ruleset is **not** reloaded (M6). In M1 that was host-mode publishing only;
-  M3 adds ingress publishing to the same anchor (see "Published ports"
+- `satl/rdr`, one **table declaration plus three static rules** per
+  `(published port, protocol, container port)` triple:
+
+  ```
+  table <satl_p8080_tcp_80> persist
+  nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1
+  rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin
+  rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin
+  ```
+
+  The task addresses live in the table, not in the rules, so a membership
+  change (task started, dead, rescheduled) goes through `pfctl -T replace` and
+  the ruleset is **not** reloaded (M6). In M1 that was host-mode publishing
+  only; M3 adds ingress publishing to the same anchor (see "Published ports"
   below).
+
+  The two `lo0` lines plus one host route make the published port reachable
+  **from the publishing host itself** — `localhost:8080` and the host's own
+  address (api-compat #35, every part measured in `hack/experiments/lo0rdr/`
+  and on the cluster). Locally generated traffic re-enters through `lo0` and
+  pf's `rdr` does fire there; what dies is the next step, the kernel refusing
+  to forward a loopback-*source* packet. Four parts, all required: (1) the
+  `nat on lo0` rewrites the source to the dummy `198.18.0.1`
+  (`satl_core::defaults::LOOPBACK_PUBLISH_SNAT`, from the RFC 2544 benchmark
+  block — never routable, and deliberately **outside any container subnet**:
+  an in-subnet dummy makes the container ARP for it on its own link and the
+  reply never leaves); (2) the `rdr` rule is duplicated `on lo0`, because the
+  interface-less rule does not match the NATed packet re-entering `lo0` (A/B
+  measured both ways — the duplicate is not decorative); (3) `satld`'s port
+  sweep keeps a host route `198.18.0.1 -> 127.0.0.1`, which makes the task's
+  reply non-local so it re-traverses `lo0` and both pf states un-translate in
+  order; (4) the same sweep keeps lo0's IPv4 TX checksum offload **off**
+  (`ifconfig lo0 -txcsum`), because a loopback-originated packet carries no
+  real TCP checksum — only "already verified" mbuf flags, which epair
+  propagates in software but vxlan encapsulation to a remote node loses — so
+  without it a localhost connection relayed over the mesh arrives with a
+  wrong inner checksum and is silently dropped (measured on the cluster:
+  perfect translation chain, `cksum ... (incorrect)` on the remote node,
+  3/3 HTTP 200 the moment `-txcsum` was set). Prerequisite: pf must not
+  `set skip on lo0` — `satld` warns at startup (enforce mode) when it does.
+  The `nat` rules co-locate with the `rdr` rules in `satl/rdr`; the wildcard
+  `nat-anchor "satl/*"` declaration above picks them up.
 
 ### The egress interface
 
@@ -410,11 +443,14 @@ The daemon logs one line per *change*, carrying every redirect as
 grep by task id or by port number. A steady node logs nothing and runs no
 pfctl; a membership-only change shows up in `-T show`, never in `-s nat`.
 
-Remember `docs/api-compat.md` #35 when testing: a published port is not
-reachable from the publishing host through `localhost`, because pf applies `rdr`
-to packets *entering* an interface. Test from another machine, which is what
-the `publish_port` cluster scenario does, from the dev host against the VMs'
-public addresses.
+When testing, `docs/api-compat.md` #35 now cuts the other way: a published
+port **is** reachable from the publishing host through `localhost` and through
+the host's own address (`pf_mode = enforce`, no `set skip on lo0` — the
+three-part lo0 recipe above, `hack/experiments/lo0rdr/`), so test both paths.
+A host-local `curl 127.0.0.1:<port>` exercises the lo0 nat + rdr + route
+triple; a remote one, which is what the `publish_port` cluster scenario does
+from the dev host against the VMs' public addresses, exercises the classic
+inbound path and must keep working unchanged.
 
 ## M6d, the routing mesh
 

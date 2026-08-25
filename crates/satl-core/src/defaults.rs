@@ -3,6 +3,7 @@
 //! `docs/architecture.md` §15 (adopted from SwarmKit, SWK §22, unless noted).
 //! Keep that table in sync with any change here.
 
+use std::net::Ipv4Addr;
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
@@ -96,6 +97,25 @@ pub fn jail_annotations(
         })
         .collect()
 }
+
+/// SNAT source that makes a published port reachable from the publishing
+/// host itself (`docs/api-compat.md` #35, measured in
+/// `hack/experiments/lo0rdr`).
+///
+/// Locally generated traffic to `127.0.0.1:port` or to the host's own address
+/// re-enters through `lo0`, where pf's `rdr` does fire — but the kernel then
+/// refuses to forward a packet whose *source* is loopback. So `satl-net`
+/// NATs the source on `lo0` to this dummy and `satld` keeps a host route
+/// sending it back to `127.0.0.1`, which makes the reply non-local: it
+/// re-traverses `lo0` and both pf states get their reverse pass in order.
+///
+/// Why this address: `198.18.0.0/15` is the RFC 2544 benchmarking block,
+/// reserved and never routable, so the route is harmless — and it is outside
+/// any container subnet, which is mandatory: an in-subnet dummy makes the
+/// container ARP for it on its own link, nobody answers, and the reply never
+/// leaves (measured with `10.88.0.254`). Keep every IPAM pool out of
+/// `198.18.0.0/15`.
+pub const LOOPBACK_PUBLISH_SNAT: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 
 /// Failure-observation window after a task starts during a rolling update.
 pub const UPDATE_MONITOR: Duration = Duration::from_secs(5);
@@ -262,6 +282,22 @@ mod tests {
         assert_eq!(*OVERLAY_VXLAN_PORT_RANGE.start(), 4790);
         assert_eq!(*OVERLAY_VXLAN_PORT_RANGE.end(), 4999);
         assert_eq!(OVERLAY_VXLAN_PORT_RANGE.count(), 210);
+    }
+
+    /// The loopback-publish SNAT source must stay inside the RFC 2544
+    /// benchmark block (never routable) and outside both default container
+    /// pools — an in-subnet dummy dies on unanswered ARP in the container
+    /// (measured, `hack/experiments/lo0rdr`).
+    #[test]
+    fn loopback_publish_snat_is_in_the_benchmark_block() {
+        assert_eq!(LOOPBACK_PUBLISH_SNAT, Ipv4Addr::new(198, 18, 0, 1));
+        // 198.18.0.0/15: first octet 198, second octet 18 or 19.
+        let [a, b, _, _] = LOOPBACK_PUBLISH_SNAT.octets();
+        assert_eq!(a, 198);
+        assert!(b == 18 || b == 19);
+        // Outside 10.0.0.0/8, which holds the default local bridge pool
+        // (10.88.0.0/16) and the default overlay pool (10.100.0.0/14).
+        assert_ne!(a, 10);
     }
 
     #[test]

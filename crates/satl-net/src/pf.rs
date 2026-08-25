@@ -187,13 +187,35 @@ pub fn pool_publishes(publishes: &[PortPublish]) -> BTreeMap<PoolKey, BTreeSet<I
 /// Generate the full `satl/rdr` anchor ruleset for `pools`.
 ///
 /// **Table-backed: the ruleset is static and membership is dynamic.** One
-/// `table` declaration plus one `rdr` rule per pool, targeting the table —
+/// `table` declaration plus three static rules per pool, targeting the table —
 /// never an inline address list:
 ///
 /// ```text
 /// table <satl_p8080_tcp_80> persist
+/// nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1
 /// rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin
+/// rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin
 /// ```
+///
+/// The two `lo0` lines are what makes a published port reachable from the
+/// publishing host itself (`docs/api-compat.md` #35, all of it measured in
+/// `hack/experiments/lo0rdr/`). Locally generated traffic to `127.0.0.1:8080`
+/// or to the host's own address re-enters through `lo0`, where the
+/// interface-less `rdr` rule *does* fire — what kills the packet is the next
+/// step: the kernel refuses to forward a loopback-*source* packet. So the
+/// `nat on lo0` rewrites the source to a dummy from the RFC 2544 benchmark
+/// block ([`satl_core::defaults::LOOPBACK_PUBLISH_SNAT`], never routable and
+/// **outside any container subnet** — an in-subnet dummy dies on unanswered
+/// ARP in the container), and a host route `198.18.0.1 -> 127.0.0.1` (owned
+/// by `satld`'s port sweep) makes the reply non-local, so it re-traverses
+/// `lo0` and both pf states get their reverse pass in order: un-rdr on the
+/// way out, un-nat on the way back in. The duplicated `rdr ... on lo0` is
+/// not decorative: the interface-less rule does not match the source-NATed
+/// packet re-entering `lo0` even though it matched the un-NATed one — pinned by A/B
+/// measurement both ways. `nat` and `rdr` co-locate fine in this anchor (the
+/// wildcard `nat-anchor "satl/*"` declaration picks the nat rules up), and
+/// the per-pool emission order (table, nat-on-lo0, rdr, rdr-on-lo0) is the
+/// measured-working one.
 ///
 /// A membership change (a task starts, dies, is rescheduled) then goes
 /// through `pfctl -T replace` ([`PfCtl::replace_table`]) and the anchor is
@@ -215,6 +237,7 @@ pub fn pool_publishes(publishes: &[PortPublish]) -> BTreeMap<PoolKey, BTreeSet<I
 /// always produce identical rule text (golden-testable, cheap to diff).
 #[must_use]
 pub fn rdr_rules(pools: &BTreeMap<PoolKey, BTreeSet<Ipv4Addr>>) -> String {
+    let snat = satl_core::defaults::LOOPBACK_PUBLISH_SNAT;
     let mut rules = String::new();
     for key in pools.keys() {
         let table = table_name(key);
@@ -225,7 +248,15 @@ pub fn rdr_rules(pools: &BTreeMap<PoolKey, BTreeSet<Ipv4Addr>>) -> String {
         let _ = writeln!(rules, "table <{table}> persist");
         let _ = writeln!(
             rules,
+            "nat on lo0 inet proto {proto} from any to any port {host} -> {snat}"
+        );
+        let _ = writeln!(
+            rules,
             "rdr pass inet proto {proto} from any to any port {host} -> <{table}> port {task} round-robin"
+        );
+        let _ = writeln!(
+            rules,
+            "rdr pass on lo0 inet proto {proto} from any to any port {host} -> <{table}> port {task} round-robin"
         );
     }
     rules
@@ -385,6 +416,11 @@ fn args_show_anchor(anchor: &str, what: &str) -> Vec<String> {
     to_args(["-a", anchor, "-s", what])
 }
 
+fn args_show_interfaces() -> Vec<String> {
+    // `-v` is load-bearing: pfctl prints the `(skip)` flag only verbosely.
+    to_args(["-s", "Interfaces", "-v"])
+}
+
 fn args_replace_table(anchor: &str, table: &str) -> Vec<String> {
     to_args(["-a", anchor, "-t", table, "-T", "replace"])
 }
@@ -410,6 +446,17 @@ fn is_owned_anchor(anchor: &str) -> bool {
 /// manages are the pool tables [`table_name`] mints, inside its own anchors.
 fn is_owned_table(table: &str) -> bool {
     table.starts_with("satl_p")
+}
+
+/// Whether `iface` carries the `(skip)` flag in `pfctl -s Interfaces -v`
+/// output — i.e. pf's ruleset has `set skip on <iface>` (directly or through
+/// a group). One interface per line, the name first, ` (skip)` appended when
+/// set; pure so it is testable against a fixture.
+fn interface_is_skipped_in(output: &str, iface: &str) -> bool {
+    output.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next() == Some(iface) && words.any(|word| word == "(skip)")
+    })
 }
 
 /// pf is not usable at all (as opposed to rejecting the ruleset): pfctl
@@ -653,6 +700,22 @@ impl<R: CommandRunner> PfCtl<R> {
         Ok(output.stdout)
     }
 
+    /// Whether pf skips `iface` (`set skip on <iface>`): `pfctl -s
+    /// Interfaces -v`, looking for the `(skip)` flag on the interface's line.
+    ///
+    /// Exists for the startup probe of `set skip on lo0`
+    /// (`docs/api-compat.md` #35): the lo0 nat/rdr rules that make a
+    /// published port reachable from the publishing host are never consulted
+    /// on a skipped interface, so the condition deserves a warning. Not
+    /// anchor-scoped — `-s Interfaces` is a read of pf's global interface
+    /// table, which touches no rule.
+    pub async fn interface_is_skipped(&self, iface: &str) -> Result<bool, PfError> {
+        let context = format!("read pf's skip flag on interface '{iface}'");
+        let (argv, output) = self.exec(&context, args_show_interfaces(), None).await?;
+        Self::interpret(&context, argv, &output, "")?;
+        Ok(interface_is_skipped_in(&output.stdout, iface))
+    }
+
     /// Destroy a pool table entirely: `pfctl -a <anchor> -t <table> -T kill`.
     ///
     /// Needed because the tables are declared **`persist`**: flushing or
@@ -688,6 +751,7 @@ mod tests {
     use crate::runner::MockRunner;
 
     const FIXTURE_UNAVAILABLE: &str = include_str!("../tests/fixtures/pfctl_unavailable.txt");
+    const FIXTURE_INTERFACES: &str = include_str!("../tests/fixtures/pfctl_show_interfaces_v.txt");
 
     fn subnet(s: &str) -> SubnetV4 {
         s.parse().unwrap()
@@ -800,16 +864,24 @@ mod tests {
     #[test]
     fn rdr_rules_golden_and_sorted() {
         // Input deliberately unsorted; output must be sorted by host port,
-        // each pool a table declaration plus one static rule.
+        // each pool a table declaration plus three static rules: the lo0
+        // source-NAT, the redirect, and its lo0 duplicate (the measured
+        // recipe for host-local access, hack/experiments/lo0rdr).
         let rules = rdr_rules(&pool_publishes(&sample_publishes()));
         assert_eq!(
             rules,
             "table <satl_p8053_udp_53> persist\n\
+             nat on lo0 inet proto udp from any to any port 8053 -> 198.18.0.1\n\
              rdr pass inet proto udp from any to any port 8053 -> <satl_p8053_udp_53> port 53 round-robin\n\
+             rdr pass on lo0 inet proto udp from any to any port 8053 -> <satl_p8053_udp_53> port 53 round-robin\n\
              table <satl_p8080_tcp_80> persist\n\
+             nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1\n\
              rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n\
+             rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n\
              table <satl_p8443_tcp_443> persist\n\
-             rdr pass inet proto tcp from any to any port 8443 -> <satl_p8443_tcp_443> port 443 round-robin\n"
+             nat on lo0 inet proto tcp from any to any port 8443 -> 198.18.0.1\n\
+             rdr pass inet proto tcp from any to any port 8443 -> <satl_p8443_tcp_443> port 443 round-robin\n\
+             rdr pass on lo0 inet proto tcp from any to any port 8443 -> <satl_p8443_tcp_443> port 443 round-robin\n"
         );
     }
 
@@ -856,7 +928,9 @@ mod tests {
         assert_eq!(
             rdr_rules(&pools),
             "table <satl_p8080_tcp_80> persist\n\
-             rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n"
+             nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1\n\
+             rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n\
+             rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n"
         );
     }
 
@@ -898,9 +972,13 @@ mod tests {
         assert_eq!(
             rdr_rules(&pool_publishes(&publishes)),
             "table <satl_p8080_tcp_80> persist\n\
+             nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1\n\
              rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n\
+             rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_80> port 80 round-robin\n\
              table <satl_p8080_tcp_8080> persist\n\
-             rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_8080> port 8080 round-robin\n"
+             nat on lo0 inet proto tcp from any to any port 8080 -> 198.18.0.1\n\
+             rdr pass inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_8080> port 8080 round-robin\n\
+             rdr pass on lo0 inet proto tcp from any to any port 8080 -> <satl_p8080_tcp_8080> port 8080 round-robin\n"
         );
     }
 
@@ -1083,6 +1161,44 @@ mod tests {
                 "/sbin/pfctl -a satl/nat -s rules",
             ]
         );
+    }
+
+    // ---- the `set skip` probe -------------------------------------------------
+
+    /// `pfctl_show_interfaces_v.txt` is a real `pfctl -s Interfaces -v`
+    /// capture from alpha (FreeBSD 15.1) with `set skip on lo0` loaded: one
+    /// interface per line, ` (skip)` appended when the flag is set.
+    #[test]
+    fn skip_flag_is_parsed_from_the_interfaces_listing() {
+        assert!(interface_is_skipped_in(FIXTURE_INTERFACES, "lo0"));
+        assert!(!interface_is_skipped_in(FIXTURE_INTERFACES, "ice0"));
+        assert!(!interface_is_skipped_in(FIXTURE_INTERFACES, "satl0"));
+        // `lo` (the group line) carries no flag, and a name must match whole:
+        // `lo0`'s flag says nothing about `lo`.
+        assert!(!interface_is_skipped_in(FIXTURE_INTERFACES, "lo"));
+        // Absent interface: not skipped.
+        assert!(!interface_is_skipped_in(FIXTURE_INTERFACES, "vtnet0"));
+        assert!(!interface_is_skipped_in("", "lo0"));
+    }
+
+    #[tokio::test]
+    async fn interface_is_skipped_builds_expected_argv() {
+        let mock = MockRunner::new();
+        mock.push_output(0, FIXTURE_INTERFACES, "");
+        let pf = PfCtl::with_runner(&mock);
+        assert!(pf.interface_is_skipped("lo0").await.unwrap());
+        assert_eq!(mock.calls(), ["/sbin/pfctl -s Interfaces -v"]);
+    }
+
+    #[tokio::test]
+    async fn interface_is_skipped_surfaces_pf_unavailable() {
+        let mock = MockRunner::new();
+        mock.push_output(1, "", FIXTURE_UNAVAILABLE);
+        let pf = PfCtl::with_runner(&mock);
+        assert!(matches!(
+            pf.interface_is_skipped("lo0").await.unwrap_err(),
+            PfError::Unavailable { .. }
+        ));
     }
 
     #[tokio::test]

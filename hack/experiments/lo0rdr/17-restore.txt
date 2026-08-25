@@ -1,0 +1,13 @@
+== verification restauration ==
+-- anchors --
+nat on ice0 inet from 10.88.0.0/24 to any -> (ice0) round-robin
+rdr pass inet proto tcp from any to any port = http-alt -> <satl_p8080_tcp_80> port 80 round-robin
+   10.88.0.5
+-- route 198.18.0.1 (doit etre absente) --
+destination: 0.0.0.0
+    gateway: 100.64.0.1
+-- localhost doit re-echouer (baseline #35) --
+curl: (28) Connection timed out after 3013 milliseconds
+http_code=000
+-- direct conteneur doit marcher --
+http_code=200

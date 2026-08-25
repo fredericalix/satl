@@ -1,0 +1,13 @@
+== curl 127.0.0.1:8080 (pass out on lo0, rdr-to+nat-to) ==
+curl: (28) Connection timed out after 4003 milliseconds
+http_code=000
+== curl 51.38.30.173:8080 ==
+curl: (28) Connection timed out after 4003 milliseconds
+http_code=000
+== etats ==
+all tcp 10.88.0.1:62351 (127.0.0.1:17043) -> 127.0.0.1:8080       SYN_SENT:CLOSED
+all tcp 10.88.0.5:80 (127.0.0.1:8080) <- 10.88.0.1:62351       CLOSED:SYN_SENT
+all tcp 10.88.0.1:62351 -> 10.88.0.5:80       TIME_WAIT:TIME_WAIT
+all tcp 10.88.0.1:58927 (51.38.30.173:28510) -> 51.38.30.173:8080       SYN_SENT:CLOSED
+all tcp 10.88.0.5:80 (51.38.30.173:8080) <- 10.88.0.1:58927       CLOSED:SYN_SENT
+all tcp 10.88.0.1:58927 -> 10.88.0.5:80       TIME_WAIT:TIME_WAIT
