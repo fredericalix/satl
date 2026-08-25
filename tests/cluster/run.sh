@@ -1244,8 +1244,28 @@ scenario_worker_join_roles() {
 	}
 	wait_until "$T_QUICK" "the write through $WJ_WRK committed (desired $WJ_STEP)" \
 	    'state_fetch "$CTL" && [ "$(svc_desired)" = "$WJ_STEP" ]'
-	node_ssh "$WJ_WRK" "satl service scale $SERVICE=$REPLICAS" >/dev/null 2>&1 ||
-	    fail "scaling $SERVICE back through $WJ_WRK failed"
+	# The leader having committed it is not enough to write through $WJ_WRK
+	# again. `satl service scale` is a read-modify-write, and reads are
+	# answered from the node's **own** applied store (architecture section 7),
+	# so scaling through a node that has not applied the previous scale yet
+	# submits the stale object version and the leader refuses it:
+	#
+	#   store transaction rejected ... sequence conflict on service <id>:
+	#   store has version 65, caller wrote from version 14
+	#
+	# Measured: the scale below failed exactly that way in a full-suite run
+	# and the same scenario passed alone, which is the signature of a
+	# precondition weaker than what it guards -- the same mistake this suite
+	# already removed from `node_kill`, `leader_kill` and `demote_leader`,
+	# where the observable being waited on was not the one the next step
+	# depends on. Wait for the writer's own reading, not the leader's.
+	wait_until "$T_QUICK" "$WJ_WRK has applied it too (its own read says $WJ_STEP)" \
+	    'state_fetch "$WJ_WRK" && [ "$(svc_desired)" = "$WJ_STEP" ]'
+	node_ssh "$WJ_WRK" "satl service scale $SERVICE=$REPLICAS" >"$TMPD/wjscale2" 2>&1 ||
+	    {
+		show "$TMPD/wjscale2"
+		fail "scaling $SERVICE back through $WJ_WRK failed"
+	}
 	# Converged, not merely desired: the count below must not race a task that
 	# is still starting (measured: the extra replica landed on $WJ_WRK and
 	# started *during* the demote steps, reading as "3 after, 2 before").
@@ -7260,8 +7280,19 @@ want "kern.racct.enable" 1 "$(sysctl -n kern.racct.enable 2>/dev/null)"
 want "ip forwarding" 1 "$(sysctl -n net.inet.ip.forwarding 2>/dev/null)"
 want "pf status" Enabled \
     "$(pfctl -s info 2>/dev/null | awk '/^Status:/ { print $2; exit }')"
+# Any whitespace, not one space: pf(5) does not care, and the pf.conf the
+# published install-satl.sh writes -- the one the website tells an operator to
+# run -- aligns the third anchor for readability:
+#
+#     nat-anchor "satl/*"
+#     rdr-anchor "satl/*"
+#     anchor     "satl/*"
+#
+# A single literal space counted 2 of 3 on a perfectly good ruleset and told
+# three healthy nodes they were NOT READY. Same expression as the install
+# script's own PF_ANCHOR_RE, so the two counters cannot disagree again.
 want "pf satl anchors" 3 \
-    "$(grep -cE '^(nat-anchor|rdr-anchor|anchor) "satl/\*"' /etc/pf.conf 2>/dev/null)"
+    "$(grep -cE '^[[:space:]]*(nat-anchor|rdr-anchor|anchor)[[:space:]]+"satl/\*"' /etc/pf.conf 2>/dev/null)"
 
 # --- storage (invariant #5: ZFS is mandatory) ------------------------------
 want "zfs $zfs_root" "$state_dir" \
