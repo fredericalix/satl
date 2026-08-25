@@ -20,6 +20,18 @@ use crate::zfs::{CommandRunner, SystemRunner, Zfs, ZfsError};
 /// without this snapshot is a half-made leftover and gets destroyed.
 pub const FINAL_SNAPSHOT: &str = "final";
 
+/// How many times [`LayerStore::reclaim_incomplete`] retries a destroy that
+/// answered "dataset is busy", and how long it waits between tries.
+///
+/// The budget covers an abandoned `spawn_blocking` unpack finishing its tar,
+/// which is bounded by the layer's size and not by anything this process can
+/// interrogate. 30 s is generous for the layers a real image is made of and
+/// still short enough that a genuinely stuck mount is reported rather than
+/// waited on for ever.
+const RECLAIM_ATTEMPTS: u32 = 15;
+/// Pause between the reclaim attempts (see [`RECLAIM_ATTEMPTS`]).
+const RECLAIM_STEP: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// One layer of an image, in application order.
 #[derive(Debug, Clone)]
 pub struct LayerSource {
@@ -325,6 +337,99 @@ impl<R: CommandRunner> LayerStore<R> {
         )
     }
 
+    /// Deal with a layer dataset that exists **without** its `@final`
+    /// snapshot: either finish reclaiming it, or discover that it was not
+    /// incomplete after all.
+    ///
+    /// `Ok(true)` means the dataset became complete while we were looking at
+    /// it and the caller should adopt it; `Ok(false)` means it was destroyed
+    /// and has to be rebuilt.
+    ///
+    /// # Why this is a loop and not a `zfs destroy`
+    ///
+    /// "Dataset without `@final`" reads as an interrupted apply, and usually
+    /// is: a daemon that died mid-unpack leaves exactly that. But it is also
+    /// what an apply that is *still running* looks like, and this process
+    /// cannot always see one of those, which is the part that cost a rolling
+    /// update (decision log, 2026-08-25).
+    ///
+    /// [`Self::ensure_layer`] holds a per-chain mutex across the whole apply,
+    /// so two live applies cannot interleave. What escapes it is
+    /// **cancellation**: `unpack_layer` awaits a `spawn_blocking` handle, and
+    /// dropping a `JoinHandle` does not stop a blocking task. So when the
+    /// agent replaces a task manager mid-prepare, the future is dropped, the
+    /// mutex guard goes with it, and the tar extraction carries on writing
+    /// into the dataset with nothing holding the gate. The next apply then
+    /// finds a dataset with no `@final`, calls it interrupted, and destroys a
+    /// mountpoint that is in use: `cannot unmount ...: pool or dataset is
+    /// busy`, a fatal task rejection, and a paused rollout.
+    ///
+    /// `zfs destroy` is the only thing that knows whether anything still has
+    /// the dataset, so it makes the decision rather than a check before it,
+    /// the same conclusion [`crate::ContainerFsStore::create`] reached for
+    /// container clones. Busy means "not yet", not "give up": the abandoned
+    /// unpack is bounded by the layer it is writing, and when it stops the
+    /// destroy succeeds. Every other refusal (`filesystem has dependent
+    /// clones`, a permission problem, a missing pool) stays fatal on the
+    /// first try, because waiting cannot change any of them.
+    async fn reclaim_incomplete(
+        &self,
+        chain: &ChainId,
+        dataset: &str,
+    ) -> Result<bool, LayerStoreError> {
+        tracing::warn!(
+            chain_id = %chain,
+            "layer dataset exists without @{FINAL_SNAPSHOT} snapshot (interrupted apply), destroying and re-applying"
+        );
+        for attempt in 1..=RECLAIM_ATTEMPTS {
+            let error = match self.zfs.destroy(dataset, true).await {
+                Ok(()) => return Ok(false),
+                Err(error) if error.is_busy() => error,
+                Err(error) => return Err(error.into()),
+            };
+
+            // Busy. Before waiting, ask the one question that would make the
+            // wait pointless: an apply this process could not await may have
+            // reached its snapshot, in which case the dataset is complete and
+            // adopting it is both correct and free.
+            if self
+                .zfs
+                .snapshot_exists(dataset, FINAL_SNAPSHOT)
+                .await
+                .unwrap_or(false)
+            {
+                tracing::info!(
+                    chain_id = %chain,
+                    attempt,
+                    "the layer was being finished by an apply this process no longer tracks; \
+                     adopting the completed dataset instead of rebuilding it"
+                );
+                return Ok(true);
+            }
+
+            if attempt == RECLAIM_ATTEMPTS {
+                tracing::error!(
+                    chain_id = %chain,
+                    waited_secs = u64::from(RECLAIM_ATTEMPTS) * RECLAIM_STEP.as_secs(),
+                    "layer dataset stayed busy for the whole reclaim budget; something outside \
+                     this daemon is holding it. Look for a leftover mount with `mount -p` and \
+                     for a dying prison with `jls -d -h name dying`"
+                );
+                return Err(error.into());
+            }
+            tracing::info!(
+                chain_id = %chain,
+                attempt,
+                of = RECLAIM_ATTEMPTS,
+                "layer dataset is busy, so an unpack is still writing into it; waiting rather \
+                 than failing the task"
+            );
+            tokio::time::sleep(RECLAIM_STEP).await;
+        }
+        // The loop returns on every path; `1..=N` with N >= 1 always runs.
+        unreachable!("the reclaim loop returns from inside its last iteration")
+    }
+
     async fn ensure_layer_inner(
         &self,
         parent: Option<&ChainId>,
@@ -339,11 +444,9 @@ impl<R: CommandRunner> LayerStore<R> {
                 tracing::info!(chain_id = %chain, "layer already applied, adopting existing dataset");
                 return Ok(());
             }
-            tracing::warn!(
-                chain_id = %chain,
-                "layer dataset exists without @{FINAL_SNAPSHOT} snapshot (interrupted apply), destroying and re-applying"
-            );
-            self.zfs.destroy(dataset, true).await?;
+            if self.reclaim_incomplete(chain, dataset).await? {
+                return Ok(());
+            }
         }
 
         match parent {
@@ -459,6 +562,15 @@ mod tests {
 
     fn missing_stderr(name: &str) -> String {
         format!("cannot open '{name}': dataset does not exist\n")
+    }
+
+    /// What `zfs destroy` prints, verbatim from FreeBSD 15.1, while something
+    /// still has the dataset's mountpoint open.
+    fn busy_stderr(mountpoint: &std::path::Path) -> String {
+        format!(
+            "cannot unmount '{}': pool or dataset is busy\n",
+            mountpoint.display()
+        )
     }
 
     struct TestLayer {
@@ -697,6 +809,192 @@ mod tests {
                 format!("/sbin/zfs get -H -p -o value mountpoint {dataset}"),
                 format!("/sbin/zfs snapshot {dataset}@final"),
             ]
+        );
+    }
+
+    /// `cannot unmount ...: pool or dataset is busy` on the reclaim destroy
+    /// means an unpack is still writing into the dataset -- an apply whose
+    /// future was dropped mid-`spawn_blocking`, which releases the per-chain
+    /// mutex while the tar extraction carries on. That is "not yet", not a
+    /// fatal task failure: the destroy is retried until the mountpoint frees
+    /// up, and the layer is then rebuilt.
+    ///
+    /// Regression test for the paused rolling update of 2026-08-25.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_dataset_is_waited_out_rather_than_failing_the_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = make_layer(tmp.path(), "base.txt", b"base\n");
+        let c1 = chain_id(None, &layer.diff_id).unwrap();
+        let dataset = format!("{ROOT}/{}", c1.hex());
+        let mount = tmp.path().join("mnt-busy");
+        fs::create_dir(&mount).unwrap();
+
+        let mock = MockRunner::new();
+        mock.push_output(0, &format!("{dataset}\n"), ""); // dataset exists
+        mock.push_output(1, "", &missing_stderr(&format!("{dataset}@final"))); // no @final
+        // Two destroys refused by a live unpack, and after each one the
+        // @final re-check that would have let us adopt instead.
+        mock.push_output(1, "", &busy_stderr(&mount));
+        mock.push_output(1, "", &missing_stderr(&format!("{dataset}@final")));
+        mock.push_output(1, "", &busy_stderr(&mount));
+        mock.push_output(1, "", &missing_stderr(&format!("{dataset}@final")));
+        // The unpack has finished; the third destroy goes through.
+        mock.push_output(0, "", "");
+        mock.push_output(0, "", ""); // create
+        mock.push_output(0, &format!("{}\n", mount.display()), ""); // mountpoint
+        mock.push_output(0, "", ""); // snapshot
+
+        let store = LayerStore::new(Zfs::with_runner(&mock), ROOT);
+        store
+            .ensure_layer(
+                None,
+                &layer.diff_id,
+                &layer.blob_path,
+                LayerCompression::None,
+            )
+            .await
+            .expect("a busy dataset must not fail the layer apply");
+
+        let destroys = mock
+            .calls()
+            .iter()
+            .filter(|c| c.contains("destroy"))
+            .count();
+        assert_eq!(destroys, 3, "two refusals, then the one that worked");
+        assert!(
+            mock.calls()
+                .contains(&format!("/sbin/zfs snapshot {dataset}@final")),
+            "the layer must be rebuilt and snapshotted after the reclaim: {:?}",
+            mock.calls()
+        );
+    }
+
+    /// The other half of the same decision: if the apply this process could
+    /// not await *finished*, the dataset is complete and adopting it is both
+    /// correct and free. No destroy, no rebuild, no wasted unpack.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_dataset_that_became_complete_is_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = make_layer(tmp.path(), "base.txt", b"base\n");
+        let c1 = chain_id(None, &layer.diff_id).unwrap();
+        let dataset = format!("{ROOT}/{}", c1.hex());
+        let mount = tmp.path().join("mnt-raced");
+        fs::create_dir(&mount).unwrap();
+
+        let mock = MockRunner::new();
+        mock.push_output(0, &format!("{dataset}\n"), ""); // dataset exists
+        mock.push_output(1, "", &missing_stderr(&format!("{dataset}@final"))); // no @final yet
+        mock.push_output(1, "", &busy_stderr(&mount)); // destroy refused
+        mock.push_output(0, &format!("{dataset}@final\n"), ""); // ... it just appeared
+
+        let store = LayerStore::new(Zfs::with_runner(&mock), ROOT);
+        assert_eq!(
+            store
+                .ensure_layer(
+                    None,
+                    &layer.diff_id,
+                    &layer.blob_path,
+                    LayerCompression::None,
+                )
+                .await
+                .unwrap(),
+            c1
+        );
+        assert_eq!(
+            mock.calls(),
+            [
+                format!("/sbin/zfs list -H -o name {dataset}"),
+                format!("/sbin/zfs list -H -o name {dataset}@final"),
+                format!("/sbin/zfs destroy -r {dataset}"),
+                format!("/sbin/zfs list -H -o name {dataset}@final"),
+            ],
+            "nothing is created, unpacked or snapshotted when the dataset was already finished"
+        );
+    }
+
+    /// A dataset that stays busy for the whole budget is reported, with the
+    /// real `zfs` failure rather than a synthesised one, so the operator sees
+    /// the argv and the stderr. Waiting for ever would hang the prepare.
+    #[tokio::test(start_paused = true)]
+    async fn a_dataset_busy_for_the_whole_budget_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = make_layer(tmp.path(), "base.txt", b"base\n");
+        let c1 = chain_id(None, &layer.diff_id).unwrap();
+        let dataset = format!("{ROOT}/{}", c1.hex());
+        let mount = tmp.path().join("mnt-stuck");
+
+        let mock = MockRunner::new();
+        mock.push_output(0, &format!("{dataset}\n"), ""); // dataset exists
+        mock.push_output(1, "", &missing_stderr(&format!("{dataset}@final"))); // no @final
+        for _ in 0..RECLAIM_ATTEMPTS {
+            mock.push_output(1, "", &busy_stderr(&mount)); // destroy: busy
+            mock.push_output(1, "", &missing_stderr(&format!("{dataset}@final"))); // still no @final
+        }
+
+        let store = LayerStore::new(Zfs::with_runner(&mock), ROOT);
+        let error = store
+            .ensure_layer(
+                None,
+                &layer.diff_id,
+                &layer.blob_path,
+                LayerCompression::None,
+            )
+            .await
+            .expect_err("a permanently busy dataset has to be reported");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("zfs destroy -r") && rendered.contains("dataset is busy"),
+            "the operator needs the argv and the stderr: {rendered}"
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|c| c.contains("destroy"))
+                .count(),
+            RECLAIM_ATTEMPTS as usize,
+            "exactly the budget, no more"
+        );
+    }
+
+    /// Only "busy" is transient. `filesystem has dependent clones` means a
+    /// container rootfs was cloned from this layer: waiting cannot change it,
+    /// so it stays fatal on the first try and the task fails fast.
+    #[tokio::test(start_paused = true)]
+    async fn a_destroy_refused_for_any_other_reason_stays_fatal_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = make_layer(tmp.path(), "base.txt", b"base\n");
+        let c1 = chain_id(None, &layer.diff_id).unwrap();
+        let dataset = format!("{ROOT}/{}", c1.hex());
+
+        let mock = MockRunner::new();
+        mock.push_output(0, &format!("{dataset}\n"), ""); // dataset exists
+        mock.push_output(1, "", &missing_stderr(&format!("{dataset}@final"))); // no @final
+        mock.push_output(
+            1,
+            "",
+            &format!("cannot destroy '{dataset}': filesystem has dependent clones\n"),
+        );
+
+        let store = LayerStore::new(Zfs::with_runner(&mock), ROOT);
+        let error = store
+            .ensure_layer(
+                None,
+                &layer.diff_id,
+                &layer.blob_path,
+                LayerCompression::None,
+            )
+            .await
+            .expect_err("dependent clones is not something to wait out");
+        assert!(
+            error.to_string().contains("dependent clones"),
+            "{}",
+            error.to_string()
+        );
+        assert_eq!(
+            mock.calls().len(),
+            3,
+            "one probe, one snapshot check, one destroy, and no retry: {:?}",
+            mock.calls()
         );
     }
 

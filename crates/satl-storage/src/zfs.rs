@@ -154,6 +154,22 @@ impl ZfsError {
             _ => false,
         }
     }
+
+    /// Whether this failure is `zfs` refusing because something has the
+    /// dataset (or its mountpoint) open **right now**.
+    ///
+    /// The distinction a caller needs: "in use at this instant" is a state
+    /// that ends by itself, where every other refusal does not. A destroy
+    /// that treats the two alike either fails work that would have succeeded
+    /// a second later, or retries for ever on something that will never
+    /// change.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        match self {
+            Self::CommandFailed { stderr, .. } => stderr_says_busy(stderr),
+            _ => false,
+        }
+    }
 }
 
 fn render_exit(exit_code: Option<i32>) -> String {
@@ -362,6 +378,19 @@ fn args_list_with_origin(root: &str) -> Vec<String> {
 /// on stderr (exit code 1) for a missing dataset.
 fn stderr_says_dataset_missing(stderr: &str) -> bool {
     stderr.contains("does not exist")
+}
+
+/// `zfs destroy` prints `cannot unmount '<mountpoint>': pool or dataset is
+/// busy` (exit code 1) while a process still has the mountpoint open, and
+/// `cannot destroy '<dataset>': dataset is busy` for a held dataset. Both
+/// carry the same tail.
+///
+/// Deliberately narrow. `filesystem has dependent clones` is the *other*
+/// refusal a layer dataset draws, it means a container rootfs was cloned from
+/// this layer, and it must stay fatal: waiting would never help and
+/// destroying anyway is not on offer.
+fn stderr_says_busy(stderr: &str) -> bool {
+    stderr.contains("dataset is busy")
 }
 
 /// Parse output expected to be exactly one non-empty line (e.g.
@@ -1200,6 +1229,38 @@ mod tests {
         let zfs = Zfs::with_runner(&mock);
         let err = zfs.list_space("zroot/satl/layers").await.unwrap_err();
         assert!(!err.is_missing_dataset(), "{err}");
+    }
+
+    /// `is_busy` decides whether a failed destroy is worth waiting out, so its
+    /// narrowness is the whole point: "dependent clones" is a permanent
+    /// refusal and must not be retried, and a spawn failure is not a refusal
+    /// at all.
+    #[tokio::test]
+    async fn only_a_busy_dataset_reads_as_busy() {
+        let busy = |stderr: &str| ZfsError::CommandFailed {
+            argv: "/sbin/zfs destroy -r zroot/satl/layers/abc".to_owned(),
+            exit_code: Some(1),
+            stderr: stderr.to_owned(),
+        };
+        assert!(
+            busy("cannot unmount '/var/db/satl/layers/abc': pool or dataset is busy\n").is_busy()
+        );
+        assert!(busy("cannot destroy 'zroot/satl/layers/abc': dataset is busy\n").is_busy());
+        assert!(
+            !busy("cannot destroy 'zroot/satl/layers/abc': filesystem has dependent clones\n")
+                .is_busy(),
+            "dependent clones is permanent; waiting cannot clear it"
+        );
+        assert!(!busy("cannot open 'zroot/nope': dataset does not exist\n").is_busy());
+
+        let mock = MockRunner::new();
+        mock.push_spawn_error(io::ErrorKind::NotFound, "no zfs binary");
+        let zfs = Zfs::with_runner(&mock);
+        let spawn_failure = zfs
+            .destroy("zroot/satl/layers/abc", true)
+            .await
+            .unwrap_err();
+        assert!(!spawn_failure.is_busy(), "{spawn_failure}");
     }
 
     #[test]

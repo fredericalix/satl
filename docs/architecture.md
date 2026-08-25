@@ -924,7 +924,15 @@ then closed **upward** through the clone `origin` edges on disk:
 Without the ancestry closure the GC would go after the layers *below* a live container's
 top layer, where ZFS refuses (`filesystem has dependent clones`) on every pass forever.
 A dataset with no `@final` is never collected either, it is mid-apply or half-applied,
-and `ensure_layer` destroys and rebuilds it.
+and `ensure_layer` reclaims it. Reclaiming is a *loop*, not a `zfs destroy`: the two
+states are indistinguishable from the outside, and the per-chain gate does not separate
+them either, because a prepare cancelled mid-`spawn_blocking` releases the gate while
+the tar extraction carries on writing (dropping a `JoinHandle` does not stop a blocking
+task). So the destroy makes the decision: `dataset is busy` means an unpack is still in
+it and is retried within a bounded budget, an `@final` that appears meanwhile is adopted
+instead, and every other refusal stays fatal at once. Same conclusion as the container
+clone's origin check (§10, `ContainerFsStore::create`): only the atomic ZFS operation can
+arbitrate.
 
 Two safety properties are structural rather than hoped for. **Two consecutive passes must
 agree** before anything is destroyed, the discipline `27ccb64` set for the dataset sweep
