@@ -21,8 +21,11 @@
 # never shows a config label). So these stay node1/2/3 while the machines call
 # themselves fbsd1.satl.cc and friends.
 #
-# Values verified 2026-08-23 on the reinstalled VMs (same hostnames and
-# private underlay as the 2026-08-19 set; the public addresses changed).
+# Values verified 2026-08-25 on the VMs reinstalled that day, from the live
+# interfaces. The hostnames and the private underlay have survived every
+# rebuild so far; the **public addresses change on every one of them**, and
+# they had gone stale again by the time this line was written. If a script
+# cannot reach a node, suspect these three lines before anything else.
 # Re-verify with:
 #   sh tests/cluster/run.sh        (checks private_ip against the live vtnet1)
 
@@ -57,20 +60,20 @@ prefix = "/usr/local"
 [[node]]
 name = "node1"
 ssh_host = "fbsd1.satl.cc"
-public_ip = "54.36.253.84"
+public_ip = "141.94.186.106"
 private_ip = "10.0.0.101"
 role = "bootstrap"
 
 [[node]]
 name = "node2"
 ssh_host = "fbsd2.satl.cc"
-public_ip = "92.222.226.189"
+public_ip = "141.94.186.17"
 private_ip = "10.0.0.102"
 role = "joiner"
 
 [[node]]
 name = "node3"
 ssh_host = "fbsd3.satl.cc"
-public_ip = "146.59.190.104"
+public_ip = "54.36.253.217"
 private_ip = "10.0.0.103"
 role = "joiner"
