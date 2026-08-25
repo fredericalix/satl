@@ -228,6 +228,15 @@ FreeBSD behaviors that have each cost a debugging session:
   unit tests never require it.
 - Published ports are not reachable from the publishing host via localhost, a pf property,
   recorded as api-compat #35.
+- **The linuxulator takes two sysctls, and `satld` can only probe one.**
+  `compat.linux.osrelease` answering is the capability marker, but `rctl`-style graceful
+  degradation is not available here: `kern.elf64.fallback_brand` must also be `3`, or
+  every *static musl* binary (Alpine's `busybox`) dies with `Exec format error` while
+  glibc images run, which reads as "Alpine is broken". `service linux start` sets the
+  brand only when it is `-1`, so check the value rather than the command's exit status.
+  `kldload linux` alone loads `linux_common` and neither `linux64.ko` nor the brand: the
+  node then advertises a capability it does not have. This is also why a freshly
+  installed node fails its first `satl pull` of any Linux image (api-compat #183).
 
 ## Testing shape
 
