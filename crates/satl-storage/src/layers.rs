@@ -24,11 +24,13 @@ pub const FINAL_SNAPSHOT: &str = "final";
 /// answered "dataset is busy", and how long it waits between tries.
 ///
 /// The budget covers an abandoned `spawn_blocking` unpack finishing its tar,
-/// which is bounded by the layer's size and not by anything this process can
-/// interrogate. 30 s is generous for the layers a real image is made of and
-/// still short enough that a genuinely stuck mount is reported rather than
-/// waited on for ever.
-const RECLAIM_ATTEMPTS: u32 = 15;
+/// which is bounded by the layer's size and by nothing this process can
+/// interrogate. 60 s, because the arithmetic that matters is the slow end: a
+/// 1 GiB layer on a virtio disk unpacks in well under a minute, and
+/// overrunning the budget means the rejected task this whole path exists to
+/// prevent. Bounded all the same, so a mount held by something else is
+/// reported instead of waited on for ever.
+const RECLAIM_ATTEMPTS: u32 = 30;
 /// Pause between the reclaim attempts (see [`RECLAIM_ATTEMPTS`]).
 const RECLAIM_STEP: std::time::Duration = std::time::Duration::from_secs(2);
 
