@@ -1279,9 +1279,47 @@ consensus engine -- the reason it is not optional.
 - [x] The encrypted-overlay suite, 7/7, on the 3-VM testbed. Not part of
       `make cluster-test`, and worth running deliberately because M12 touched
       the raft transport and `satld::overlay`.
-- [ ] Leave it running for a few days and re-read `/var/log/messages` for
-      anything the suites cannot see: slow leaks, a raft node that stops
-      contributing, an assertion that only fires under real uptime.
+- [x] **Re-based on the current build and widened to the cluster
+      (2026-08-25T14:11Z).** Two things were wrong with the soak as it stood:
+      it was running a build three commits old, which by its own standard
+      proves nothing about what ships; and it was **single-node**, so two of
+      the three things this phase is looking for -- a raft node that stops
+      contributing, and anything that only shows up under real cluster uptime
+      -- were outside what it could ever see. All four hosts are now on
+      `e263826` (alpha's `web` container re-adopted across the upgrade, same
+      jail id 6), and the 3-node testbed runs the Node.js + MariaDB stack from
+      the getting-started page: 3 web replicas spread one per node behind a
+      published port, one database pinned by constraint with a node-local
+      volume, a secret, healthchecks, and both the `tuto_default` and `ingress`
+      overlays. A real workload rather than an idle cluster.
+- [x] **`tests/cluster/soak-report.sh`, so the reading happens and is
+      comparable.** "Re-read `/var/log/messages`" is a reading, not a test: done
+      by hand it is done differently every time and compared against nothing.
+      The script prints the same observations in the same order for every node
+      (satld uptime and RSS, jail ids *with* their start times, leadership
+      churn, ERROR/WARN counts per tracing target, panics and assertions,
+      epairs, DYING prisons, layer datasets missing `@final`), asserts nothing,
+      and takes `--host` for a machine outside the inventory. Two runs a week
+      apart are the finding. Writing it caught three bugs in itself first,
+      which is why it is worth having: FreeBSD's `ps` reads `-o rss=,vsz=` as
+      one column with a header, `grep -c` prints 0 *and* exits 1 so a `|| echo
+      0` yields two lines, and a sed pipeline that looked right reported the
+      **month name** as the busiest tracing target. All three produced numbers
+      rather than errors, which is the failure mode a reporting script must not
+      have.
+- [x] **Baseline, 2026-08-25T14:11Z**, on the fleet described above: satld
+      73-76 MiB RSS per node, zero leadership or vote lines since start, zero
+      panics or assertions, zero DYING prisons, every layer dataset carrying
+      its `@final`, and epair counts matching one per (task x network) with
+      every description naming a live task. The last one is recorded because it
+      nearly read as a leak: five epairs for two containers on node1 is what
+      healthy looks like.
+- [ ] **Re-read it in a few days** with the same command and diff the numbers.
+      This is the only item in this phase that cannot be compressed: it needs
+      time to pass, not work to be done. The specific questions the baseline
+      makes answerable: does RSS grow, do the epair and layer counts return to
+      where they started once tasks churn, does any node stop appearing in the
+      leadership lines, and does anything at all show up under `crashes`.
 
 ### Phase 8: launch mechanics 🔨
 
