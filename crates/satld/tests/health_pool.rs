@@ -112,11 +112,14 @@ fn mark_log(message: &str) {
         .status();
 }
 
-/// Lines of `/var/log/messages` containing `needle`. `grep -a`, always: one
-/// non-ASCII byte anywhere in the file makes grep treat it as binary and print
-/// nothing (CLAUDE.md).
+/// Lines of `/var/log/messages` containing `needle`, as a fixed string.
+///
+/// `grep -a`, always: one non-ASCII byte anywhere in the file makes grep treat
+/// it as binary and print nothing (CLAUDE.md). And `-F`, because every needle
+/// here is a literal and one of them is `satld[<pid>]`, where the brackets
+/// would otherwise be a character class matching three digits anywhere.
 fn log_lines(needle: &str) -> Vec<String> {
-    let (_, out) = run("/usr/bin/grep", &["-a", needle, MESSAGES]);
+    let (_, out) = run("/usr/bin/grep", &["-aF", needle, MESSAGES]);
     out.lines().map(str::to_owned).collect()
 }
 
@@ -262,9 +265,30 @@ struct Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            eprintln!("--- last daemon lines (grep -a {NODE} {MESSAGES}) ---");
-            for line in log_lines(NODE).iter().rev().take(40).rev() {
+            // Grep by the daemon's **pid**, not by the node name: syslog stamps
+            // every line `satld[<pid>]:`, while `hpool-node` appears only in
+            // the startup banner and the cluster-init line. Measured
+            // 2026-08-25: a run that timed out waiting for a task to become
+            // healthy dumped exactly those two lines and nothing at all about
+            // the task, which is the opposite of what a failure dump is for --
+            // the diagnosis had to be redone by hand afterwards, and the
+            // failure has not reproduced since, so the dump was the only
+            // chance at it.
+            let needle = self
+                .daemon
+                .as_ref()
+                .map_or_else(|| NODE.to_owned(), |child| format!("satld[{}]", child.id()));
+            eprintln!("--- last daemon lines (grep -aF '{needle}' {MESSAGES}) ---");
+            for line in log_lines(&needle).iter().rev().take(80).rev() {
                 eprintln!("{line}");
+            }
+            // And the task's whole life, by identity: the span chain is the
+            // parent chain, so this is one task's story start to finish.
+            if let Some(task_id) = &self.task_id {
+                eprintln!("--- everything logged about task {task_id} ---");
+                for line in log_lines(task_id) {
+                    eprintln!("{line}");
+                }
             }
             eprintln!("--- satl/rdr anchor now ---\n{}", rdr_anchor());
         }

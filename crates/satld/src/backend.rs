@@ -99,6 +99,15 @@ pub const REMOVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// concurrency.
 const MAX_PROPOSE_ATTEMPTS: u32 = 5;
 
+/// Base pause between two proposal attempts, multiplied by the attempt number.
+///
+/// Without one the five attempts happen in microseconds, all reading the same
+/// store, which makes the retry a no-op for the only case where the store
+/// needs a moment: this node being a few raft entries behind. 50 ms x 1..4 is
+/// ~500 ms in the worst case, which an operator will not notice and ordinary
+/// contention resolves well inside.
+const PROPOSE_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Capacity of the daemon's own event channel (image events).
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
@@ -236,10 +245,35 @@ impl DaemonBackend {
     /// An empty action list means "nothing to do": the value is returned
     /// without touching the store, which is how the lifecycle handlers report
     /// [`ChangeOutcome::Unchanged`].
+    ///
+    /// # Two ways to lose a sequence conflict, and they need opposite answers
+    ///
+    /// The view is rebuilt from **this node's** applied store, because that is
+    /// where reads are answered (§7). So a conflict means one of two things:
+    ///
+    /// - somebody else wrote the object between our read and our proposal.
+    ///   Rebuilding really does help, and the version we read moves each time;
+    /// - or this node's store is simply *behind* the leader's, and every
+    ///   rebuild produces the **same** stale version. Retrying in a tight loop
+    ///   cannot help, because nothing that would advance our store happens
+    ///   inside the loop.
+    ///
+    /// Both were reported as "the object kept changing underneath", which sends
+    /// an operator hunting a concurrent writer that does not exist. Measured on
+    /// the 3-node testbed: a `service scale` submitted through a freshly
+    /// promoted manager failed that way, five attempts deep, in microseconds
+    /// (decision log, 2026-08-25).
+    ///
+    /// So: pause between attempts, so a store that is merely a few entries
+    /// behind can catch up and the retry becomes worth making; and tell the two
+    /// cases apart at the end, from whether the version we kept reading ever
+    /// moved.
     async fn propose_from_view<T, F>(&self, what: &'static str, build: F) -> Result<T>
     where
         F: Fn(&StoreView<'_>) -> Result<(Vec<StoreAction>, T)>,
     {
+        let mut conflict: Option<ProposalRejection> = None;
+        let mut our_versions: Vec<u64> = Vec::new();
         for attempt in 1..=MAX_PROPOSE_ATTEMPTS {
             // Scope the view: its guard is !Send and must not cross an await.
             let (actions, value) = {
@@ -257,19 +291,35 @@ impl DaemonBackend {
                 .await
             {
                 Ok(_) => return Ok(value),
-                Err(ForwardError::Rejected(ProposalRejection::SequenceConflict { .. })) => {
+                Err(ForwardError::Rejected(
+                    rejection @ ProposalRejection::SequenceConflict { found, .. },
+                )) => {
+                    our_versions.push(found);
                     tracing::debug!(
                         what,
                         attempt,
+                        our_version = found,
                         "sequence conflict; retrying from a fresh view"
                     );
+                    conflict = Some(rejection);
+                    if attempt < MAX_PROPOSE_ATTEMPTS {
+                        // Linear, small, and bounded by the attempt count: this
+                        // is a REST handler, so waiting out a badly lagging
+                        // node is not on offer. Ordinary contention resolves
+                        // inside this; a real lag falls through to the error
+                        // below, which says so.
+                        tokio::time::sleep(PROPOSE_RETRY_PAUSE * attempt).await;
+                    }
                 }
                 Err(err) => return Err(swarm::forward_error(what, &manager, &err)),
             }
         }
-        Err(BackendError::conflict(format!(
-            "cannot {what}: the object kept changing underneath ({MAX_PROPOSE_ATTEMPTS} attempts)"
-        )))
+
+        Err(exhausted_conflict_error(
+            what,
+            conflict.as_ref(),
+            &our_versions,
+        ))
     }
 
     /// The IPAM state as the network manager last persisted it.
@@ -376,6 +426,45 @@ impl DaemonBackend {
                 Err(RecvError::Closed) => return (last, false),
             }
         }
+    }
+}
+
+/// The error a run of exhausted proposal attempts deserves.
+///
+/// `our_versions` is the object version *this node* read on each failed
+/// attempt, in order. If it never moved, no amount of rebuilding from this
+/// node's store was ever going to help and the operator needs to hear that
+/// rather than "the object kept changing underneath": nothing was changing,
+/// this node was behind. If it did move, the object really is contended and
+/// the original wording is the accurate one.
+///
+/// Split out of [`DaemonBackend::propose_from_view`] because it is the whole
+/// decision and it is pure, so it can be tested without a cluster.
+fn exhausted_conflict_error(
+    what: &str,
+    conflict: Option<&ProposalRejection>,
+    our_versions: &[u64],
+) -> BackendError {
+    let contended = format!(
+        "cannot {what}: the object kept changing underneath ({MAX_PROPOSE_ATTEMPTS} attempts)"
+    );
+    let stale = our_versions
+        .first()
+        .is_some_and(|first| our_versions.iter().all(|version| version == first));
+    match conflict {
+        Some(ProposalRejection::SequenceConflict {
+            kind,
+            id,
+            expected,
+            found,
+        }) if stale => BackendError::conflict(format!(
+            "cannot {what}: this node's copy of {kind} {id} is stale and did not catch up \
+             ({MAX_PROPOSE_ATTEMPTS} attempts): it reads version {found} where the leader has \
+             {expected}. Reads are answered from each node's own store, so this node is behind \
+             rather than contended. Retry in a moment, or run the command against the leader \
+             (`satl node ls` names it)"
+        )),
+        _ => BackendError::conflict(contended),
     }
 }
 
@@ -2445,5 +2534,84 @@ pub(crate) mod tests {
             "0123456789ab"
         );
         assert_eq!(short_digest("abc"), "abc");
+    }
+}
+
+#[cfg(test)]
+mod propose_conflict_tests {
+    use satl_cluster::ProposalRejection;
+    use satl_core::{Id, ObjectKind};
+
+    use super::exhausted_conflict_error;
+
+    fn conflict(expected: u64, found: u64, id: &Id) -> ProposalRejection {
+        ProposalRejection::SequenceConflict {
+            kind: ObjectKind::Service,
+            id: id.clone(),
+            expected,
+            found,
+        }
+    }
+
+    /// Every attempt read the same version, so nothing was changing: this node
+    /// is behind. The message has to say so, name both versions, and not send
+    /// the reader hunting a concurrent writer.
+    ///
+    /// Regression test for the `service scale` through a freshly promoted
+    /// manager that failed as "the object kept changing underneath".
+    #[test]
+    fn a_view_that_never_moved_is_reported_as_a_stale_node_not_as_contention() {
+        let id = Id::generate();
+        let error = exhausted_conflict_error(
+            "update service",
+            Some(&conflict(65, 14, &id)),
+            &[14, 14, 14, 14, 14],
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("is stale and did not catch up"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("version 14") && rendered.contains("has 65"),
+            "both versions belong in the message: {rendered}"
+        );
+        assert!(
+            rendered.contains(id.as_str()),
+            "and which object: {rendered}"
+        );
+        assert!(
+            !rendered.contains("kept changing underneath"),
+            "the misattributed wording must be gone: {rendered}"
+        );
+        assert!(rendered.is_ascii(), "operator-facing text is ASCII-only");
+    }
+
+    /// The version we read moved between attempts, so somebody else really is
+    /// writing the object. That is what the original wording describes, and it
+    /// stays.
+    #[test]
+    fn a_view_that_moved_is_still_reported_as_contention() {
+        let id = Id::generate();
+        let error = exhausted_conflict_error(
+            "update service",
+            Some(&conflict(70, 69, &id)),
+            &[65, 66, 68, 69, 69],
+        );
+        assert!(
+            error.to_string().contains("kept changing underneath"),
+            "{error}"
+        );
+    }
+
+    /// Defensive: no conflict recorded at all cannot claim staleness it has no
+    /// evidence for.
+    #[test]
+    fn no_recorded_conflict_falls_back_to_the_contention_wording() {
+        let error = exhausted_conflict_error("update service", None, &[]);
+        assert!(
+            error.to_string().contains("kept changing underneath"),
+            "{error}"
+        );
     }
 }
