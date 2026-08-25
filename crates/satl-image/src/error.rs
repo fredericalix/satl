@@ -161,6 +161,30 @@ pub enum ImageError {
         available: Vec<String>,
     },
 
+    /// The image has no native platform, but it does carry the `linux/amd64`
+    /// entry this node would have selected had the linuxulator been enabled.
+    ///
+    /// Kept apart from [`Self::PlatformNotFound`] because the two call for
+    /// opposite reactions: that one means the image cannot run on this
+    /// architecture at all, this one means it is one host command away.
+    #[error(
+        "no matching platform for {requested} in {reference}; available: [{}]. \
+         {emulated} is there, but the linuxulator is off on this node, so it was never \
+         a candidate: run `service linux start` (and `sysrc linux_enable=YES` to keep it \
+         across reboots). satld re-probes every 10s, no daemon restart needed",
+        available.join(", ")
+    )]
+    LinuxEmulationDisabled {
+        /// The native platform that was looked for (`freebsd/amd64`).
+        requested: String,
+        /// The emulatable platform found in the index (`linux/amd64`).
+        emulated: String,
+        /// The image reference being resolved.
+        reference: String,
+        /// Platforms actually present in the index.
+        available: Vec<String>,
+    },
+
     /// Manifest layer list and config `rootfs.diff_ids` disagree in length.
     #[error(
         "image {reference}: manifest has {manifest_layers} layers but config lists \

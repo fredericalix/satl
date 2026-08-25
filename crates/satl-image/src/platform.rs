@@ -7,7 +7,11 @@
 //!    otherwise a typed error lists what is available;
 //! 2. `freebsd/<host arch>` (native jails);
 //! 3. `linux/amd64` when the node runs the linuxulator;
-//! 4. otherwise a typed error listing the available platforms.
+//! 4. otherwise a typed error listing the available platforms, and a distinct
+//!    one ([`ImageError::LinuxEmulationDisabled`]) when the only thing between
+//!    the node and the image is a linuxulator that is off, because that is the
+//!    common shape of the failure on a freshly installed node and it names its
+//!    own fix.
 //!
 //! `variant` is matched loosely: it only participates when needed to
 //! disambiguate several entries of the same os/arch. `os.version` is
@@ -20,6 +24,12 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ImageError;
+
+/// The one architecture the linuxulator fallback considers, and the one the
+/// emulation recipe in `docs/linuxulator.md` was measured on. Named rather
+/// than spelled twice so the emulation arm and the error that explains it
+/// cannot drift apart.
+const EMULATED_ARCH: &str = "amd64";
 
 /// An OCI platform (`os`, `architecture`, optional `variant`/`os.version`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -149,18 +159,31 @@ impl PlatformPolicy {
             return Ok(found);
         }
 
+        let emulated = Platform::new("linux", EMULATED_ARCH);
         if self.linux_emulation {
-            let emulated = Platform::new("linux", "amd64");
             if let Some(found) = pick(&runnable, &emulated) {
                 return Ok(found);
             }
+            let mut requested = native.to_string();
+            requested.push_str(" or linux/amd64 (emulation)");
+            return Err(not_found(requested, &runnable, reference));
         }
 
-        let mut requested = native.to_string();
-        if self.linux_emulation {
-            requested.push_str(" or linux/amd64 (emulation)");
+        // Emulation is off and the image carries the entry it would have
+        // picked. That is the whole reason `docker.io/library/alpine` fails on
+        // a fresh node, so say which command fixes it rather than leaving an
+        // operator to read a platform list and conclude the image is
+        // unsupported here.
+        if let Some(found) = pick(&runnable, &emulated) {
+            return Err(ImageError::LinuxEmulationDisabled {
+                requested: native.to_string(),
+                emulated: found.to_string(),
+                reference: reference.to_owned(),
+                available: runnable.iter().map(ToString::to_string).collect(),
+            });
         }
-        Err(not_found(requested, &runnable, reference))
+
+        Err(not_found(native.to_string(), &runnable, reference))
     }
 
     /// Validates the platform of a single-manifest image (no index to choose
@@ -242,7 +265,9 @@ mod tests {
 
     #[test]
     fn no_emulation_means_typed_error_listing_platforms() {
-        let available = platforms(&["linux/amd64", "linux/arm64/v8"]);
+        // No linux/amd64 to point at, so this stays the plain "cannot run
+        // here" error rather than the one that names `service linux start`.
+        let available = platforms(&["linux/arm64/v8", "linux/386"]);
         let err = freebsd_policy(false).select(&available, "img").unwrap_err();
         let ImageError::PlatformNotFound {
             requested,
@@ -253,7 +278,77 @@ mod tests {
             panic!("expected PlatformNotFound, got {err}");
         };
         assert_eq!(requested, "freebsd/amd64");
-        assert_eq!(available, ["linux/amd64", "linux/arm64/v8"]);
+        assert_eq!(available, ["linux/arm64/v8", "linux/386"]);
+    }
+
+    #[test]
+    fn linux_amd64_present_but_emulation_off_names_the_fix() {
+        // This is `satl pull docker.io/library/alpine:latest` on a node that
+        // never ran `service linux start`: the image is fine, the host is one
+        // command short, and the error has to say so.
+        let available = platforms(&[
+            "linux/amd64",
+            "linux/arm/v6",
+            "linux/arm64/v8",
+            "linux/s390x",
+        ]);
+        let err = freebsd_policy(false)
+            .select(&available, "docker.io/library/alpine:latest")
+            .unwrap_err();
+        let ImageError::LinuxEmulationDisabled {
+            requested,
+            emulated,
+            reference,
+            available,
+        } = &err
+        else {
+            panic!("expected LinuxEmulationDisabled, got {err}");
+        };
+        assert_eq!(requested, "freebsd/amd64");
+        assert_eq!(emulated, "linux/amd64");
+        assert_eq!(reference, "docker.io/library/alpine:latest");
+        assert_eq!(available.len(), 4, "the full list is still reported");
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("service linux start"),
+            "the message must name the command that fixes it: {rendered}"
+        );
+        assert!(
+            rendered.contains("linux_enable=YES"),
+            "and how to make it survive a reboot: {rendered}"
+        );
+        assert!(
+            rendered.is_ascii(),
+            "operator-facing text is ASCII-only: {rendered}"
+        );
+    }
+
+    #[test]
+    fn single_manifest_linux_image_without_emulation_names_the_fix() {
+        // Same failure through validate(): a single-manifest linux/amd64
+        // image has no index to list, and still deserves the actionable text.
+        let err = freebsd_policy(false)
+            .validate(&Platform::new("linux", "amd64"), "img")
+            .unwrap_err();
+        assert!(
+            matches!(err, ImageError::LinuxEmulationDisabled { .. }),
+            "expected LinuxEmulationDisabled, got {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_platform_is_never_second_guessed_by_the_emulation_gate() {
+        // `--platform linux/amd64` is an operator's explicit instruction, and
+        // the pull is allowed: the executor's own prepare gate is what refuses
+        // to start a linux task on a host without the modules.
+        let available = platforms(&["linux/amd64"]);
+        let mut policy = freebsd_policy(false);
+        policy.explicit = Some("linux/amd64".parse().unwrap());
+        assert_eq!(
+            policy.select(&available, "img").unwrap().to_string(),
+            "linux/amd64"
+        );
     }
 
     #[test]
@@ -335,8 +430,8 @@ mod tests {
 
         // And they never appear in the "available" error listing.
         let err = freebsd_policy(false).select(&available, "img").unwrap_err();
-        let ImageError::PlatformNotFound { available, .. } = err else {
-            panic!("expected PlatformNotFound");
+        let ImageError::LinuxEmulationDisabled { available, .. } = err else {
+            panic!("expected LinuxEmulationDisabled, got {err}");
         };
         assert_eq!(available, ["linux/amd64"]);
     }

@@ -847,7 +847,14 @@ what any operator on a stock GENERIC host gets.
 - **Platform selection** (invariant / brief §1.6): prefer `freebsd/<local arch>` from
   the index; else fall back to `linux/amd64` (linuxulator) when available on the node;
   else fail with a clear error listing available platforms. `satl images` / `satl ps`
-  expose a `PLATFORM` column. `--platform` overrides.
+  expose a `PLATFORM` column. `--platform` overrides, and is not held to the
+  emulation gate: an explicit request pulls, and the executor's prepare gate is
+  what refuses to start it. The failure is **two** typed errors, not one, because
+  they call for opposite reactions: `PlatformNotFound` (nothing in the index runs
+  on this architecture, emulation or not, so the image is the problem) and
+  `LinuxEmulationDisabled` (`linux/amd64` is in the index and this node's
+  linuxulator is off, so the host is the problem, and the message names
+  `service linux start`). api-compat #183.
 - **Metadata store**: image manifests/configs and the layer→dataset mapping live in a
   small node-local metadata file set under `/var/db/satl/images/` (CBOR, atomic
   writes), keyed by digest; repository:tag references map to digests.

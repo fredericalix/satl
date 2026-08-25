@@ -165,3 +165,46 @@ async fn full_pull_into_tempdir_store() {
         );
     }
 }
+
+/// The failure a fresh FreeBSD node meets on its first command.
+///
+/// Against the **real** `docker.io/library/alpine` index, so the platform list
+/// in the message is the registry's and not a fixture's: with emulation off,
+/// the pull must refuse *and* name the command that fixes it. Unit tests pin
+/// the policy; this pins that the refusal survives the whole pull path, index
+/// fetch and registry auth included.
+#[tokio::test]
+#[ignore = "requires network access (docker.io)"]
+async fn pull_without_emulation_refuses_and_names_the_fix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ImageStore::open(dir.path().join("images")).expect("open store");
+    let reference = ImageReference::parse("docker.io/library/alpine:3.20").expect("parse");
+
+    let error = store
+        .pull(&reference, &PlatformPolicy::for_host(false), None)
+        .await
+        .expect_err("alpine publishes no freebsd platform, so this cannot succeed");
+
+    let rendered = error.to_string();
+    eprintln!("{rendered}");
+    assert!(
+        matches!(error, satl_image::ImageError::LinuxEmulationDisabled { .. }),
+        "expected LinuxEmulationDisabled, got {error:?}"
+    );
+    assert!(
+        rendered.contains("linux/amd64 is there")
+            && rendered.contains("service linux start")
+            && rendered.contains("linux_enable=YES"),
+        "the message must be the actionable one: {rendered}"
+    );
+
+    // And nothing was written: a refused pull leaves no half-image behind.
+    assert!(
+        store
+            .resolve(&reference)
+            .await
+            .expect("store read")
+            .is_none(),
+        "the refused image must not be in the store"
+    );
+}
