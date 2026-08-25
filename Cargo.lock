@@ -2378,7 +2378,7 @@ dependencies = [
 
 [[package]]
 name = "satl-agent"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "ciborium",
@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "satl-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2424,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "satl-build"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "flate2",
  "satl-core",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "satl-ca"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rand 0.10.2",
  "rcgen",
@@ -2462,7 +2462,7 @@ dependencies = [
 
 [[package]]
 name = "satl-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "satl-cluster"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "base64",
@@ -2515,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "satl-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rand 0.10.2",
  "serde",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "satl-dispatcher"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ciborium",
  "prost-types",
@@ -2548,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "satl-image"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "futures-util",
@@ -2565,7 +2565,7 @@ dependencies = [
 
 [[package]]
 name = "satl-metrics"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "prometheus-client",
@@ -2575,7 +2575,7 @@ dependencies = [
 
 [[package]]
 name = "satl-net"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "satl-core",
  "satl-metrics",
@@ -2589,7 +2589,7 @@ dependencies = [
 
 [[package]]
 name = "satl-orchestrator"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rand 0.10.2",
  "satl-cluster",
@@ -2604,7 +2604,7 @@ dependencies = [
 
 [[package]]
 name = "satl-overlay"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "rand 0.10.2",
@@ -2619,7 +2619,7 @@ dependencies = [
 
 [[package]]
 name = "satl-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "prost",
  "prost-types",
@@ -2631,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "satl-runtime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "nix",
  "satl-core",
@@ -2646,7 +2646,7 @@ dependencies = [
 
 [[package]]
 name = "satl-sched"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "satl-cluster",
  "satl-core",
@@ -2658,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "satl-storage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "flate2",
  "hex",
@@ -2674,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "satld"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",

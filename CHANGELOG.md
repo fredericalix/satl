@@ -10,9 +10,34 @@ a `pkg(8)` version is read as the name/version separator.
 
 ## [Unreleased]
 
-Launch-readiness work (M12). Two cluster defects that kept `make cluster-test`
+## [0.2.1-alpha] - 2026-08-25
+
+`curl localhost:8080` now works on the host that publishes the port -- the
+first-container tutorial's "test that will not work" works. Plus the
+launch-readiness work (M12): two cluster defects that kept `make cluster-test`
 red are fixed and measured on the 3-node testbed; the suite's own reliability
 was the third defect, and the larger one.
+
+### Added
+
+- **A published port answers on the publishing host itself**, via
+  `127.0.0.1:<port>` and via the host's own address, the way Docker's does --
+  on every cluster node for an ingress port, including one running no replica
+  (api-compat #35, remeasured and rewritten). pf's `rdr` was never the
+  blocker: locally generated traffic re-enters through `lo0` and the redirect
+  fires there; what died was the kernel refusing to forward a loopback-source
+  packet, and then, node-to-node, a TCP checksum loopback never computes.
+  `satld` now emits a `nat on lo0` and an `on lo0` redirect twin per published
+  port, and its port sweep owns a host route for the NAT source
+  (`198.18.0.1 -> 127.0.0.1`, RFC 2544 block) and clears TXCSUM on `lo0` --
+  all of it only in `pf_mode = enforce`, all measured in
+  `hack/experiments/lo0rdr/`. `satld` warns at startup when `set skip on lo0`
+  in `/etc/pf.conf` would defeat it. Remaining deviations from Docker are in
+  api-compat #35: nothing redirects in `check`/`disabled` modes, and loopback
+  TCP on a publishing node pays software checksums.
+- `CONTRIBUTING.md`, and CI (`.cirrus.yml`) running `make check` on FreeBSD for
+  every pull request. The tick covers compiling, linting and the unit tests; it
+  cannot run the integration or cluster suites, and says so.
 
 ### Fixed
 
@@ -57,12 +82,6 @@ was the third defect, and the larger one.
   daemon's own words, instead of costing a round trip to learn that the flag
   answers `501` permanently. The two recovery procedures are in the message and
   in the operations guide.
-
-### Added
-
-- `CONTRIBUTING.md`, and CI (`.cirrus.yml`) running `make check` on FreeBSD for
-  every pull request. The tick covers compiling, linting and the unit tests; it
-  cannot run the integration or cluster suites, and says so.
 
 ## [0.2.0-alpha] - 2026-08-24
 

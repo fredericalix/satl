@@ -1382,7 +1382,7 @@ consensus engine -- the reason it is not optional.
       to. Fixed on both sides, in `satl` and in `satl-website-v2`; see the
       decision log.
 
-### Phase 9: localhost access to published ports (#35)
+### Phase 9: localhost access to published ports (#35) ✅ (shipped as 0.2.1)
 
 The 2026-08-25 decision-log entry measured the whole mechanism on alpha
 (`hack/experiments/lo0rdr/`): the old #35 explanation was wrong -- pf's `rdr`
