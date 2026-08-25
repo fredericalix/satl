@@ -217,7 +217,7 @@ impl GatewayAttachment {
 
 /// A network the node must program, with its endpoint table.
 ///
-/// This is the CBOR payload of `satl.internal.v1.NetworkAssignment`. Endpoints
+/// This is the CBOR payload of `satl.internal.v2.NetworkAssignment`. Endpoints
 /// are kept keyed by task ID so the encoding is canonical: two reads of the
 /// same store state produce equal values, which is what lets
 /// [`AssignmentTracker::observe_network`] suppress no-op updates by comparison.

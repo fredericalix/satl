@@ -44,7 +44,7 @@ Install it on any FreeBSD 15 amd64 host with:
 
 ```sh
 sha512sum -c CHECKSUM.SHA512    # both files in the same directory
-pkg add ./satl-0.1.0.pkg
+pkg add ./satl-0.2.0.pkg
 ```
 
 `pkg add` needs no configured repository. If one is configured (the
@@ -77,7 +77,7 @@ forced past them.
 
 ```sh
 sha512sum -c CHECKSUM.SHA512
-sudo pkg add -f ./satl-0.1.0.pkg    # -f: same version, newer build
+sudo pkg add -f ./satl-0.2.0.pkg    # -f: same version, newer build
 sudo service satld restart
 ```
 
@@ -681,7 +681,10 @@ grep -a "raft engine has stopped" /var/log/messages
 The reason is the line above it (seen once here:
 `quit RaftCore::main on error error=when Read Snapshot(None): replication channel
 closed`, an openraft 0.9 race between a replication task exiting and the core
-handing it a snapshot). The cure is a restart of that daemon; the other managers
+handing it a snapshot). **Observed on openraft 0.9**, which SatL left in M12 for
+0.10; whether the race survives the upgrade has not been measured either way, so
+treat the symptom below as the thing to recognise and the version as a detail
+that may no longer hold. The cure is a restart of that daemon; the other managers
 elect around it as long as a quorum of them is left, and this one simply stops
 contributing.
 

@@ -303,6 +303,31 @@ mod tests {
         assert!(db.dir().is_dir());
     }
 
+    /// An unreadable task db must be an error, never an empty list.
+    ///
+    /// Every caller in `satld::reconcile` turns this into a *claim set* and
+    /// destroys whatever the set does not name -- jails, mounts, datasets,
+    /// epairs, and the whole `satl/rdr` anchor. `Ok(vec![])` from a db that
+    /// could not be read told startup reconciliation that every running
+    /// container on the node was an orphan.
+    #[tokio::test]
+    async fn listing_an_unreadable_db_is_an_error_not_an_empty_list() {
+        let (dir, db) = db();
+        db.put(&TaskRecord {
+            task: testing::task(),
+            status: TaskStatus::new(TaskState::Running, "started"),
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.list().await.unwrap().len(), 1);
+
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert!(
+            db.list().await.is_err(),
+            "a vanished task db must not read as a node with no tasks"
+        );
+    }
+
     #[tokio::test]
     async fn roundtrip_preserves_the_task_and_the_status() {
         let (_dir, db) = db();

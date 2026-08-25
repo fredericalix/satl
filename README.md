@@ -68,9 +68,15 @@ make build            # debug build of satl + satld
 make release          # release build into target/release
 sudo make install     # binaries + rc.d script + sample config
 make package          # dist/satl-<version>.pkg + dist/CHECKSUM.SHA512,
-                      # installable anywhere with `pkg add ./satl-0.1.0.pkg`
+                      # installable anywhere with `pkg add ./satl-0.2.0.pkg`
                       # (no repository needed)
 ```
+
+The package is built locally and is **not signed**, there is no pkg repository
+to point `pkg install` at, and SatL is not in the FreeBSD ports tree. Verify a
+package you did not build yourself against `dist/CHECKSUM.SHA512`. Publishing a
+signed repository and submitting a port are both out of scope until the API and
+the on-disk layout stop moving.
 
 Then, on the host (details in [docs/operations.md](docs/operations.md)):
 
@@ -91,13 +97,17 @@ make cluster-test     # the 3-node scenario suite (tests/cluster/)
 
 `make check` must be green before any commit.
 
-**There is no CI.** Opening a pull request here runs nothing, no GitHub Actions,
-no checks tab. `make check` on a FreeBSD 15.1 host is the only gate, and running
-it is the contributor's job: paste its output in the pull request. Networking,
-runtime and storage changes also need `sudo make integration`, and cluster
-behaviour needs `make cluster-test`. The reason is the platform, the build and
-the tests need FreeBSD 15.1 with ZFS, jails, pf and `ocijail`, which no hosted
-runner offers.
+**CI runs `make check` on FreeBSD, and that is all it can run.** A pull request
+gets one gate, on Cirrus (`.cirrus.yml`) — GitHub's runners have no FreeBSD
+image, so the workspace would not even compile there. What CI *cannot* run is
+the other two suites: `sudo make integration` needs real jails, ZFS datasets,
+pf anchors and `ocijail` on the machine, and `make cluster-test` needs three
+networked FreeBSD hosts. Those stay the contributor's and the maintainer's job.
+A green tick therefore means "this compiles, lints and passes the unit tests on
+FreeBSD", not "this works".
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for which suite a change is expected to
+have run, the eight invariants, and the definition of done.
 
 Release history is in [CHANGELOG.md](CHANGELOG.md). The design rationale lives in
 [docs/architecture.md](docs/architecture.md), the Docker API deviations are

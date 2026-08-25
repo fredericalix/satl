@@ -10,6 +10,60 @@ a `pkg(8)` version is read as the name/version separator.
 
 ## [Unreleased]
 
+Launch-readiness work (M12). Two cluster defects that kept `make cluster-test`
+red are fixed and measured on the 3-node testbed; the suite's own reliability
+was the third defect, and the larger one.
+
+### Fixed
+
+- **`satl node demote` on the *current* raft leader completes.** It used to
+  retry for ever: openraft 0.9 had no leadership-transfer call, and the
+  stand-in waited for a follower to campaign on its own -- which cannot happen
+  while the leader keeps replicating, because every AppendEntries refreshes the
+  follower's lease. Measured on the testbed: the whole call takes 294 ms and
+  the handover 14 ms, where the old code logged ten attempts and zero
+  handovers.
+- **A demotion now writes the node's role, not just its raft membership.** The
+  departing node used to write it from its own store -- which stops moving the
+  moment it leaves consensus, so the write lost the optimistic-concurrency
+  check for ever and left the node out of consensus with its manager role
+  intact. The leader does it now, in the same breath as the membership change.
+- **An unreadable local task database no longer reads as "this node runs
+  nothing".** `satld`'s startup reconciliation derives its claim set from it and
+  destroys whatever the set does not name, so a transient read failure could
+  take out every running container's jail, mounts, dataset and epair on that
+  node. The sweeps now skip the pass instead.
+- **The published-port anchor is re-derived immediately on a role change**
+  rather than up to a minute later, and a pass that computes an empty set says
+  so, so an absent `satl/rdr` can be told apart from a dead sweep.
+- **`satl --version`'s build time is the build's.** The build script tracked
+  only `.git/HEAD`, which opted it out of cargo's default file tracking, so a
+  rebuilt binary carried the previous build's timestamp.
+- **The overlay error on a host with no measurable underlay says what it is.**
+  A public `/32` is a deliberate degradation -- bridge networks and
+  `satl compose` work, overlays and `satl stack` do not -- and it used to
+  report "a start-up ordering bug in satld", sending the reader after a race
+  that does not exist.
+
+### Changed
+
+- **openraft 0.9.25 -> 0.10.0-alpha.34.** The upgrade is what makes a real
+  leadership handover possible. The internal gRPC protocol moves to
+  `satl.internal.v2` with it, non-additively: the chunked `InstallSnapshot`
+  becomes a streamed `FullSnapshot`, and `TransferLeader` is new. **A v1 node
+  and a v2 node cannot talk**, deliberately and at the transport level rather
+  than deep inside raft, so upgrade every manager together.
+- **`satl swarm init --force-new-cluster` is refused by the CLI**, in the
+  daemon's own words, instead of costing a round trip to learn that the flag
+  answers `501` permanently. The two recovery procedures are in the message and
+  in the operations guide.
+
+### Added
+
+- `CONTRIBUTING.md`, and CI (`.cirrus.yml`) running `make check` on FreeBSD for
+  every pull request. The tick covers compiling, linting and the unit tests; it
+  cannot run the integration or cluster suites, and says so.
+
 ## [0.2.0-alpha] - 2026-08-24
 
 Docker's two worlds, both of them. `satl compose` now runs a Compose file on the

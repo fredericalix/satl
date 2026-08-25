@@ -8,24 +8,54 @@
 //! variable is simply not emitted and `option_env!` falls back to
 //! `"unknown"`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
-    let git_head = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.git/HEAD");
+    // Emitting ANY `cargo:rerun-if-changed` opts this script out of cargo's
+    // default "re-run when any file in the package changed". Narrowing it to
+    // `.git/HEAD` alone is what made `satl --version` lie: a source change
+    // rebuilt the binary without re-running this script, so the new binary
+    // carried the previous build's timestamp. Observed as a binary rebuilt at
+    // 07:38 reporting `Built: 2026-08-23T11:35:34Z`, and it cost real time --
+    // the deployment looked like it had not happened.
+    //
+    // Three signals, each covering one way the answer can go stale:
+    //   * the crate's own sources — a rebuilt binary gets a fresh timestamp;
+    //   * `.git/HEAD` — a branch switch or a detached checkout;
+    //   * the ref `.git/HEAD` points at — a commit on the current branch,
+    //     which does not touch `HEAD` itself.
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
 
+    let git_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.git");
+    let git_head = git_dir.join("HEAD");
     if git_head.exists() {
-        // Rebuild on branch switches / checkouts; commits on the current
-        // branch do not touch `.git/HEAD` itself, but tracking the ref file
-        // too would rebuild on every commit — this is the standard trade-off.
         println!("cargo:rerun-if-changed={}", git_head.display());
+        if let Some(ref_path) = head_ref_path(&git_dir, &git_head) {
+            // Absent on a branch whose ref lives in `packed-refs` (a fresh
+            // clone), where `HEAD` moving is the only signal there is.
+            if ref_path.exists() {
+                println!("cargo:rerun-if-changed={}", ref_path.display());
+            }
+        }
         if let Some(commit) = git_commit() {
             println!("cargo:rustc-env=SATL_GIT_COMMIT={commit}");
         }
     }
 
     println!("cargo:rustc-env=SATL_BUILD_TIME={}", utc_now());
+}
+
+/// The file `.git/HEAD` points at, for a HEAD on a branch.
+///
+/// `None` for a detached HEAD, where `HEAD` holds the sha itself and is
+/// already tracked.
+fn head_ref_path(git_dir: &Path, git_head: &Path) -> Option<PathBuf> {
+    let head = std::fs::read_to_string(git_head).ok()?;
+    let reference = head.trim().strip_prefix("ref:")?.trim();
+    Some(git_dir.join(reference))
 }
 
 /// `git rev-parse --short HEAD`, or `None` when git is missing or unhappy.

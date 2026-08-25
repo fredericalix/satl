@@ -11,10 +11,10 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openraft::error::{InitializeError, RaftError};
-use openraft::{BasicNode, Raft, ServerState, SnapshotPolicy};
+use openraft::{BasicNode, ServerState, SnapshotPolicy};
 use rand::RngExt;
 
 use satl_core::defaults::{MAX_TX_BYTES, RAFT_SLOW_FOLLOWER_ENTRIES, RAFT_SNAPSHOT_INTERVAL};
@@ -26,12 +26,12 @@ use satl_core::{
 
 use satl_ca::LiveIdentity;
 use satl_proto::MAX_MESSAGE_SIZE;
-use satl_proto::v1::control_client::ControlClient;
+use satl_proto::v2::control_client::ControlClient;
 
 use crate::crypto::{DEK_FILE, Dek, DekError};
 use crate::forward::{LeaderClient, leader_addr_from_status};
 use crate::fs_util::atomic_write;
-use crate::log_store::{LOG_FILE_NAME, LogStore, LogStoreError};
+use crate::log_store::{LOG_FILE_NAME, LogStore, LogStoreError, LogStoreRelease};
 use crate::server::{
     Authorizer, DEFAULT_PORT, HEALTH_SERVICE_CONTROL, HEALTH_SERVICE_RAFT, HealthRegistry,
     ManagerContext, ManagerSlot, ServerBuilder, ServerError, ServerHandle,
@@ -39,7 +39,9 @@ use crate::server::{
 use crate::state_machine::{SNAPSHOT_FILE_NAME, StateMachine, StateMachineError};
 use crate::store::{ClusterStore, ProposeError};
 use crate::transport::{PeerChannels, RaftTransport, TransportError};
-use crate::types::TypeConfig;
+use openraft::async_runtime::watch::WatchReceiver;
+
+use crate::types::Raft;
 
 /// Filename of the persisted SatL node ID inside the raft directory.
 const NODE_ID_FILE: &str = "node-id";
@@ -391,13 +393,16 @@ impl RaftNodeConfig {
 /// A running Raft node. Dropping it does not stop Raft — call
 /// [`RaftNode::shutdown`].
 pub struct RaftNode {
-    raft: Raft<TypeConfig>,
+    raft: Raft,
     node_id: Id,
     raft_id: u64,
     /// The DEK this node's storage was opened with (see
     /// [`RaftNodeConfig::dek`]).
     dek: Dek,
     role_watcher: tokio::task::JoinHandle<()>,
+    /// Reports when redb has released the log database file; see
+    /// [`LogStoreRelease`] and [`RaftNode::shutdown`].
+    log_release: LogStoreRelease,
     manager: ManagerSlot,
     health: HealthRegistry,
     server: Option<ServerHandle>,
@@ -475,7 +480,7 @@ impl RaftNode {
         let event_sender = state_machine.event_sender();
 
         let transport = build_transport(raft_id, cfg.identity.as_ref())?;
-        let raft = start_raft(
+        let (raft, log_release) = start_raft(
             raft_id,
             cfg.timing,
             transport.clone(),
@@ -487,16 +492,15 @@ impl RaftNode {
         let store = ClusterStore::new(store_handle, event_sender, raft.clone());
 
         let manager = ManagerSlot::new();
-        manager.install(ManagerContext {
-            raft: raft.clone(),
-            store: store.clone(),
-            node_id: node_id.clone(),
+        manager.install(manager_context(
+            &raft,
+            &store,
+            &node_id,
             raft_id,
-            advertise_addr: peer_addr.clone(),
-            liveness: transport.liveness(),
-            liveness_window: cfg.timing.liveness_window(),
-            channels: transport.channels(),
-        });
+            peer_addr.clone(),
+            &transport,
+            cfg.timing,
+        ));
 
         let ServerParts {
             server,
@@ -561,6 +565,7 @@ impl RaftNode {
             raft_id,
             dek,
             role_watcher,
+            log_release,
             manager,
             health,
             server,
@@ -676,7 +681,7 @@ impl RaftNode {
         let store_handle = state_machine.store_handle();
         let event_sender = state_machine.event_sender();
         let transport = RaftTransport::with_channels(raft_id, channels.clone());
-        let raft = start_raft(
+        let (raft, log_release) = start_raft(
             raft_id,
             cfg.timing,
             transport.clone(),
@@ -690,16 +695,9 @@ impl RaftNode {
             authorizer.attach_store(store.clone());
         }
 
-        manager.install(ManagerContext {
-            raft: raft.clone(),
-            store: store.clone(),
-            node_id: node_id.clone(),
-            raft_id,
-            advertise_addr: peer_addr,
-            liveness: transport.liveness(),
-            liveness_window: cfg.timing.liveness_window(),
-            channels: Some(channels),
-        });
+        manager.install(manager_context(
+            &raft, &store, &node_id, raft_id, peer_addr, &transport, cfg.timing,
+        ));
         health.set_serving(HEALTH_SERVICE_CONTROL);
 
         let node = RaftNode {
@@ -708,6 +706,7 @@ impl RaftNode {
             raft_id,
             dek,
             role_watcher,
+            log_release,
             manager,
             health,
             server,
@@ -789,7 +788,7 @@ impl RaftNode {
         let recorded = self
             .raft
             .metrics()
-            .borrow()
+            .borrow_watched()
             .membership_config
             .membership()
             .get_node(&self.raft_id)
@@ -817,7 +816,7 @@ impl RaftNode {
     /// Whether this node currently leads the cluster.
     #[must_use]
     pub fn is_leader(&self) -> bool {
-        let metrics = self.raft.metrics().borrow().clone();
+        let metrics = self.raft.metrics().borrow_watched().clone();
         metrics.current_leader == Some(self.raft_id)
     }
 
@@ -833,11 +832,75 @@ impl RaftNode {
         // Abort the watcher *first*: it reports a closed metrics channel as an
         // engine that died, and a deliberate shutdown closes that channel too.
         self.role_watcher.abort();
-        let result = self.raft.shutdown().await;
-        result.map_err(|e| NodeError::Raft {
-            op: "shutdown",
-            message: e.to_string(),
-        })
+        // Bounded: `Raft::shutdown()` joins openraft's core task, and a core
+        // still trying to reach unreachable peers has been measured not to
+        // return at all. Everything after this point -- releasing the log
+        // file, stopping the task managers, removing the REST socket -- is
+        // worth doing even when the raft core will not stop, so this must not
+        // be the thing that blocks it (decision log, 2026-08-25).
+        if let Ok(result) = tokio::time::timeout(RAFT_SHUTDOWN_TIMEOUT, self.raft.shutdown()).await
+        {
+            result.map_err(|e| NodeError::Raft {
+                op: "shutdown",
+                message: e.to_string(),
+            })?;
+        } else {
+            tracing::warn!(
+                raft_id = self.raft_id,
+                timeout_s = RAFT_SHUTDOWN_TIMEOUT.as_secs(),
+                "the raft core did not stop within its budget; carrying on with the rest of the \
+                 shutdown. Its threads go away with the process"
+            );
+        }
+        await_log_release(&self.log_release).await;
+        Ok(())
+    }
+}
+
+/// How long [`RaftNode::shutdown`] waits for openraft's core to stop.
+///
+/// Shorter than the daemon's own stop budget, so this reports the raft core
+/// as the culprit *before* the outer bound fires and can only say that
+/// something did not stop.
+const RAFT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`RaftNode::shutdown`] waits for redb to release the log file.
+///
+/// Generous on purpose: the alternative to waiting is a caller that re-opens
+/// the directory and fails with `DatabaseAlreadyOpen`, and every millisecond
+/// here is one a role change was going to spend rebuilding anyway.
+const LOG_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the release is re-checked. Short: the tasks holding a clone are
+/// already finishing when we start looking.
+const LOG_RELEASE_POLL: Duration = Duration::from_millis(10);
+
+/// Waits until every [`LogStore`] clone is dropped and the database file can
+/// be opened again.
+///
+/// `Raft::shutdown()` joins openraft's core task, but its state-machine worker
+/// and replication tasks hold `LogStore` clones of their own and are not part
+/// of that join, so it can return while redb still holds the file. Measured
+/// against openraft 0.10.0-alpha.34: `crates/satl-cluster/tests/autolock.rs`
+/// fails with `DatabaseAlreadyOpen` without this wait and passes with it.
+///
+/// A timeout is logged, not returned: shutdown has done everything it can,
+/// and turning "the file is still held" into a shutdown error would make a
+/// caller that does not care about re-opening fail for no reason. The caller
+/// that does care gets a clear message in the log naming the file.
+async fn await_log_release(release: &LogStoreRelease) {
+    let deadline = Instant::now() + LOG_RELEASE_TIMEOUT;
+    while !release.released() {
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                path = %release.path().display(),
+                timeout_s = LOG_RELEASE_TIMEOUT.as_secs(),
+                "the raft log database is still open after shutdown; re-opening this directory \
+                 will fail until the last reader goes away"
+            );
+            return;
+        }
+        tokio::time::sleep(LOG_RELEASE_POLL).await;
     }
 }
 
@@ -946,6 +1009,37 @@ fn build_transport(
     }
 }
 
+/// Builds the [`ManagerContext`] both bring-up paths install.
+///
+/// One function rather than two identical literals: the bootstrap path and
+/// the join path differ only in where the channel pool comes from, and every field
+/// added to `ManagerContext` had to be added to both -- which is how one of
+/// them ends up missing it.
+fn manager_context(
+    raft: &Raft,
+    store: &ClusterStore,
+    node_id: &Id,
+    raft_id: u64,
+    advertise_addr: String,
+    transport: &RaftTransport,
+    timing: RaftTiming,
+) -> ManagerContext {
+    ManagerContext {
+        raft: raft.clone(),
+        store: store.clone(),
+        node_id: node_id.clone(),
+        raft_id,
+        advertise_addr,
+        liveness: transport.liveness(),
+        eviction: transport.eviction(),
+        liveness_window: timing.liveness_window(),
+        // Always the transport's own pool. The join path used to pass its
+        // `channels` separately, which is the same object it built the
+        // transport from -- a divergence with nothing behind it.
+        channels: transport.channels(),
+    }
+}
+
 /// Starts openraft with SatL's configuration.
 ///
 /// The tick model mirrors SwarmKit's (SWK §22, architecture §15:
@@ -958,7 +1052,7 @@ async fn start_raft(
     transport: RaftTransport,
     log_store: LogStore,
     state_machine: StateMachine,
-) -> Result<Raft<TypeConfig>, NodeError> {
+) -> Result<(Raft, LogStoreRelease), NodeError> {
     let config = openraft::Config {
         cluster_name: "satl".to_owned(),
         heartbeat_interval: timing.heartbeat_interval_ms,
@@ -975,12 +1069,17 @@ async fn start_raft(
             .validate()
             .map_err(|source| NodeError::Config { source })?,
     );
-    Raft::<TypeConfig>::new(raft_id, config, transport, log_store, state_machine)
+    // Taken before the store moves into openraft: from here on, every clone
+    // belongs to openraft's tasks and only this handle can tell when the last
+    // of them is gone (see `RaftNode::shutdown`).
+    let release = log_store.release_watch();
+    let raft = Raft::new(raft_id, config, transport, log_store, state_machine)
         .await
         .map_err(|e| NodeError::Raft {
             op: "start",
             message: e.to_string(),
-        })
+        })?;
+    Ok((raft, release))
 }
 
 /// What [`start_server`] hands back.
@@ -1021,8 +1120,8 @@ where
 }
 
 /// Whether this node is the only voter in the configuration it starts with.
-fn is_sole_voter(raft: &Raft<TypeConfig>, raft_id: u64) -> bool {
-    let metrics = raft.metrics().borrow().clone();
+fn is_sole_voter(raft: &Raft, raft_id: u64) -> bool {
+    let metrics = raft.metrics().borrow_watched().clone();
     let voters: Vec<u64> = metrics.membership_config.voter_ids().collect();
     voters.is_empty() || voters == vec![raft_id]
 }
@@ -1100,7 +1199,7 @@ async fn join_cluster(
     remote_addr: &str,
     node_id: &Id,
     advertise_addr: &str,
-) -> Result<satl_proto::v1::JoinRaftResponse, NodeError> {
+) -> Result<satl_proto::v2::JoinRaftResponse, NodeError> {
     let mut addr = remote_addr.to_owned();
     for attempt in 1..=2 {
         let channel = channels.channel(&addr).map_err(|source| NodeError::Join {
@@ -1110,7 +1209,7 @@ async fn join_cluster(
         let mut client = ControlClient::new(channel)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_MESSAGE_SIZE);
-        let request = satl_proto::v1::JoinRaftRequest {
+        let request = satl_proto::v2::JoinRaftRequest {
             node_id: node_id.to_string(),
             addr: advertise_addr.to_owned(),
         };
@@ -1268,11 +1367,11 @@ fn load_or_create_raft_id(raft_dir: &std::path::Path) -> Result<u64, NodeError> 
 
 /// Watches the metrics stream and logs Raft role transitions with
 /// structured fields (CLAUDE.md observability rule).
-fn spawn_role_watcher(raft: &Raft<TypeConfig>) -> tokio::task::JoinHandle<()> {
+fn spawn_role_watcher(raft: &Raft) -> tokio::task::JoinHandle<()> {
     let mut rx = raft.metrics();
     tokio::spawn(async move {
         let (mut last_state, mut last_leader) = {
-            let m = rx.borrow();
+            let m = rx.borrow_watched();
             (m.state, m.current_leader)
         };
         loop {
@@ -1296,7 +1395,7 @@ fn spawn_role_watcher(raft: &Raft<TypeConfig>) -> tokio::task::JoinHandle<()> {
                 return;
             }
             let (id, state, leader, term) = {
-                let m = rx.borrow();
+                let m = rx.borrow_watched();
                 (m.id, m.state, m.current_leader, m.current_term)
             };
             if state == last_state && leader == last_leader {
@@ -1329,11 +1428,11 @@ fn spawn_role_watcher(raft: &Raft<TypeConfig>) -> tokio::task::JoinHandle<()> {
 }
 
 /// Awaits this node becoming leader, bounded by [`LEADERSHIP_TIMEOUT`].
-async fn wait_for_leadership(raft: &Raft<TypeConfig>) -> Result<(), NodeError> {
+async fn wait_for_leadership(raft: &Raft) -> Result<(), NodeError> {
     let mut rx = raft.metrics();
     let wait = async {
         loop {
-            let is_leader = { rx.borrow().state == ServerState::Leader };
+            let is_leader = { rx.borrow_watched().state == ServerState::Leader };
             if is_leader {
                 return Ok(());
             }

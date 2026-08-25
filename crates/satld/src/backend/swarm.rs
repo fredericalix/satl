@@ -209,7 +209,12 @@ impl DaemonBackend {
             }
             if members.len() > 1
                 && let Some(ctx) = manager.membership.get()
-                && let Err(error) = satl_cluster::membership::remove_member(&ctx, ctx.raft_id).await
+                && let Err(error) = satl_cluster::membership::remove_member(
+                    &ctx,
+                    ctx.raft_id,
+                    satl_cluster::membership::Departing::LeavesConsensus,
+                )
+                .await
             {
                 tracing::warn!(%error, "leaving consensus before a forced leave failed");
             }

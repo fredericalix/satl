@@ -840,7 +840,34 @@ async fn generated_rulesets_pass_real_pfctl() {
         },
     ]));
     assert!(pool.contains("round-robin"), "{pool}");
-    for rules in [nat, rdr, pool] {
+    // The mesh half, which nothing checked against a real pfctl until M12.
+    // `rdr_rules` and `nat_rules` were covered and `mesh_rules` was not, so an
+    // ordering or grammar mistake in the two productions only it emits -- a
+    // table-sourced `nat pass` and a `match out ... scrub (max-mss n)` -- could
+    // only be found on the cluster, where it looks like a data-plane bug rather
+    // than a ruleset that pf refused.
+    let mesh_egress = satl_net::MeshEgress {
+        gateway: "10.100.0.2".parse().unwrap(),
+        bridge: "satl-br4096".to_owned(),
+        subnet: "10.100.0.0/24".parse().unwrap(),
+        max_mss: 1410,
+    };
+    let publishes = satl_net::pool_publishes(&[PortPublish {
+        proto: satl_core::PortProtocol::Tcp,
+        host_port: 18080,
+        task_ip: "10.88.0.2".parse().unwrap(),
+        task_port: 80,
+    }]);
+    let mesh = satl_net::mesh_rules(&mesh_egress, &publishes);
+    assert!(mesh.contains("nat pass"), "{mesh}");
+    assert!(mesh.contains("max-mss 1410"), "{mesh}");
+
+    // The rdr rules and the mesh rules share one anchor and are loaded as one
+    // text, so the concatenation is what pf actually parses -- checking the
+    // halves separately would miss an ordering rule between them.
+    let combined = format!("{}{mesh}", satl_net::rdr_rules(&publishes));
+
+    for rules in [nat, rdr, pool, mesh, combined] {
         match pf.check_syntax(&rules).await {
             Ok(()) => {}
             Err(PfError::Unavailable { .. }) => {

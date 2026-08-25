@@ -8,8 +8,6 @@
 //! entry, runs the same deterministic validation, and computes the same
 //! outcome, so the replicated state never diverges.
 
-use std::io::Cursor;
-
 use serde::{Deserialize, Serialize};
 
 use satl_core::{Id, ObjectKind, StoreAction, Version};
@@ -20,14 +18,32 @@ openraft::declare_raft_types!(
     /// - `NodeId` is a random, never-reused `u64` (architecture §6.6).
     /// - `Node` is [`openraft::BasicNode`]: the addr carries the node name at
     ///   M0 and the Raft transport address from M2 on.
-    /// - `SnapshotData` is the default `Cursor<Vec<u8>>`: snapshots are one
-    ///   sealed CBOR blob (see `state_machine`).
+    /// - `ErrorSource` is [`openraft::AnyError`] rather than openraft 0.10's
+    ///   `BoxedErrorSource` default: every storage error in this crate is
+    ///   built with the file name and the failing operation already in its
+    ///   message (`log_store::db_err`, `state_machine`), and `AnyError`
+    ///   carries that string without a heap indirection per error.
+    ///
+    /// Everything else — `Term`, `LeaderId`, `Vote`, `Entry`, `Responder`,
+    /// `Batch`, `AsyncRuntime` — takes the macro's default. `SnapshotData` is
+    /// no longer a type-config item: openraft 0.10 moved it onto
+    /// [`openraft::storage::RaftStateMachine`], where SatL sets it to
+    /// `Cursor<Vec<u8>>` (snapshots are one sealed CBOR blob, see
+    /// `state_machine`).
     pub TypeConfig:
         D = Proposal,
         R = ProposalResponse,
         NodeId = u64,
         Node = openraft::BasicNode,
+        ErrorSource = openraft::AnyError,
 );
+
+/// The `Raft` handle as this workspace instantiates it.
+///
+/// openraft 0.10 made the state machine a second type parameter of `Raft`
+/// (`Raft<C, SM = ()>`), so that a full snapshot can be typed without passing
+/// through the message channel. Every Raft in SatL is this one.
+pub type Raft = openraft::Raft<TypeConfig, crate::state_machine::StateMachine>;
 
 /// One store transaction submitted through Raft (architecture §6.1).
 ///
@@ -38,6 +54,28 @@ openraft::declare_raft_types!(
 pub struct Proposal {
     /// The actions of this transaction, applied in order, all-or-nothing.
     pub actions: Vec<StoreAction>,
+}
+
+/// openraft 0.10 added `Display` to the `AppData` bound, so every proposal
+/// can end up rendered into a log line by the engine itself.
+///
+/// **Invariant #7 governs what this may say.** A proposal can carry a
+/// `Secret`, so the rendering names the verb, the kind and the ID of each
+/// action and nothing else — never a payload, never a spec. It is the same
+/// rule the rejection messages below follow.
+impl std::fmt::Display for Proposal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tx[{}]", self.actions.len())?;
+        for (n, action) in self.actions.iter().enumerate() {
+            let sep = if n == 0 { ' ' } else { ',' };
+            match action {
+                StoreAction::Create(o) => write!(f, "{sep}create {} {}", o.kind(), o.id())?,
+                StoreAction::Update(o) => write!(f, "{sep}update {} {}", o.kind(), o.id())?,
+                StoreAction::Remove { kind, id } => write!(f, "{sep}remove {kind} {id}")?,
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Deterministic outcome of applying a [`Proposal`].

@@ -45,15 +45,36 @@
 //   * VERSION SKEW IS SERDE SKEW. Payload compatibility is governed by serde
 //     rules (add fields with `#[serde(default)]`, never repurpose a name), not
 //     by protobuf field numbers. Mixed-version clusters are only supported
-//     within one `satl.internal.v1` package version.
+//     within one `satl.internal.v2` package version.
 //
 // Rule for the whole package: EVERY `bytes payload` / `bytes …` field in
-// `satl.internal.v1` is `ciborium` CBOR of the Rust type named in its comment.
-// Changing that codec is a breaking change and requires `satl.internal.v2`.
+// `satl.internal.v2` is `ciborium` CBOR of the Rust type named in its comment.
+// Changing that codec is a breaking change and requires `satl.internal.v3`.
 
 syntax = "proto3";
 
-package satl.internal.v1;
+// ---------------------------------------------------------------------------
+// WHY THE PACKAGE IS v2
+// ---------------------------------------------------------------------------
+//
+// openraft 0.10 replaced the chunked `InstallSnapshot` RPC with a single
+// `full_snapshot` call whose fragmentation the transport owns, and added
+// `TransferLeader`. Neither change is additive, and CLAUDE.md's wire rule is
+// that anything non-additive means a new package version.
+//
+// The bump moves EVERY service, not only `Raft`, even though `Dispatcher`,
+// `NodeCA` and `Control` are unchanged. That is deliberate: the gRPC service
+// path carries the package name, so a v1 node and a v2 node now fail to find
+// each other's methods at all rather than agreeing on the dispatcher, the CA
+// and the control plane and then failing deep inside raft with a decode error.
+// A half-speaking pair is the harder failure to diagnose, and a mixed cluster
+// is broken either way.
+//
+// There is no compatibility promise to keep here: this protocol is
+// node-to-node only, inside one workspace (invariant #8), and no fleet is
+// deployed on v1.
+
+package satl.internal.v2;
 
 import "google/protobuf/timestamp.proto";
 

@@ -51,10 +51,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
-use openraft::{BasicNode, ChangeMembers, Raft};
+use openraft::{BasicNode, ChangeMembers};
 use rand::RngExt;
 use tonic::{Request, Response, Status};
 
@@ -67,8 +67,8 @@ use satl_proto::MAX_MESSAGE_SIZE;
 use satl_proto::health::HealthCheckRequest;
 use satl_proto::health::health_check_response::ServingStatus;
 use satl_proto::health::health_client::HealthClient;
-use satl_proto::v1::control_server::Control;
-use satl_proto::v1::{self as pb};
+use satl_proto::v2::control_server::Control;
+use satl_proto::v2::{self as pb};
 
 use crate::forward;
 use crate::server::{
@@ -76,7 +76,10 @@ use crate::server::{
 };
 use crate::store::{ClusterStore, RaftMember};
 use crate::transport::{HEALTH_CHECK_BUDGET, PeerLiveness};
-use crate::types::TypeConfig;
+use openraft::async_runtime::watch::WatchReceiver;
+
+use crate::store::ProposeError;
+use crate::types::{ProposalRejection, Raft};
 
 /// The role the `Control` service's interceptor enforces.
 ///
@@ -93,10 +96,26 @@ pub const CONTROL_ROLE: RoleRequirement = RoleRequirement::WorkerOrManager;
 /// health-checked. Bounds the RPC — openraft's own waits are unbounded.
 const MEMBERSHIP_CHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long [`yield_leadership`] waits for another manager to take over
-/// before giving up. Three election timeouts (architecture §15: 10 s), so a
-/// single lost election round does not fail the operation.
-const LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(35);
+/// How long [`yield_leadership`] waits for the target to take over.
+///
+/// openraft 0.10's `transfer_leader` broadcasts a request that **disarms the
+/// leader lease** for the designated node, so the handover costs one broadcast
+/// plus one election round -- not the `leader_lease + election_timeout`
+/// (30-40 s at architecture §15's timings) that a node waiting for a
+/// spontaneous election has to pay. The budget is generous against that, so a
+/// single lost round still fits, and small enough that an operator waiting on
+/// `satl node demote` is not left guessing.
+const LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the leader keeps re-reading and retrying a departing node's
+/// object ([`finish_departure`]).
+///
+/// The object is contended right after a leadership handover (the new leader
+/// writes its own manager status, description refreshes land), so a sequence
+/// conflict is the expected first outcome, not an error. Long enough to
+/// outlast that burst, short enough that a genuinely stuck write still
+/// answers the operator.
+const DEPARTURE_WRITE_BUDGET: Duration = Duration::from_secs(10);
 
 /// How long the leader keeps trying to promote a freshly admitted learner
 /// before giving up and logging loudly.
@@ -131,10 +150,24 @@ pub enum MembershipError {
         leader_addr: Option<String>,
     },
     /// Removing this member would cost the cluster its quorum.
+    ///
+    /// "Reachable" here means **answered an outgoing raft RPC inside the
+    /// liveness window** (`RaftTiming::liveness_window`, one election
+    /// timeout), which is not the same as "up". A manager that has just won an
+    /// election, or whose connection was re-established a moment ago, has not
+    /// answered *this* node yet and counts as unreachable until it does. The
+    /// message says so, because the alternative -- "only 1 of 2 members are
+    /// reachable" on a cluster every `satl node ls` shows healthy -- sends an
+    /// operator hunting a network fault that is not there. Measured: a demote
+    /// refused this way succeeded a minute later, unchanged, on the same idle
+    /// cluster.
     #[error(
         "refusing to remove raft member {raft_id}: only {reachable} of the remaining {remaining} \
-         members are reachable, and {needed} are needed for quorum. Bring the unreachable \
-         managers back or force-remove them one at a time"
+         members have answered this node within the liveness window, and {needed} are needed \
+         for quorum. If the other managers are up and `satl node ls` shows them Reachable, this \
+         is transient -- they have not answered a raft RPC here *yet* -- and the same command \
+         succeeds shortly after. If they are genuinely down, bring them back or force-remove \
+         them one at a time"
     )]
     QuorumWouldBreak {
         /// The member that was to be removed.
@@ -643,7 +676,7 @@ fn spawn_promotion(ctx: ManagerContext, raft_id: u64) {
 fn learner_is_replicating(ctx: &ManagerContext, raft_id: u64) -> bool {
     ctx.raft
         .metrics()
-        .borrow()
+        .borrow_watched()
         .replication
         .as_ref()
         .and_then(|progress| progress.get(&raft_id).copied())
@@ -665,12 +698,20 @@ fn learner_is_replicating(ctx: &ManagerContext, raft_id: u64) -> bool {
 /// departing leader cannot reliably observe its own removal commit
 /// (SWK §11.5) — and then forwards to whoever won, so the caller gets the
 /// removal, not a "retry elsewhere".
+///
+/// SWK §11.5 transfers to the *longest-active* peer. [`yield_leadership`]
+/// picks the *most caught-up* one instead, because openraft's
+/// `TransferLeaderRequest` names a `last_log_id` the target must have reached
+/// before it may campaign: a long-lived but lagging peer would be handed a
+/// request it cannot act on. Liveness still gates the removal itself, through
+/// `can_remove_member`'s quorum check.
 pub async fn remove_member(
     ctx: &ManagerContext,
     raft_id: u64,
+    departing: Departing,
 ) -> Result<Vec<RaftMember>, MembershipError> {
     if !ctx.store.metrics().is_leader {
-        return remove_member_via_leader(ctx, raft_id).await;
+        return remove_member_via_leader(ctx, raft_id, departing).await;
     }
     let members = ctx.store.raft_members();
     let Some(target) = members.iter().find(|m| m.raft_id == raft_id) else {
@@ -695,7 +736,7 @@ pub async fn remove_member(
             "asked to remove the current leader; handing leadership over first"
         );
         yield_leadership(&ctx.raft).await?;
-        return remove_member_via_leader(ctx, raft_id).await;
+        return remove_member_via_leader(ctx, raft_id, departing).await;
     }
 
     // Two steps, because openraft models "stop voting" and "leave the
@@ -735,7 +776,7 @@ pub async fn remove_member(
     }
     ctx.liveness.forget(raft_id);
 
-    clear_manager_status(ctx, raft_id).await?;
+    finish_departure(ctx, raft_id, departing).await?;
     let members = ctx.store.raft_members();
     tracing::info!(raft_id, members = members.len(), "raft member removed");
     Ok(members)
@@ -756,6 +797,7 @@ const LEAVE_FORWARD_HOPS: usize = 3;
 async fn remove_member_via_leader(
     ctx: &ManagerContext,
     raft_id: u64,
+    departing: Departing,
 ) -> Result<Vec<RaftMember>, MembershipError> {
     let refused = |addr: &str, message: String| MembershipError::ForwardedRemove {
         addr: addr.to_owned(),
@@ -795,6 +837,7 @@ async fn remove_member_via_leader(
         let mut request = tonic::Request::new(pb::LeaveRaftRequest {
             raft_id,
             node_id: node_id.clone(),
+            demote: matches!(departing, Departing::BecomesWorker { .. }),
         });
         request.set_timeout(LEAVE_FORWARD_DEADLINE);
         match client.leave_raft(request).await {
@@ -861,38 +904,83 @@ pub async fn demote_to_worker(ctx: &ManagerContext, node_id: &Id) -> Result<(), 
             .any(|m| m.raft_id == raft_id)
         {
             tracing::info!(node_id = %node_id, raft_id, "demotion phase 1: leaving consensus");
-            remove_member(ctx, raft_id).await?;
+            remove_member(
+                ctx,
+                raft_id,
+                Departing::BecomesWorker {
+                    node_id: node_id.clone(),
+                },
+            )
+            .await?;
+            // The leader wrote the role in the same breath as the membership
+            // change (`finish_departure`), because this node may be the one
+            // leaving and a node out of consensus has a store that no longer
+            // moves. Nothing left to do here.
+            return Ok(());
         }
     }
 
     // Phase 2: only now is the role safe to change.
-    let node = ctx
-        .store
-        .view()
-        .node(node_id)
-        .ok_or_else(|| MembershipError::UnknownMember {
-            message: format!("node {node_id} disappeared while it was being demoted"),
-        })?;
-    if node.spec.role == NodeRole::Worker && node.manager_status.is_none() {
-        return Ok(());
+    //
+    // Retried from a fresh read on a sequence conflict, because the node
+    // object is *busy*: the new leader writes its own manager status the
+    // moment phase 1 hands leadership over, and every node's description
+    // refresh rewrites it periodically. Optimistic concurrency turns those
+    // into `SequenceConflict` (architecture §3), and a single-shot write loses
+    // that race often enough to be the normal outcome -- measured on the
+    // testbed, where the first demote of a live leader after the transfer fix
+    // failed with `store has version 1185, caller wrote from version 1081`,
+    // leaving the node out of consensus but still holding the manager role:
+    // exactly the half-demoted state the phase ordering exists to prevent.
+    //
+    // The local view is read each pass rather than once, and it is the
+    // *applied* store, which lags the leader — so the loop also gives this
+    // node time to catch up with the write it lost to.
+    let deadline = Instant::now() + DEPARTURE_WRITE_BUDGET;
+    loop {
+        let node =
+            ctx.store
+                .view()
+                .node(node_id)
+                .ok_or_else(|| MembershipError::UnknownMember {
+                    message: format!("node {node_id} disappeared while it was being demoted"),
+                })?;
+        if node.spec.role == NodeRole::Worker && node.manager_status.is_none() {
+            return Ok(());
+        }
+        let mut updated = (*node).clone();
+        updated.spec.role = NodeRole::Worker;
+        updated.manager_status = None;
+        // Through the leader, wherever it is: after phase 1 this manager may
+        // be a follower (it may even be the node being demoted), and a local
+        // propose would refuse with "not the raft leader".
+        let outcome = forward::propose_via(
+            ctx,
+            vec![StoreAction::Update(StoreObject::Node(updated))],
+            forward::local_identity(),
+        )
+        .await;
+        match outcome {
+            Ok(_) => {
+                tracing::info!(node_id = %node_id, "demotion phase 2: role set to worker");
+                return Ok(());
+            }
+            Err(forward::ForwardError::Rejected(ProposalRejection::SequenceConflict {
+                expected,
+                found,
+                ..
+            })) if Instant::now() < deadline => {
+                tracing::debug!(
+                    node_id = %node_id,
+                    expected,
+                    found,
+                    "the node object moved under the demotion; re-reading and retrying"
+                );
+                tokio::time::sleep(MEMBERSHIP_RETRY_DELAY).await;
+            }
+            Err(source) => return Err(MembershipError::ForwardedStore { source }),
+        }
     }
-    let mut updated = (*node).clone();
-    updated.spec.role = NodeRole::Worker;
-    updated.manager_status = None;
-    // Through the leader, wherever it is: after phase 1 this manager may be
-    // a follower (it may even be the node being demoted), and a local
-    // propose would refuse with "not the raft leader" — leaving the node out
-    // of consensus but still holding the manager role, the half-demoted
-    // state phase ordering exists to prevent.
-    forward::propose_via(
-        ctx,
-        vec![StoreAction::Update(StoreObject::Node(updated))],
-        forward::local_identity(),
-    )
-    .await
-    .map_err(|source| MembershipError::ForwardedStore { source })?;
-    tracing::info!(node_id = %node_id, "demotion phase 2: role set to worker");
-    Ok(())
 }
 
 /// Hands leadership to another manager (openraft 0.9 has no
@@ -901,13 +989,54 @@ pub async fn demote_to_worker(ctx: &ManagerContext, node_id: &Id) -> Result<(), 
 /// Stops the local ticker so this node neither heartbeats nor campaigns, and
 /// waits for a different leader to appear. The ticker is restored either way
 /// — a node that failed to hand over must go back to participating normally.
-pub async fn yield_leadership(raft: &Raft<TypeConfig>) -> Result<(), MembershipError> {
-    let me = raft.metrics().borrow().id;
-    raft.runtime_config().tick(false);
+pub async fn yield_leadership(raft: &Raft) -> Result<(), MembershipError> {
+    let (me, target) = {
+        let metrics = raft.metrics().borrow_watched().clone();
+        let me = metrics.id;
+        // Prefer the most caught-up voter: it needs the fewest entries before
+        // it can serve, and openraft refuses to hand leadership to a node
+        // behind the `last_log_id` it names in the request.
+        let target = metrics
+            .membership_config
+            .voter_ids()
+            .filter(|id| *id != me)
+            .max_by_key(|id| {
+                metrics
+                    .replication
+                    .as_ref()
+                    .and_then(|r| r.get(id).copied().flatten())
+                    .map(|log_id| log_id.index)
+            });
+        (me, target)
+    };
+    let Some(target) = target else {
+        return Err(MembershipError::LeadershipTransfer {
+            budget: LEADERSHIP_TRANSFER_TIMEOUT,
+        });
+    };
+
+    tracing::info!(
+        previous_leader = me,
+        target,
+        "asking openraft to transfer leadership"
+    );
+    raft.trigger()
+        .transfer_leader(target)
+        .await
+        .map_err(|e| MembershipError::Raft {
+            op: "transfer_leader",
+            raft_id: target,
+            message: e.to_string(),
+        })?;
+
+    // `transfer_leader` only submits the command; the handover is observed on
+    // the metrics watch. No ticker fiddling here: 0.10 broadcasts a request
+    // that disarms the target's leader lease, which is the whole reason this
+    // terminates where the 0.9 stand-in could not.
     let result = tokio::time::timeout(LEADERSHIP_TRANSFER_TIMEOUT, async {
         let mut rx = raft.metrics();
         loop {
-            let leader = rx.borrow().current_leader;
+            let leader = rx.borrow_watched().current_leader;
             if leader.is_some_and(|id| id != me) {
                 return;
             }
@@ -917,7 +1046,6 @@ pub async fn yield_leadership(raft: &Raft<TypeConfig>) -> Result<(), MembershipE
         }
     })
     .await;
-    raft.runtime_config().tick(true);
 
     if result.is_err() {
         return Err(MembershipError::LeadershipTransfer {
@@ -926,7 +1054,7 @@ pub async fn yield_leadership(raft: &Raft<TypeConfig>) -> Result<(), MembershipE
     }
     tracing::info!(
         previous_leader = me,
-        new_leader = ?raft.metrics().borrow().current_leader,
+        new_leader = ?raft.metrics().borrow_watched().current_leader,
         "leadership handed over"
     );
     Ok(())
@@ -1040,23 +1168,103 @@ async fn record_manager_status(
     Ok(())
 }
 
-/// Drops the manager status of whichever node owns `raft_id`.
-async fn clear_manager_status(ctx: &ManagerContext, raft_id: u64) -> Result<(), MembershipError> {
-    let node = ctx.store.view().nodes().into_iter().find(|n| {
-        n.manager_status
-            .as_ref()
-            .is_some_and(|m| m.raft_id == raft_id)
-    });
-    let Some(node) = node else {
-        return Ok(());
-    };
-    let mut updated = (*node).clone();
-    updated.manager_status = None;
-    ctx.store
-        .propose(vec![StoreAction::Update(StoreObject::Node(updated))])
-        .await
-        .map_err(|source| MembershipError::Store { source })?;
-    Ok(())
+/// What a departure writes on the node object it removes from consensus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Departing {
+    /// Node removal or `swarm leave --force`: drop the manager status only.
+    ///
+    /// The node is identified by its raft id, through the `manager_status`
+    /// that records it -- which is all this case needs.
+    LeavesConsensus,
+    /// Demotion (SWK §12.3 phase 2): drop the manager status **and** set the
+    /// role to worker, so certificate renewal issues a worker certificate.
+    ///
+    /// Carries the node id because the raft id is not enough: once the manager
+    /// status is cleared, nothing on the node object records which raft member
+    /// it was, and a role write that guessed -- "some node whose role is
+    /// manager and whose status is empty" -- would demote a node that is
+    /// merely mid-promotion. The caller always knows the id; asking for it is
+    /// cheaper than being clever.
+    BecomesWorker {
+        /// The node being demoted.
+        node_id: Id,
+    },
+}
+
+/// Writes the node object's half of a departure, on the leader.
+///
+/// This runs where the store is still moving. That is the whole point: phase 1
+/// takes the node out of consensus, and a node out of consensus stops
+/// receiving replication, so if the *departing* node tried to write this from
+/// its own applied store it would re-read the same frozen version and lose the
+/// optimistic-concurrency check every time (architecture §3). Measured on the
+/// testbed before this moved here: ten seconds of retries against a store
+/// stuck at version 25 while the leader was at 45.
+///
+/// Retried from a fresh read because the node object is contended right after
+/// a handover -- the new leader writes its own manager status, description
+/// refreshes land -- so a sequence conflict is an expected first outcome, not
+/// an error.
+async fn finish_departure(
+    ctx: &ManagerContext,
+    raft_id: u64,
+    departing: Departing,
+) -> Result<(), MembershipError> {
+    let deadline = Instant::now() + DEPARTURE_WRITE_BUDGET;
+    loop {
+        // Keyed on the node id for a demotion, because the manager status this
+        // would otherwise match on is exactly what the write clears: a retry
+        // after a partial success would have nothing left to find. Matching
+        // "some node whose role is manager and whose status is empty" instead
+        // would be worse than useless -- it is a description of a node that is
+        // merely mid-promotion, and demoting that one is a silent disaster.
+        let node = {
+            let view = ctx.store.view();
+            match &departing {
+                Departing::BecomesWorker { node_id } => view.node(node_id),
+                Departing::LeavesConsensus => view.nodes().into_iter().find(|n| {
+                    n.manager_status
+                        .as_ref()
+                        .is_some_and(|m| m.raft_id == raft_id)
+                }),
+            }
+        };
+        let Some(node) = node else {
+            return Ok(());
+        };
+        let becomes_worker = matches!(departing, Departing::BecomesWorker { .. });
+        let done = node.manager_status.is_none()
+            && (!becomes_worker || node.spec.role == NodeRole::Worker);
+        if done {
+            return Ok(());
+        }
+        let mut updated = (*node).clone();
+        updated.manager_status = None;
+        if becomes_worker {
+            updated.spec.role = NodeRole::Worker;
+        }
+        match ctx
+            .store
+            .propose(vec![StoreAction::Update(StoreObject::Node(updated))])
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(ProposeError::Rejected(ProposalRejection::SequenceConflict {
+                expected,
+                found,
+                ..
+            })) if Instant::now() < deadline => {
+                tracing::debug!(
+                    raft_id,
+                    expected,
+                    found,
+                    "the node object moved under the departure; re-reading and retrying"
+                );
+                tokio::time::sleep(MEMBERSHIP_RETRY_DELAY).await;
+            }
+            Err(source) => return Err(MembershipError::Store { source }),
+        }
+    }
 }
 
 /// The minimal node object a joining manager gets when none exists.
@@ -1223,8 +1431,8 @@ impl Control for ControlService {
                 .as_ref()
                 .is_some_and(|m| m.raft_id == req.raft_id)
         });
-        match owner {
-            Some(node) if node.id.as_str() == req.node_id => {}
+        let owner_id = match owner {
+            Some(node) if node.id.as_str() == req.node_id => Some(node.id.clone()),
             Some(node) => {
                 return Err(Status::failed_precondition(format!(
                     "raft member {raft_id} belongs to node {actual}, not to {claimed:?}; \
@@ -1242,10 +1450,20 @@ impl Control for ControlService {
                     node_id = %req.node_id,
                     "removing a raft member with no matching node object"
                 );
+                None
             }
-        }
+        };
 
-        let members = remove_member(&ctx, req.raft_id).await?;
+        // The id comes from the node object the membership check just matched,
+        // not from the request: a demotion writes the role of the node this
+        // store says owns that raft member, and of no other. With no matching
+        // object there is nothing to demote, so the removal is a plain
+        // departure.
+        let departing = match (req.demote, owner_id) {
+            (true, Some(node_id)) => Departing::BecomesWorker { node_id },
+            _ => Departing::LeavesConsensus,
+        };
+        let members = remove_member(&ctx, req.raft_id, departing).await?;
         Ok(Response::new(pb::LeaveRaftResponse {
             members: members.iter().map(proto_member).collect(),
         }))

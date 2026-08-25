@@ -16,10 +16,12 @@
 
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use satl_ca::RoleRequirement;
-use satl_cluster::membership::{self, MembershipError};
+use satl_cluster::membership::{self, Departing, MembershipError};
 use satl_cluster::node::RaftTiming;
 use satl_cluster::server::ManagerContext;
 use satl_cluster::testing::TestCa;
@@ -28,6 +30,13 @@ use satl_core::{
     Annotations, Id, IpamConfig, Meta, Network, NetworkDriver, NetworkSpec, NodeRole, StoreAction,
     StoreObject,
 };
+
+/// What a real handover must beat in [`a_leader_demotes_itself_under_write_load`].
+///
+/// Comfortably above one election round at `RaftTiming::fast()` and far below
+/// the `leader_lease + election_timeout` a lease expiry would cost, so the
+/// assertion separates the two mechanisms rather than timing the machine.
+const LEADERSHIP_TRANSFER_BUDGET: Duration = Duration::from_secs(5);
 
 /// Upper bound on every "wait until" in these tests. Generous relative to the
 /// fast raft timings, so a loaded build machine does not turn a pass into a
@@ -99,7 +108,41 @@ fn manager_config(
     }
 }
 
-/// Bootstraps the first manager: it initializes the cluster and seeds state.
+/// Proposes on a freshly elected leader, tolerating only the one race the
+/// test does not mean to exercise.
+///
+/// `is_leader()` reads a metrics flag that is set when the node wins the
+/// election, but a raft leader cannot serve writes until the blank entry it
+/// appends on election has committed -- and leadership can move again in
+/// between. A propose in that window comes back `NotLeader`, which is the
+/// protocol working, not a defect. Anything else (a deterministic rejection,
+/// a raft fault) fails the test at once, so this stays a test of "the new
+/// leader accepts writes" rather than a retry that would swallow a real one.
+///
+/// Observed once as a `make check` flake under heavy load before this existed;
+/// eleven subsequent runs, eight of them under CPU contention, did not
+/// reproduce it.
+async fn propose_on_new_leader(
+    manager: &TestManager,
+    actions: Vec<StoreAction>,
+) -> satl_core::Version {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match manager.store.propose(actions.clone()).await {
+            Ok(version) => return version,
+            Err(satl_cluster::ProposeError::NotLeader { leader_hint })
+                if Instant::now() < deadline =>
+            {
+                tracing::debug!(
+                    ?leader_hint,
+                    "leadership still settling; retrying the proposal"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(other) => panic!("the new leader must accept proposals: {other}"),
+        }
+    }
+}
 async fn bootstrap(ca: &TestCa, name: &str) -> TestManager {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = manager_config(&dir, name, ca.live_identity(NodeRole::Manager));
@@ -300,11 +343,11 @@ async fn three_managers_form_replicate_and_survive_losing_the_leader() {
     // And the new leader still accepts writes.
     let after = sample_network("after-election");
     let after_id = after.id.clone();
-    leader
-        .store
-        .propose(vec![StoreAction::Create(StoreObject::Network(after))])
-        .await
-        .expect("the new leader accepts proposals");
+    propose_on_new_leader(
+        leader,
+        vec![StoreAction::Create(StoreObject::Network(after))],
+    )
+    .await;
     let id = after_id.clone();
     eventually(
         "the other survivor replicated the post-election write",
@@ -349,7 +392,7 @@ async fn removal_respects_quorum_and_never_reuses_a_raft_id() {
 
     // Removing beta now would leave {alpha, gamma} with only alpha
     // reachable: one of the two needed for quorum. Refuse.
-    let err = membership::remove_member(&leader_ctx, beta_raft_id)
+    let err = membership::remove_member(&leader_ctx, beta_raft_id, Departing::LeavesConsensus)
         .await
         .expect_err("removing a live member while another is down must be refused");
     match err {
@@ -366,7 +409,7 @@ async fn removal_respects_quorum_and_never_reuses_a_raft_id() {
     }
 
     // Removing the member that is already down is safe and must succeed.
-    let members = membership::remove_member(&leader_ctx, gamma_raft_id)
+    let members = membership::remove_member(&leader_ctx, gamma_raft_id, Departing::LeavesConsensus)
         .await
         .expect("dropping the unreachable member keeps quorum");
     assert_eq!(members.len(), 2, "{members:?}");
@@ -470,6 +513,61 @@ async fn demotion_leaves_consensus_before_flipping_the_role() {
     first.shutdown().await;
 }
 
+/// Demoting the **leader** must finish the job, not stop at consensus.
+///
+/// The half it used to skip is the role write. Phase 1 takes the node out of
+/// consensus, and a node out of consensus stops receiving replication -- so
+/// the departing node's own store freezes, and a role write built from it
+/// loses the optimistic-concurrency check for ever. Measured on the testbed:
+/// ten seconds of retries against a store stuck at version 25 while the leader
+/// was at 45, leaving the node out of consensus with its manager role intact.
+///
+/// The leader now writes both halves while it still holds a moving store, so
+/// what this pins is the *outcome as the survivors see it*: role worker, no
+/// manager status. Reading it from the survivors and not from the demoted node
+/// is the point -- the demoted node cannot see its own demotion.
+#[tokio::test(flavor = "multi_thread")]
+async fn demoting_the_leader_also_flips_its_role() {
+    let ca = TestCa::new();
+    let first = bootstrap(&ca, "alpha").await;
+    let second = join(&ca, "beta", &first.addr).await;
+    let third = join(&ca, "gamma", &first.addr).await;
+
+    eventually("the cluster has three voting members", || {
+        first
+            .store
+            .raft_members()
+            .iter()
+            .filter(|m| m.voter)
+            .count()
+            == 3
+    })
+    .await;
+    assert!(first.is_leader(), "alpha bootstrapped and leads");
+
+    let alpha_id = first.node.node_id().clone();
+    membership::demote_to_worker(&first.context(), &alpha_id)
+        .await
+        .expect("demoting the current leader completes");
+
+    for (name, manager) in [("beta", &second), ("gamma", &third)] {
+        let id = alpha_id.clone();
+        eventually(
+            &format!("{name} sees alpha as a worker with no manager status"),
+            || {
+                manager.store.view().node(&id).is_some_and(|node| {
+                    node.spec.role == NodeRole::Worker && node.manager_status.is_none()
+                })
+            },
+        )
+        .await;
+    }
+
+    third.shutdown().await;
+    second.shutdown().await;
+    first.shutdown().await;
+}
+
 /// A leader asked to remove **itself** hands leadership over first and tells
 /// the caller to retry against the new leader (SWK §11.5): a departing leader
 /// cannot reliably observe its own removal commit.
@@ -498,9 +596,10 @@ async fn a_leader_removing_itself_hands_leadership_over_first() {
     // by whoever won, over Control.LeaveRaft: the caller gets the completed
     // removal, not a "retry elsewhere" (proto/control.proto: "lets the new
     // leader do the removal").
-    let members = membership::remove_member(&first.context(), alpha_raft_id)
-        .await
-        .expect("the removal completes: yield leadership, then forwarded to the new leader");
+    let members =
+        membership::remove_member(&first.context(), alpha_raft_id, Departing::LeavesConsensus)
+            .await
+            .expect("the removal completes: yield leadership, then forwarded to the new leader");
     assert_eq!(members.len(), 2, "{members:?}");
     assert!(
         members.iter().all(|m| m.raft_id != alpha_raft_id),
@@ -520,6 +619,88 @@ async fn a_leader_removing_itself_hands_leadership_over_first() {
         || second.store.raft_members().len() == 2 && third.store.raft_members().len() == 2,
     )
     .await;
+
+    third.shutdown().await;
+    second.shutdown().await;
+    first.shutdown().await;
+}
+
+/// A leader that removes itself **while the cluster is being written to**.
+///
+/// This is the case the old code could never finish, and the reason the
+/// existing test above passed against it: openraft 0.9 had no transfer call,
+/// so `yield_leadership` stopped the local ticker and waited for a follower to
+/// campaign on its own -- which only happens once that follower's leader lease
+/// expires, and **every replicated write refreshes it**. An idle three-node
+/// cluster at test timings expires its leases in under a second and hides the
+/// defect completely; a `satld` that is reporting node and task status never
+/// does, which is why the cluster suite hit it and the unit tests did not.
+///
+/// The write generator is therefore the load-bearing part of this test, not
+/// decoration. Remove it and this passes against the broken implementation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_demotes_itself_under_write_load() {
+    let ca = TestCa::new();
+    let first = bootstrap(&ca, "alpha").await;
+    let second = join(&ca, "beta", &first.addr).await;
+    let third = join(&ca, "gamma", &first.addr).await;
+
+    eventually("the cluster has three voting members", || {
+        first
+            .store
+            .raft_members()
+            .iter()
+            .filter(|m| m.voter)
+            .count()
+            == 3
+    })
+    .await;
+    assert!(first.is_leader());
+
+    // Keep the followers' leases alive for as long as the handover takes.
+    let writer_store = first.store.clone();
+    let writing = Arc::new(AtomicBool::new(true));
+    let writer_flag = Arc::clone(&writing);
+    let writer = tokio::spawn(async move {
+        while writer_flag.load(Ordering::Acquire) {
+            // Rejections are fine: the point is traffic, not the outcome, and
+            // once alpha stops leading these start failing by design.
+            let _ = writer_store
+                .propose(vec![StoreAction::Create(StoreObject::Network(
+                    sample_network("load"),
+                ))])
+                .await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    let alpha_raft_id = first.raft_id();
+    let started = Instant::now();
+    let members =
+        membership::remove_member(&first.context(), alpha_raft_id, Departing::LeavesConsensus)
+            .await
+            .expect("the removal completes even while the cluster is taking writes");
+    let elapsed = started.elapsed();
+
+    writing.store(false, Ordering::Release);
+    writer.await.expect("the write generator exits cleanly");
+
+    assert!(
+        elapsed < LEADERSHIP_TRANSFER_BUDGET,
+        "the handover took {elapsed:?}: a real transfer is one broadcast and one \
+         election round, not a wait for a lease to expire"
+    );
+    assert_eq!(members.len(), 2, "{members:?}");
+    assert!(
+        members.iter().all(|m| m.raft_id != alpha_raft_id),
+        "the departing leader is out of the returned membership: {members:?}"
+    );
+
+    eventually("another manager leads", || {
+        second.is_leader() || third.is_leader()
+    })
+    .await;
+    assert!(!first.is_leader(), "alpha stepped down");
 
     third.shutdown().await;
     second.shutdown().await;
@@ -562,7 +743,7 @@ async fn a_node_with_existing_state_refuses_to_join() {
 /// from a different cluster's CA cannot get past the handshake at all.
 #[tokio::test]
 async fn manager_rpcs_reject_workers_and_foreign_clusters() {
-    use satl_proto::v1::control_client::ControlClient;
+    use satl_proto::v2::control_client::ControlClient;
 
     let ca = TestCa::new();
     let leader = bootstrap(&ca, "alpha").await;
@@ -574,7 +755,7 @@ async fn manager_rpcs_reject_workers_and_foreign_clusters() {
     let channel = channels.channel(&leader.addr).expect("channel");
     let mut client = ControlClient::new(channel);
     let status = client
-        .cluster_info(satl_proto::v1::ClusterInfoRequest {})
+        .cluster_info(satl_proto::v2::ClusterInfoRequest {})
         .await
         .expect_err("a worker must not read cluster info");
     assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status}");
@@ -589,7 +770,7 @@ async fn manager_rpcs_reject_workers_and_foreign_clusters() {
     let channel = channels.channel(&leader.addr).expect("channel");
     let mut client = ControlClient::new(channel);
     let info = client
-        .cluster_info(satl_proto::v1::ClusterInfoRequest {})
+        .cluster_info(satl_proto::v2::ClusterInfoRequest {})
         .await
         .expect("a manager may read cluster info")
         .into_inner();
@@ -605,7 +786,7 @@ async fn manager_rpcs_reject_workers_and_foreign_clusters() {
     let channel = channels.channel(&leader.addr).expect("channel");
     let mut client = ControlClient::new(channel);
     let status = client
-        .cluster_info(satl_proto::v1::ClusterInfoRequest {})
+        .cluster_info(satl_proto::v2::ClusterInfoRequest {})
         .await
         .expect_err("a foreign CA must not be trusted");
     assert!(

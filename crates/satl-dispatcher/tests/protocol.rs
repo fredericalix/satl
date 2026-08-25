@@ -37,7 +37,7 @@ use satl_dispatcher::agent::{Agent, AgentConfig, ChannelFactory, ConnectError, S
 use satl_dispatcher::liveness::HeartbeatConfig;
 use satl_dispatcher::manager::{Dispatcher, DispatcherConfig};
 use satl_dispatcher::peer::{Endpoint, ManagerPeer};
-use satl_proto::v1;
+use satl_proto::v2;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tokio_util::sync::CancellationToken;
@@ -109,12 +109,12 @@ async fn serve(
 /// Serves a hand-written misbehaving dispatcher (the gap test).
 async fn serve_raw<T>(service: T, identity: PeerIdentity, shutdown: CancellationToken) -> SocketAddr
 where
-    T: v1::dispatcher_server::Dispatcher,
+    T: v2::dispatcher_server::Dispatcher,
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let service = tonic::service::interceptor::InterceptedService::new(
-        v1::dispatcher_server::DispatcherServer::new(service),
+        v2::dispatcher_server::DispatcherServer::new(service),
         move |mut request: Request<()>| {
             request.extensions_mut().insert(identity.clone());
             Ok(request)
@@ -661,9 +661,9 @@ async fn a_live_session_drags_its_node_back_to_ready_without_re_registering() {
         .connect()
         .await
         .expect("connect");
-    let mut client = v1::dispatcher_client::DispatcherClient::new(channel);
+    let mut client = v2::dispatcher_client::DispatcherClient::new(channel);
     let mut session = client
-        .session(v1::SessionRequest {
+        .session(v2::SessionRequest {
             description: Vec::new(),
             session_id: String::new(),
         })
@@ -691,7 +691,7 @@ async fn a_live_session_drags_its_node_back_to_ready_without_re_registering() {
         tokio::spawn(async move {
             while !stop.is_cancelled() {
                 if client
-                    .heartbeat(v1::HeartbeatRequest {
+                    .heartbeat(v2::HeartbeatRequest {
                         session_id: session_id.clone(),
                     })
                     .await
@@ -875,9 +875,9 @@ async fn a_silent_agent_is_marked_down_when_its_ttl_expires() {
         .connect()
         .await
         .expect("connect");
-    let mut client = v1::dispatcher_client::DispatcherClient::new(channel);
+    let mut client = v2::dispatcher_client::DispatcherClient::new(channel);
     let mut session = client
-        .session(v1::SessionRequest {
+        .session(v2::SessionRequest {
             description: Vec::new(),
             session_id: String::new(),
         })
@@ -910,7 +910,7 @@ async fn a_silent_agent_is_marked_down_when_its_ttl_expires() {
 
     // The session is void: the agent's only correct move is to re-register.
     let error = client
-        .heartbeat(v1::HeartbeatRequest {
+        .heartbeat(v2::HeartbeatRequest {
             session_id: session_id.clone(),
         })
         .await
@@ -919,7 +919,7 @@ async fn a_silent_agent_is_marked_down_when_its_ttl_expires() {
 
     // And re-registering brings it back.
     let mut session = client
-        .session(v1::SessionRequest {
+        .session(v2::SessionRequest {
             description: Vec::new(),
             session_id: String::new(),
         })
@@ -932,7 +932,7 @@ async fn a_silent_agent_is_marked_down_when_its_ttl_expires() {
         "session ids are never reused"
     );
     client
-        .heartbeat(v1::HeartbeatRequest {
+        .heartbeat(v2::HeartbeatRequest {
             session_id: message.session_id,
         })
         .await
@@ -987,9 +987,9 @@ async fn a_long_down_node_has_its_live_tasks_orphaned() {
         .connect()
         .await
         .expect("connect");
-    let mut client = v1::dispatcher_client::DispatcherClient::new(channel);
+    let mut client = v2::dispatcher_client::DispatcherClient::new(channel);
     let mut session = client
-        .session(v1::SessionRequest {
+        .session(v2::SessionRequest {
             description: Vec::new(),
             session_id: String::new(),
         })
@@ -1061,9 +1061,9 @@ async fn the_manager_refuses_spoofed_and_illegal_status_updates() {
         .connect()
         .await
         .expect("connect");
-    let mut client = v1::dispatcher_client::DispatcherClient::new(channel);
+    let mut client = v2::dispatcher_client::DispatcherClient::new(channel);
     let mut session = client
-        .session(v1::SessionRequest {
+        .session(v2::SessionRequest {
             description: Vec::new(),
             session_id: String::new(),
         })
@@ -1081,7 +1081,7 @@ async fn the_manager_refuses_spoofed_and_illegal_status_updates() {
         let status = TaskStatus::new(state, "reported");
         let mut bytes = Vec::new();
         ciborium::into_writer(&status, &mut bytes).expect("cbor");
-        v1::TaskStatusUpdate {
+        v2::TaskStatusUpdate {
             task_id: task_id.to_string(),
             state: state.value().into(),
             status: bytes,
@@ -1089,7 +1089,7 @@ async fn the_manager_refuses_spoofed_and_illegal_status_updates() {
     };
 
     let error = client
-        .update_task_status(v1::UpdateTaskStatusRequest {
+        .update_task_status(v2::UpdateTaskStatusRequest {
             session_id: session_id.clone(),
             updates: vec![update(&theirs_id, TaskState::Running)],
         })
@@ -1098,7 +1098,7 @@ async fn the_manager_refuses_spoofed_and_illegal_status_updates() {
     assert_eq!(error.code(), tonic::Code::PermissionDenied, "{error}");
 
     let error = client
-        .update_task_status(v1::UpdateTaskStatusRequest {
+        .update_task_status(v2::UpdateTaskStatusRequest {
             session_id: session_id.clone(),
             updates: vec![update(&mine_id, TaskState::Remove)],
         })
@@ -1108,7 +1108,7 @@ async fn the_manager_refuses_spoofed_and_illegal_status_updates() {
 
     // An unknown task is skipped, not an error.
     client
-        .update_task_status(v1::UpdateTaskStatusRequest {
+        .update_task_status(v2::UpdateTaskStatusRequest {
             session_id: session_id.clone(),
             updates: vec![update(&Id::generate(), TaskState::Running)],
         })
@@ -1117,7 +1117,7 @@ async fn the_manager_refuses_spoofed_and_illegal_status_updates() {
 
     // A stale session is refused.
     let error = client
-        .update_task_status(v1::UpdateTaskStatusRequest {
+        .update_task_status(v2::UpdateTaskStatusRequest {
             session_id: "not-the-session".to_owned(),
             updates: vec![update(&mine_id, TaskState::Running)],
         })
@@ -1204,19 +1204,19 @@ struct GappyManager {
 }
 
 #[tonic::async_trait]
-impl v1::dispatcher_server::Dispatcher for GappyManager {
-    type SessionStream = ReceiverStream<Result<v1::SessionMessage, Status>>;
+impl v2::dispatcher_server::Dispatcher for GappyManager {
+    type SessionStream = ReceiverStream<Result<v2::SessionMessage, Status>>;
     type AssignmentsStream =
-        Pin<Box<dyn tokio_stream::Stream<Item = Result<v1::AssignmentsMessage, Status>> + Send>>;
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<v2::AssignmentsMessage, Status>> + Send>>;
 
     async fn session(
         &self,
-        _request: Request<v1::SessionRequest>,
+        _request: Request<v2::SessionRequest>,
     ) -> Result<Response<Self::SessionStream>, Status> {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
             let _ = tx
-                .send(Ok(v1::SessionMessage {
+                .send(Ok(v2::SessionMessage {
                     session_id: "gappy-session".to_owned(),
                     node: None,
                     managers: Vec::new(),
@@ -1231,9 +1231,9 @@ impl v1::dispatcher_server::Dispatcher for GappyManager {
 
     async fn heartbeat(
         &self,
-        _request: Request<v1::HeartbeatRequest>,
-    ) -> Result<Response<v1::HeartbeatResponse>, Status> {
-        Ok(Response::new(v1::HeartbeatResponse {
+        _request: Request<v2::HeartbeatRequest>,
+    ) -> Result<Response<v2::HeartbeatResponse>, Status> {
+        Ok(Response::new(v2::HeartbeatResponse {
             period: Some(prost_types::Duration {
                 seconds: 1,
                 nanos: 0,
@@ -1243,31 +1243,31 @@ impl v1::dispatcher_server::Dispatcher for GappyManager {
 
     async fn update_task_status(
         &self,
-        _request: Request<v1::UpdateTaskStatusRequest>,
-    ) -> Result<Response<v1::UpdateTaskStatusResponse>, Status> {
-        Ok(Response::new(v1::UpdateTaskStatusResponse {}))
+        _request: Request<v2::UpdateTaskStatusRequest>,
+    ) -> Result<Response<v2::UpdateTaskStatusResponse>, Status> {
+        Ok(Response::new(v2::UpdateTaskStatusResponse {}))
     }
 
     async fn assignments(
         &self,
-        _request: Request<v1::AssignmentsRequest>,
+        _request: Request<v2::AssignmentsRequest>,
     ) -> Result<Response<Self::AssignmentsStream>, Status> {
         let open = self.opens.fetch_add(1, Ordering::SeqCst);
         let task = self.task.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tokio::spawn(async move {
             let encoded = satl_dispatcher::codec::encode_task(&task).expect("encode");
-            let change = v1::AssignmentChange {
-                assignment: Some(v1::Assignment {
-                    item: Some(v1::assignment::Item::Task(encoded)),
+            let change = v2::AssignmentChange {
+                assignment: Some(v2::Assignment {
+                    item: Some(v2::assignment::Item::Task(encoded)),
                 }),
-                action: v1::assignment_change::Action::Update as i32,
+                action: v2::assignment_change::Action::Update as i32,
             };
             if open == 0 {
                 // A correct snapshot with nothing in it…
                 let _ = tx
-                    .send(Ok(v1::AssignmentsMessage {
-                        r#type: v1::assignments_message::Type::Complete as i32,
+                    .send(Ok(v2::AssignmentsMessage {
+                        r#type: v2::assignments_message::Type::Complete as i32,
                         applies_to: String::new(),
                         results_in: "chain-1".to_owned(),
                         changes: Vec::new(),
@@ -1277,17 +1277,17 @@ impl v1::dispatcher_server::Dispatcher for GappyManager {
                 // in. It carries a removal so that applying it would be
                 // visible in the sink.
                 let _ = tx
-                    .send(Ok(v1::AssignmentsMessage {
-                        r#type: v1::assignments_message::Type::Incremental as i32,
+                    .send(Ok(v2::AssignmentsMessage {
+                        r#type: v2::assignments_message::Type::Incremental as i32,
                         applies_to: "chain-99".to_owned(),
                         results_in: "chain-100".to_owned(),
-                        changes: vec![v1::AssignmentChange {
-                            assignment: Some(v1::Assignment {
-                                item: Some(v1::assignment::Item::Task(
+                        changes: vec![v2::AssignmentChange {
+                            assignment: Some(v2::Assignment {
+                                item: Some(v2::assignment::Item::Task(
                                     satl_dispatcher::codec::task_removal(&task.id),
                                 )),
                             }),
-                            action: v1::assignment_change::Action::Remove as i32,
+                            action: v2::assignment_change::Action::Remove as i32,
                         }],
                     }))
                     .await;
@@ -1295,8 +1295,8 @@ impl v1::dispatcher_server::Dispatcher for GappyManager {
             } else {
                 // The re-opened stream: a fresh, correct snapshot.
                 let _ = tx
-                    .send(Ok(v1::AssignmentsMessage {
-                        r#type: v1::assignments_message::Type::Complete as i32,
+                    .send(Ok(v2::AssignmentsMessage {
+                        r#type: v2::assignments_message::Type::Complete as i32,
                         applies_to: String::new(),
                         results_in: "chain-2".to_owned(),
                         changes: vec![change],
@@ -1337,9 +1337,9 @@ async fn an_empty_node_still_gets_a_complete_snapshot() {
         .connect()
         .await
         .expect("connect");
-    let mut client = v1::dispatcher_client::DispatcherClient::new(channel);
+    let mut client = v2::dispatcher_client::DispatcherClient::new(channel);
     let mut session = client
-        .session(v1::SessionRequest {
+        .session(v2::SessionRequest {
             description: satl_dispatcher::codec::encode_description(&testing::description(
                 "worker-1",
             ))
@@ -1357,7 +1357,7 @@ async fn an_empty_node_still_gets_a_complete_snapshot() {
     assert!(first.node.is_some(), "the node object rides the session");
 
     let mut assignments = client
-        .assignments(v1::AssignmentsRequest {
+        .assignments(v2::AssignmentsRequest {
             session_id: first.session_id.clone(),
         })
         .await
@@ -1370,7 +1370,7 @@ async fn an_empty_node_still_gets_a_complete_snapshot() {
         .expect("a snapshot");
     assert_eq!(
         snapshot.r#type(),
-        v1::assignments_message::Type::Complete,
+        v2::assignments_message::Type::Complete,
         "the first message on the stream is always a complete snapshot"
     );
     assert!(snapshot.applies_to.is_empty());
@@ -1387,7 +1387,7 @@ async fn an_empty_node_still_gets_a_complete_snapshot() {
 
     // An unregistered node cannot open an assignment stream.
     let error = client
-        .assignments(v1::AssignmentsRequest {
+        .assignments(v2::AssignmentsRequest {
             session_id: "bogus".to_owned(),
         })
         .await
@@ -1619,9 +1619,9 @@ async fn a_complete_snapshot_puts_the_network_ahead_of_its_tasks_on_the_wire() {
         .connect()
         .await
         .expect("connect");
-    let mut client = v1::dispatcher_client::DispatcherClient::new(channel);
+    let mut client = v2::dispatcher_client::DispatcherClient::new(channel);
     let session = client
-        .session(v1::SessionRequest {
+        .session(v2::SessionRequest {
             description: satl_dispatcher::codec::encode_description(&testing::description(
                 "worker-1",
             ))
@@ -1636,7 +1636,7 @@ async fn a_complete_snapshot_puts_the_network_ahead_of_its_tasks_on_the_wire() {
         .expect("stream")
         .expect("a first message");
     let snapshot = client
-        .assignments(v1::AssignmentsRequest {
+        .assignments(v2::AssignmentsRequest {
             session_id: session.session_id.clone(),
         })
         .await
@@ -1646,7 +1646,7 @@ async fn a_complete_snapshot_puts_the_network_ahead_of_its_tasks_on_the_wire() {
         .await
         .expect("stream")
         .expect("a snapshot");
-    assert_eq!(snapshot.r#type(), v1::assignments_message::Type::Complete);
+    assert_eq!(snapshot.r#type(), v2::assignments_message::Type::Complete);
 
     let kinds: Vec<&str> = snapshot
         .changes
@@ -1657,10 +1657,10 @@ async fn a_complete_snapshot_puts_the_network_ahead_of_its_tasks_on_the_wire() {
                 .as_ref()
                 .and_then(|assignment| assignment.item.as_ref())
             {
-                Some(v1::assignment::Item::Secret(_)) => "secret",
-                Some(v1::assignment::Item::Config(_)) => "config",
-                Some(v1::assignment::Item::Network(_)) => "network",
-                Some(v1::assignment::Item::Task(_)) => "task",
+                Some(v2::assignment::Item::Secret(_)) => "secret",
+                Some(v2::assignment::Item::Config(_)) => "config",
+                Some(v2::assignment::Item::Network(_)) => "network",
+                Some(v2::assignment::Item::Task(_)) => "task",
                 None => "empty",
             }
         })
@@ -1672,7 +1672,7 @@ async fn a_complete_snapshot_puts_the_network_ahead_of_its_tasks_on_the_wire() {
     );
 
     // The network envelope decodes to the object plus the endpoint table.
-    let Some(v1::assignment::Item::Network(wire)) = snapshot.changes[1]
+    let Some(v2::assignment::Item::Network(wire)) = snapshot.changes[1]
         .assignment
         .as_ref()
         .and_then(|assignment| assignment.item.as_ref())

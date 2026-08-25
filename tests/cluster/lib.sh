@@ -6,13 +6,27 @@
 #
 # Provides inventory access (the only place inventory.toml is parsed) and thin
 # ssh/scp wrappers that always use BatchMode so nothing can ever hang waiting
-# for a password or a host-key prompt.
+# for a password or a host-key prompt, and always keep-alive so nothing can
+# hang on a session whose peer has stopped answering either.
 
 # Resolved by the sourcing script; SATL_INVENTORY overrides for a scratch cluster.
 : "${CLUSTER_DIR:?lib.sh: set CLUSTER_DIR before sourcing}"
 INVENTORY="${SATL_INVENTORY:-$CLUSTER_DIR/inventory.toml}"
 
-SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR"
+# `ConnectTimeout` bounds only the *initial* connect. A session that is already
+# established and whose peer stops answering -- the node rebooted, its
+# networking was torn down under it, the remote shell died without the FIN
+# arriving -- blocks for ever, because ssh has no reason to give up on a TCP
+# connection nobody has reset. Measured: a `reset.sh` run sat on a dead session
+# to node3 for over ten minutes with **no process left on node3 at all**, which
+# reads exactly like a slow teardown and is not one (decision log, 2026-08-25).
+#
+# 15s x 4 = a peer that has said nothing for a minute is gone. Keepalives are
+# answered by sshd itself, not by the remote command, so a legitimately slow
+# operation (a `zfs destroy` behind a DYING prison, say) is never cut short by
+# this -- only a genuinely unresponsive host is.
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+-o ServerAliveCountMax=4 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR"
 
 # ---------------------------------------------------------------- output ----
 

@@ -426,6 +426,15 @@ impl Controller {
     }
 
     /// Clone the writable layer, adopting an existing clone (re-entrancy).
+    ///
+    /// This check is **not** the whole guard, and must not be mistaken for
+    /// one: it is a check-then-act, so two prepares racing over the same task
+    /// both see the dataset absent and both go on to clone. The atomic half
+    /// lives in [`ContainerFsStore::create`], which treats "dataset already
+    /// exists" as success when the existing dataset's origin proves it is this
+    /// task's own. Measured: a rolling update rolled back six slots because
+    /// the loser of exactly this race reported a fatal task failure
+    /// (decision log, 2026-08-25).
     async fn ensure_container_fs(
         &self,
         top: &satl_storage::ChainId,

@@ -45,7 +45,8 @@ pub struct InitArgs {
     #[arg(long, value_name = "ADDR")]
     pub listen_addr: Option<String>,
 
-    /// Force create a new cluster from the current state.
+    /// Force create a new cluster from the current state. NOT IMPLEMENTED:
+    /// see the backup and restore section of the operations guide.
     #[arg(long)]
     pub force_new_cluster: bool,
 
@@ -145,6 +146,24 @@ pub async fn execute(
 }
 
 async fn init(host: &Host, args: &InitArgs, streams: &mut Streams) -> anyhow::Result<u8> {
+    // Refused here rather than by the daemon. The flag is real Docker surface
+    // and stays in the interface -- dropping it would answer "unexpected
+    // argument", which teaches nothing -- but the daemon's answer is a
+    // permanent 501, so making the operator spend a round trip to learn that
+    // is pure cost. The wording is the daemon's, deliberately: whichever end
+    // says no, an operator should read the same sentence and find the same
+    // procedure in the docs (api-compat, docs/operations.md).
+    if args.force_new_cluster {
+        anyhow::bail!(
+            "--force-new-cluster is not implemented: this node cannot rebuild a cluster from \
+             its own raft state by discarding the other members. A manager that still has its \
+             raft directory needs no forcing -- restart satld and it resumes. A manager that \
+             lost it is recovered by restoring that directory from a backup (the 'dek' key \
+             file included) or, on a cluster with other managers, by discarding this node's \
+             identity and re-joining it. Both procedures are in the backup and restore \
+             section of docs/operations.md."
+        );
+    }
     let body = SwarmInitBody {
         listen_addr: args.listen_addr.clone().unwrap_or_default(),
         advertise_addr: args.advertise_addr.clone().unwrap_or_default(),
@@ -444,7 +463,7 @@ To add a manager to this swarm, run 'satl swarm join-token manager' and follow t
         let args = InitArgs {
             advertise_addr: Some("10.2.0.11:2377".to_owned()),
             listen_addr: Some("0.0.0.0:2377".to_owned()),
-            force_new_cluster: true,
+            force_new_cluster: false,
             autolock: false,
         };
         let code = execute(&stub.host(), &SwarmCommand::Init(args), &mut streams)
@@ -459,7 +478,42 @@ To add a manager to this swarm, run 'satl swarm join-token manager' and follow t
         let call = stub.first_call("POST /swarm/init").expect("init call");
         assert_eq!(
             call.body,
-            r#"{"ListenAddr":"0.0.0.0:2377","AdvertiseAddr":"10.2.0.11:2377","ForceNewCluster":true}"#
+            r#"{"ListenAddr":"0.0.0.0:2377","AdvertiseAddr":"10.2.0.11:2377","ForceNewCluster":false}"#
+        );
+    }
+
+    /// The flag is refused **without a round trip**: the daemon's answer is a
+    /// permanent 501, so an operator should not have to reach it to find out.
+    #[tokio::test]
+    async fn init_refuses_force_new_cluster_locally() {
+        // A stub that would answer if it were asked. It must not be.
+        let stub = Stub::start().await;
+        stub.on(
+            "POST",
+            "/swarm/init",
+            Reply::json(200, &format!("\"{NODE_ID}\"")),
+        );
+
+        let (mut streams, _out, _err) = testing::streams();
+        let args = InitArgs {
+            advertise_addr: None,
+            listen_addr: None,
+            force_new_cluster: true,
+            autolock: false,
+        };
+        let err = execute(&stub.host(), &SwarmCommand::Init(args), &mut streams)
+            .await
+            .expect_err("the flag is refused");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--force-new-cluster is not implemented"),
+            "{msg}"
+        );
+        assert!(msg.contains("docs/operations.md"), "{msg}");
+        assert!(
+            stub.first_call("POST /swarm/init").is_none(),
+            "the refusal is local: the daemon was never asked"
         );
     }
 

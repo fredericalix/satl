@@ -12,9 +12,9 @@
 #       leader_kill     overlay_dns   overlay_dns_multinet
 #       publish_port    rolling_update
 #       global_service  global_update   global_node_loss
-#       constraint_enforcer   restart_budget   ca_rotate   compose_stack
-#       mesh_failed_start   build_push_run   stack_verbs   jobs_and_prefs
-#       hot_resize      compose_local
+#       constraint_enforcer   restart_budget   demote_leader   ca_rotate
+#       compose_stack   mesh_failed_start   build_push_run   stack_verbs
+#       jobs_and_prefs  hot_resize   images_rm   compose_local
 #       cleanup
 #
 #   With scenario names: the readiness gate (it always gates), then just
@@ -73,7 +73,7 @@ usage() {
 
 SCENARIOS="init_and_join worker_join replicas_spread node_kill leader_kill overlay_dns \
 overlay_dns_multinet publish_port rolling_update global_service global_update \
-global_node_loss constraint_enforcer restart_budget ca_rotate compose_stack \
+global_node_loss constraint_enforcer restart_budget demote_leader ca_rotate compose_stack \
 mesh_failed_start build_push_run stack_verbs jobs_and_prefs hot_resize images_rm compose_local cleanup"
 
 READINESS_ONLY=0
@@ -541,7 +541,7 @@ cluster_live_jails() {
 	echo "$_total"
 }
 
-# node_audit <node> — "jails=<n> epairs=<n> datasets=<n> mounts=<n>", the
+# node_audit <node> — "jails=<n> epairs=<n> datasets=<n> mounts=<n> rdr=<n>", the
 # leftover audit.
 #
 # `satl0` is excluded from the epair count on purpose: it is the node's bridge
@@ -590,8 +590,19 @@ mounts=$(mount -p |
     while read -r id; do
 	printf '%s\n' "$live" | grep -qx "$id" || echo "$id"
     done | wc -l | tr -d ' ')
-printf 'jails=%s epairs=%s datasets=%s mounts=%s\n' \
-    "$jails" "$epairs" "$datasets" "$mounts"
+# Redirects left in the satl/rdr anchor. stderr is dropped on purpose: an
+# anchor that was never loaded prints `DIOCGETRULES: Invalid argument` and
+# still exits 0, so "no anchor" and "empty anchor" read the same -- which is
+# what absence means here.
+#
+# Safe to demand zero alongside jails=0: with no container anywhere on the
+# node, no redirect can legitimately point at one. Without this the audit was
+# blind to pf entirely, so `leftovers_gone` and `cleanup` were green with dead
+# redirects on every node -- and a missing satl/rdr anchor was only ever
+# noticed by the one scenario that thought to look.
+rdr=$(pfctl -a satl/rdr -s nat 2>/dev/null | grep -c '^rdr' || true)
+printf 'jails=%s epairs=%s datasets=%s mounts=%s rdr=%s\n' \
+    "$jails" "$epairs" "$datasets" "$mounts" "$rdr"
 REMOTE
 }
 
@@ -1380,10 +1391,16 @@ scenario_node_kill() {
 	ensure_service
 
 	state_fetch "$CTL"
-	VHOST=$(reachable_hosts | head -1)
-	[ -n "$VHOST" ] || fail "no non-leader manager to kill (node ls shows no Reachable)"
-	VICTIM=$(node_of_host "$VHOST")
-	[ -n "$VICTIM" ] || fail "node ls reports hostname '$VHOST', which is in no inventory node"
+	# The victim is chosen by RAFT role. `reachable_hosts` reads the
+	# MANAGER STATUS column, which is written at cluster formation and never
+	# refreshed on a leadership change (see the note in leader_kill) — so
+	# "Reachable" there can be the real leader, and this scenario, whose whole
+	# premise is "a non-leader dies", would silently become a second and
+	# worse-asserted leader_kill.
+	VICTIM=$(a_follower)
+	[ -n "$VICTIM" ] || fail "no manager other than the leader to kill"
+	assert_not_leader "$VICTIM"
+	VHOST=$(host_of "$VICTIM")
 	CTL=$(live_manager "$VICTIM") || fail "no other node can serve reads"
 
 	node_jails "$VICTIM" | awk '$3 > 0 { print $2 }' >"$TMPD/strays"
@@ -1499,10 +1516,13 @@ scenario_leader_kill() {
 	ensure_service
 
 	state_fetch "$CTL"
-	OLD_LEADER_HOST=$(leader_host)
-	[ -n "$OLD_LEADER_HOST" ] || fail "node ls shows no Leader to kill"
-	LEADER=$(node_of_host "$OLD_LEADER_HOST")
-	[ -n "$LEADER" ] || fail "the leader's hostname '$OLD_LEADER_HOST' is in no inventory node"
+	# From the daemons' own logs, not from the MANAGER STATUS column this
+	# scenario's own header documents as never refreshed. Reading the column
+	# here was the sharpest version of the problem: run standalone after any
+	# scenario that moved leadership, it killed a FOLLOWER and then waited out
+	# T_ELECT for an election that was never going to happen.
+	LEADER=$(the_leader)
+	OLD_LEADER_HOST=$(host_of "$LEADER")
 	CTL=$(live_manager "$LEADER") || fail "no survivor can serve reads"
 
 	node_jails "$LEADER" | awk '$3 > 0 { print $2 }' >"$TMPD/strays"
@@ -3571,6 +3591,91 @@ the_leader() {
 	echo "$_tl"
 }
 
+# A running manager that is NOT the leader, excluding any node named as an
+# argument. Empty when there is none.
+#
+# The generalisation of the loop ca_rotate already wrote correctly for its
+# rejoin target: leadership comes from the daemons' own logs (`the_leader`),
+# never from `satl node ls`'s MANAGER STATUS column, which is written at
+# cluster formation and never refreshed on a leadership change. A scenario that
+# picks "a follower" from that column can hand itself the real leader.
+a_follower() {
+	_af_leader=$(the_leader)
+	for _af_n in $(cluster_nodes); do
+		[ "$_af_n" = "$_af_leader" ] && continue
+		for _af_x in "$@"; do
+			[ "$_af_n" = "$_af_x" ] && continue 2
+		done
+		echo "$_af_n"
+		return 0
+	done
+	return 0
+}
+
+# Fails unless <node> is the current raft leader.
+assert_leader() {
+	_al_have=$(the_leader)
+	[ "$_al_have" = "$1" ] ||
+	    fail "expected $1 to be the raft leader, but $_al_have is"
+}
+
+# Fails if <node> is the current raft leader.
+assert_not_leader() {
+	_anl_have=$(the_leader)
+	[ "$_anl_have" != "$1" ] ||
+	    fail "expected $1 NOT to be the raft leader, but it is"
+}
+
+# Moves raft leadership onto <node>, or fails.
+#
+# **This is a random walk, not a command.** Stopping the leader leaves two
+# voters and either may win, so each round has roughly even odds and the cap
+# below is a probability, not a guarantee -- 4 rounds failed a real run
+# (~6% of the time), which is why it is 8 here (~99.6%). Raft has no "make this
+# node lead" operation, and openraft's transfer, which SatL does now use for
+# demotion, hands leadership to the most caught-up voter rather than a chosen
+# one.
+#
+# So prefer NOT needing it. A scenario that wants "the hard case" should ask
+# `the_leader` who leads and act on that node, which is deterministic and
+# costs nothing; `demote_leader` does exactly that. This helper is for the
+# suite-level `--leader` option, where the point *is* to start two runs from
+# different leaders and see whether the verdict changes.
+#
+# `satl node demote` is not the mechanism: it removes the node from consensus
+# rather than moving leadership within it.
+require_leader() {
+	_rl_want=$1
+	_rl_round=0
+	while [ "$(the_leader)" != "$_rl_want" ]; do
+		_rl_round=$((_rl_round + 1))
+		[ "$_rl_round" -le 8 ] ||
+		    fail "could not move raft leadership onto $_rl_want after 8 rounds \
+(leader is $(the_leader)); this is a random walk, so a run of bad luck is possible -- \
+re-run, and see require_leader's comment"
+		_rl_cur=$(the_leader)
+		info "moving leadership off $(host_of "$_rl_cur") to reach $(host_of "$_rl_want")"
+		node_satld "$_rl_cur" stop
+		wait_until "$T_ELECT" "a survivor gained leadership" \
+		    '[ -n "$(leader_nodes)" ]'
+		node_satld "$_rl_cur" start
+		wait_until "$T_JOIN" "$(host_of "$_rl_cur") back and the cluster agreed" \
+		    'membership_agreed'
+	done
+	info "raft leadership is on $(host_of "$_rl_want")"
+}
+
+# Redirect rules for <port> in this node's satl/rdr anchor.
+#
+# Generalised off $PUB_PORT so scenarios other than publish_port can assert pf.
+# stderr is dropped on purpose: an anchor that was never loaded prints
+# `DIOCGETRULES: Invalid argument` and still exits 0, so "no anchor" and "empty
+# anchor" read the same -- which is what absence means here.
+rdr_count() {
+	node_ssh "$1" "sudo pfctl -a satl/rdr -s nat 2>/dev/null" |
+	    awk -v p="$2" '/^rdr/ && $0 ~ ("port = " p) {n++} END {print n+0}'
+}
+
 # --- creating and removing the services these scenarios need ---------------
 
 # api_create <spec json> — POST /services/create on $CTL (ru_api: one API helper
@@ -4251,6 +4356,13 @@ node.labels.$CE_LABEL==$CE_MATCH, restart delay ${CE_DELAY}s"
 		[ "$(tasks_live_spread)" = "$CE_EVEN" ]'
 
 	# --- 1. one node stops matching ----------------------------------------
+	# KNOWN-FRAGILE, recorded rather than changed: the first inventory node,
+	# so usually node1, which may be the raft leader. Eviction through the
+	# constraint enforcer then runs on the leader's own node and skips the
+	# `Control.ProposeActions` hop a follower would take. It passes either way
+	# and asserts neither, so it measures a slightly different path depending
+	# on who leads -- the family of problem Phase 4 is about, small enough here
+	# to name rather than fix.
 	CE_NODE=$(cluster_nodes | sed -n 1p)
 	CE_HOST=$(host_of "$CE_NODE")
 	CE_DOOMED=$(tasks_live_ids_on "$CE_HOST" | tr '\n' ' ' | sed 's/ *$//')
@@ -4500,7 +4612,19 @@ indistinguishable from a stuck orchestrator"
 $RB_TOTAL: a restarted manager re-derives the budget from the store and must \
 reach the same answer"
 	svc_rm_audited "$RB"
-	info "cluster left with $GS_NODES managers Ready, leader $(the_leader)"
+	# The cluster is left AGREED, not left with a particular leader.
+	#
+	# Restoring `$RB_LEADER` was tried and is the wrong fix: forcing a specific
+	# node to lead is a random walk (see `require_leader`), so it turns a
+	# cleanup step into a coin flip that can fail the scenario. The dependency
+	# it was meant to break is fixed at the other end instead -- `ca_rotate`
+	# now picks its demote target by raft role rather than inheriting whatever
+	# this scenario left. Which node ends up leading is genuinely this
+	# scenario's subject and no successor's business.
+	wait_until "$T_JOIN" "the cluster agrees again before leaving restart_budget" \
+	    'membership_agreed'
+	info "cluster left with $GS_NODES managers Ready and agreed, leader \
+$(host_of "$(the_leader)")"
 }
 
 # ===========================================================================
@@ -4623,6 +4747,112 @@ cr_token_digest() {
 	node_ssh "$CTL" "satl swarm join-token -q worker 2>/dev/null" | cut -d- -f3
 }
 
+
+# ---------------------------------------------------------------------------
+# Scenario: demote_leader — demoting the CURRENT raft leader, on purpose.
+#
+# The case that used to be met only by accident. `ca_rotate` demoted a
+# hardcoded node, and whether that node led was decided by where the previous
+# scenario left leadership: one run logged `leader node1` and passed, the next
+# logged `leader node3` and timed out, on identical code (decision log,
+# 2026-08-24). A scenario that means to exercise the hard case has to say so
+# and assert it, which is what `require_leader` and `assert_leader` are for.
+#
+# What it pins, beyond "the call returns": the demote completes BOTH halves.
+# Leaving consensus was never the broken part -- writing the role was, because
+# a node out of consensus stops receiving replication and its own store
+# freezes. So the role is read back from a SURVIVOR: a demoted node cannot see
+# its own demotion.
+# ---------------------------------------------------------------------------
+scenario_demote_leader() {
+	m4_prelude
+
+	# Whoever leads right now IS the case under test, so the scenario asks the
+	# cluster instead of imposing a node on it. `require_leader` exists and was
+	# used here first; it is a random walk (stopping the leader leaves two
+	# nodes and either may win), so pinning a *specific* node is a coin flip
+	# with a cap — and it failed a run at 4 rounds. Nothing here needs node1:
+	# it needs the leader, and `the_leader` names it.
+	# `membership_agreed` is not enough to name the leader: it counts the
+	# MANAGER STATUS column, which is written at formation and never refreshed
+	# on a leadership change, so it can read "1 Leader" while raft leadership is
+	# somewhere else entirely. `leader_nodes` reads the daemons' own logs, which
+	# is the only source that moves.
+	wait_until "$T_ELECT" "a manager reports holding raft leadership" '[ -n "$(leader_nodes)" ]'
+
+	DL_TARGET=$(the_leader)
+	assert_leader "$DL_TARGET"
+	DL_HOST=$(host_of "$DL_TARGET")
+	DL_OTHER=$(a_follower)
+	[ -n "$DL_OTHER" ] || fail "demote_leader needs a second manager to read from"
+
+	# The quorum guard refuses a removal until the leader has *heard from* a
+	# quorum of the remaining members within the liveness window, and a
+	# cluster that has just changed leadership has not yet. Node status is the
+	# observable that moves with it, so wait for it before asserting anything
+	# about the demote: without this the scenario failed a run with all three
+	# nodes reading `Unknown`, which is the guard doing its job, not the
+	# defect this scenario exists to catch.
+	wait_until "$T_JOIN" "all nodes Ready, so liveness has observed the managers" \
+	    'state_fetch "$CTL" && [ "$(nodes_ready)" = "$(cluster_nodes | countl)" ]'
+
+	info "satl node demote $DL_HOST — the node being demoted IS the raft leader"
+	# Bounded retry, and deliberately **not** the `|| true` retry Phase 4
+	# removed from `ca_rotate`: that one swallowed every error and turned a
+	# permanent failure into a timeout with no message. This one retries only
+	# while the refusal is the transient liveness one the daemon's own error
+	# text says to retry ("the same command succeeds shortly after"), fails
+	# immediately on any other error, and fails with the real message if the
+	# transient one outlasts the budget. A single shot would assert something
+	# the product explicitly does not promise.
+	dl_deadline=$(($(date +%s) + T_ELECT))
+	while :; do
+		node_ssh "$DL_TARGET" "satl node demote $DL_HOST" >"$TMPD/dldemote" 2>&1 && break
+		grep -q "have answered this node within the liveness window" "$TMPD/dldemote" || {
+			show "$TMPD/dldemote"
+			fail "demoting the current leader was refused"
+		}
+		[ "$(date +%s)" -lt "$dl_deadline" ] || {
+			show "$TMPD/dldemote"
+			fail "the quorum guard never let the leader be demoted within ${T_ELECT}s"
+		}
+		sleep 2
+	done
+	grep -q "demoted in the swarm" "$TMPD/dldemote" || {
+		show "$TMPD/dldemote"
+		fail "the demote did not report Docker's success line"
+	}
+
+	# Read from a survivor, and require BOTH halves: out of consensus (no
+	# manager status) and role flipped. Asserting only the first is what let
+	# the half-demoted state go unnoticed.
+	wait_until "$T_JOIN" "$DL_HOST is a worker as $(host_of "$DL_OTHER") sees it" \
+	    'state_fetch "$DL_OTHER" && [ -z "$(host_mstatus "$DL_HOST")" ] &&
+	     [ "$(host_status "$DL_HOST")" = "Ready" ]'
+	_dl_role=$(node_ssh "$DL_OTHER" "satl node inspect $DL_HOST" 2>/dev/null |
+	    awk -F'"' '/"Role"/ {print $4; exit}')
+	[ "$_dl_role" = "worker" ] ||
+	    fail "$DL_HOST left consensus but its role is '$_dl_role', not 'worker': \
+the demote applied only its raft half"
+
+	# Leadership really moved, and the ex-leader is not it.
+	#
+	# Order matters: `assert_not_leader` goes through `the_leader`, which fails
+	# loudly when nobody holds leadership -- and right after a handover there is
+	# a window with no leader at all. Waiting for one first turns that into the
+	# transient it is, rather than a scenario failure naming the wrong thing.
+	wait_until "$T_ELECT" "another manager leads" '[ -n "$(leader_nodes)" ]'
+	assert_not_leader "$DL_TARGET"
+	info "leadership moved to $(host_of "$(the_leader)")"
+
+	# Put it back, so the next scenario starts from three managers.
+	node_ssh "$DL_OTHER" "satl node promote $DL_HOST" >"$TMPD/dlpromote" 2>&1 || {
+		show "$TMPD/dlpromote"
+		fail "promoting $DL_HOST back was refused"
+	}
+	wait_until "$T_JOIN" "$DL_HOST back to three agreeing managers" 'membership_agreed'
+}
+
 scenario_ca_rotate() {
 	require_swarm
 	build_hostmap
@@ -4641,20 +4871,55 @@ scenario_ca_rotate() {
 	cr_unlabel
 
 	# --- a mixed-role cluster: demote one joiner to a worker -----------------
-	CR_WRK=$(nodes_with_role joiner | sed -n 2p)
-	[ -n "$CR_WRK" ] || fail "ca_rotate needs two joiner nodes in the inventory"
+	# Picked by RAFT role, not by position in the inventory.
+	#
+	# `nodes_with_role joiner | sed -n 2p` was always node3, and whether node3
+	# led was decided by where the previous scenario, restart_budget, happened
+	# to leave leadership — so the same code and the same suite produced
+	# different verdicts, and the green was partly luck (decision log,
+	# 2026-08-24). What this scenario is about is the CA rotation covering a
+	# worker's NodeCA path; demoting the leader is a different test, and it has
+	# its own scenario now.
+	CR_WRK=$(a_follower)
+	[ -n "$CR_WRK" ] ||
+	    fail "ca_rotate needs a manager that is not the leader to demote"
+	assert_not_leader "$CR_WRK"
 	CR_WRK_HOST=$(host_of "$CR_WRK")
-	# The demote is re-issued inside the poll, level-triggered: right after a
-	# scenario that killed a daemon (restart_budget kills the leader), the
-	# demotion's quorum check can transiently see a peer Unreachable and
-	# refuse — correctly. Retrying until the store shows a worker is the
-	# operator's own move; a real refusal keeps refusing and times out here.
+
+	# Read through somebody OTHER than the node being demoted.
+	#
+	# `$CTL` is a global that `require_swarm` points at the first inventory
+	# node that answers, which is node1 -- and picking the target by raft role
+	# means the target can now BE node1. Then every `state_fetch "$CTL"` below
+	# is asking a worker about cluster state, and a worker answers Docker's
+	# refusal (api-compat, "Worker nodes can't be used to view or modify
+	# cluster state"), so the demote succeeds and the poll waiting to observe
+	# it never returns. Measured: fbsd2 showed fbsd1 demoted while this
+	# scenario, reading through fbsd1, sat in `wait_until` until it timed out.
+	# The old hardcoded target hid this by never colliding with `$CTL`.
+	CTL=$(live_manager "$CR_WRK") ||
+	    fail "no manager other than $CR_WRK_HOST can serve reads for this scenario"
+	info "reading cluster state through $(host_of "$CTL"), not the node being demoted"
+	# The demote is issued ONCE and its exit status is asserted.
+	#
+	# It used to be re-issued inside the poll with `|| true`, on the reasoning
+	# that right after restart_budget kills a daemon the quorum check can
+	# transiently see a peer Unreachable and refuse — correctly. That is true,
+	# and the cost was too high: the loop turned a *permanent* refusal into a
+	# 180 s timeout reported as "demote timed out", which is how demoting the
+	# current leader stayed broken and unnoticed (it retried ten times and
+	# handed leadership over zero). The transient is handled where it belongs,
+	# by waiting for the cluster to agree before demoting anything, so a
+	# refusal here is a real one and says so immediately.
+	wait_until "$T_JOIN" "the cluster agrees on its membership before the demote" \
+	    'membership_agreed'
 	info "satl node demote $CR_WRK_HOST — the rotation must cover a worker's NodeCA path"
+	node_ssh "$CTL" "satl node demote $CR_WRK_HOST" >"$TMPD/crdemote" 2>&1 || {
+		show "$TMPD/crdemote"
+		fail "satl node demote $CR_WRK_HOST was refused"
+	}
 	wait_until "$T_JOIN" "$CR_WRK_HOST demoted: empty MANAGER STATUS, still Ready" \
-	    'if state_fetch "$CTL" && [ -n "$(host_mstatus "$CR_WRK_HOST")" ]; then
-	         node_ssh "$CTL" "satl node demote $CR_WRK_HOST" >"$TMPD/crdemote" 2>&1 || true
-	     fi
-	     state_fetch "$CTL" && [ -z "$(host_mstatus "$CR_WRK_HOST")" ] &&
+	    'state_fetch "$CTL" && [ -z "$(host_mstatus "$CR_WRK_HOST")" ] &&
 	     [ "$(host_status "$CR_WRK_HOST")" = "Ready" ]'
 
 	# --- the service, published, serving from every node ---------------------
@@ -5898,19 +6163,25 @@ REMOTE
 	# The base image stays in the store across runs (nothing can remove it —
 	# there is no image-rm verb), so only the first run after a reset pays the
 	# pull and the difference between the two builds is small and noisy.
-	# Hence: "warm must not be slower" always, the 2x rule only when the cold
-	# build was slow enough for the comparison to mean something.
-	[ "$BP_WARM" -le "$BP_COLD" ] ||
-	    fail "the warm rebuild (${BP_WARM}s) was slower than the cold build \
-(${BP_COLD}s): the build cache made things worse"
+	#
+	# BOTH comparisons are therefore gated on the same threshold. "Warm must
+	# not be slower" used not to be, and it failed a whole suite run on
+	# `cold: 1s, warm: 2s` — one second of ssh jitter, at one-second
+	# granularity, on builds too short to measure. An assertion that can only
+	# be read as "the build cache made things worse" must not fire on noise:
+	# it sends the reader after a performance regression that never happened,
+	# which is the same class of harm as a misleading error message.
 	if [ "$BP_COLD" -ge 8 ]; then
+		[ "$BP_WARM" -le "$BP_COLD" ] ||
+		    fail "the warm rebuild (${BP_WARM}s) was slower than the cold build \
+(${BP_COLD}s): the build cache made things worse"
 		[ "$((BP_WARM * 2))" -le "$BP_COLD" ] ||
 		    fail "the warm rebuild (${BP_WARM}s) was faster than cold (${BP_COLD}s) but \
 not by half: the cache hit re-executed work it should have skipped"
 		info "warm at $((BP_WARM * 100 / BP_COLD))% of cold — the cache did its work"
 	else
-		info "cold build under 8s (base already in the store) — the 2x comparison \
-would measure ssh jitter, recorded only"
+		info "cold build under 8s (base already in the store) — both timing \
+comparisons would measure ssh jitter, recorded only"
 	fi
 
 	# --- 5. the two-hop tunnel: build node -> this host -> the joiner's registry --
@@ -6458,6 +6729,11 @@ removal path is supposed to take a task's rules with its container"
 	info "no jail: rctl rule left on any node after service rm"
 
 	# --- 4. N4: the startup purge, exercised ----------------------------------------------
+	# KNOWN-FRAGILE, recorded rather than changed: the first inventory node,
+	# whose satld this stops and starts. If it is the raft leader, that forces
+	# an election -- which used to be left in flight for the next scenario. The
+	# `membership_agreed` wait at the end of this block absorbs it now, which is
+	# why the node pick itself is left alone.
 	HR_N4=$(cluster_nodes | sed -n 1p)
 	if ! node_root_sh "$HR_N4" "$HR_ORPHAN" <<'REMOTE' >"$TMPD/hrplant" 2>&1; then
 rctl -a "jail:$1:memoryuse:sigkill=1048576"
@@ -6479,6 +6755,13 @@ instance's 'startup reconciliation complete' must carry rctl_rules_purged >= 1 (
 	[ "$(hr_jail_rules "$HR_N4")" = 0 ] ||
 	    fail "$HR_N4 still has jail: rctl rules after the startup purge"
 	info "the startup purge reaped the orphan and logged rctl_rules_purged (N4)"
+
+	# The restart above may have taken this node's raft leadership with it, and
+	# an election in flight is not a state to hand to the next scenario: this
+	# one used to return with one under way, which is precisely the kind of
+	# inheritance that decided ca_rotate's verdict elsewhere.
+	wait_until "$T_JOIN" "the cluster agrees again after restarting $HR_N4" \
+	    'membership_agreed'
 
 	# --- the suite expects three Ready managers ---------------------------------------------
 	wait_until "$T_JOIN" "every node Ready again after $HR_N4's restart" '
@@ -6939,7 +7222,7 @@ scenario_cleanup() {
 leftovers_gone() {
 	for _lg in $(cluster_nodes); do
 		_a=$(node_audit "$_lg") || return 1
-		[ "$_a" = "jails=0 epairs=0 datasets=0 mounts=0" ] || return 1
+		[ "$_a" = "jails=0 epairs=0 datasets=0 mounts=0 rdr=0" ] || return 1
 	done
 	return 0
 }

@@ -514,13 +514,13 @@ possession of the socket or a valid client cert is authorization).
 ## 7. Internal protocols (gRPC over mTLS)
 
 All node-to-node traffic is tonic + rustls, one connection per peer, mTLS with role
-verification per service (§12). `proto/` defines package `satl.internal.v1`:
+verification per service (§12). `proto/` defines package `satl.internal.v2`:
 
 | Service | Role required | RPCs (summary) |
 |---|---|---|
 | `Dispatcher` | worker or manager | `Session` (server-stream), `Heartbeat`, `UpdateTaskStatus`, `Assignments` (server-stream) |
 | `NodeCA` | none (bootstrap) / any | `GetRootCACertificate`, `IssueNodeCertificate` (token-authenticated), `NodeCertificateStatus` |
-| `Raft` | manager | openraft network: `AppendEntries`, `Vote`, `InstallSnapshot` (chunked) |
+| `Raft` | manager | openraft network: `AppendEntries`, `Vote`, `FullSnapshot` (client-streaming), `TransferLeader` |
 | `Control` | manager | leader-forwarded store mutations, `JoinRaft`/`LeaveRaft`, cluster info for REST backend |
 | `Health` | any | standard gRPC health, services `raft`, `control` |
 

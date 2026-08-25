@@ -84,7 +84,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use satl_agent::LinuxEmulation;
+use satl_agent::{DbError, LinuxEmulation};
 use satl_cluster::ClusterStore;
 use satl_core::{DesiredState, Id};
 use satl_dispatcher::assignment::belongs_to;
@@ -195,27 +195,26 @@ pub fn live_tasks(store: &ClusterStore, node_id: &Id) -> BTreeMap<Id, DesiredSta
         .collect()
 }
 
-/// This node's tasks as the **local task DB** records them, status merged
-/// (the persisted status is canonical over the assignment's copy, §7.2).
+/// The tasks this node has been assigned, from its own persisted task db.
 ///
-/// This is a worker's only claim set: its records *are* what the dispatcher
-/// told it to run, persisted (architecture §7.2), so on a node with no store
-/// they play the store's role in every sweep below.
-async fn local_tasks(node: &NodeRuntime) -> Vec<Arc<satl_core::Task>> {
-    match node.task_db.list().await {
-        Ok(records) => records
-            .into_iter()
-            .map(|record| {
-                let mut task = record.task;
-                task.status = record.status;
-                Arc::new(task)
-            })
-            .collect(),
-        Err(error) => {
-            tracing::warn!(%error, "cannot read the local task db; treating it as empty");
-            Vec::new()
-        }
-    }
+/// **A read failure is not an empty node.** Every caller turns this into a
+/// *claim set*, and anything not claimed is a leftover to be destroyed:
+/// `run_worker` feeds it to the jail, mount, dataset and epair sweeps, and the
+/// port sweep derives the whole `satl/rdr` anchor from it. Returning
+/// `Vec::new()` on an unreadable db therefore told startup reconciliation that
+/// every running container on the node was an orphan. Callers must skip the
+/// pass instead: refusing to reconcile is always safer than reconciling
+/// against "nothing is claimed".
+async fn local_tasks(node: &NodeRuntime) -> Result<Vec<Arc<satl_core::Task>>, DbError> {
+    let records = node.task_db.list().await?;
+    Ok(records
+        .into_iter()
+        .map(|record| {
+            let mut task = record.task;
+            task.status = record.status;
+            Arc::new(task)
+        })
+        .collect())
 }
 
 /// Run the startup pass. Never fails: every step logs its own trouble and the
@@ -313,7 +312,20 @@ pub async fn run(store: &ClusterStore, node_id: &Id, node: &NodeRuntime) -> Reco
 /// untouched, exactly like the jails they serve.
 #[tracing::instrument(skip_all, fields(node_id = %node_id))]
 pub async fn run_worker(node_id: &Id, node: &NodeRuntime) -> ReconcileReport {
-    let tasks = local_tasks(node).await;
+    // An unreadable task db must abort the whole pass: `live_names` is the
+    // claim set every sweep below deletes against, so an empty one destroys
+    // the node's running jails, mounts, datasets and epairs.
+    let tasks = match local_tasks(node).await {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "cannot read the local task db; skipping startup reconciliation entirely \
+                 rather than treating every running container as an orphan"
+            );
+            return ReconcileReport::default();
+        }
+    };
     let live_names: BTreeSet<String> = tasks
         .iter()
         .map(|task| task.id.as_str().to_owned())
@@ -622,7 +634,31 @@ async fn reconcile_ports_over(
                     redirects = report.redirects,
                     published = %summary,
                     mesh = mesh.is_some(),
+                    source = if mesh.is_some() { "store" } else { "task_db" },
                     "published ports converged; the satl/rdr anchor was reloaded"
+                );
+            } else if report.tasks == 0 && force {
+                // A *steady* empty set, and deliberately `debug`.
+                //
+                // The transition into it is already an INFO line: going from N
+                // redirects to none changes the anchor, so it takes the branch
+                // above with `tasks = 0` and now names its `source`, which is
+                // what the original complaint needed -- "nothing publishes
+                // after it" was unreadable because the worker branch said
+                // nothing at all about where it derived from.
+                //
+                // What is left here is the steady state, and on a node that
+                // simply publishes nothing that is the normal condition
+                // for ever. An INFO line every forced pass would be one line a
+                // minute per node saying "still nothing", which is how an
+                // operator learns to stop reading the log. It stays reachable
+                // with `RUST_LOG=satld::reconcile=debug` for the one question
+                // it answers: is this sweep alive and computing empty, or
+                // dead?
+                tracing::debug!(
+                    mesh = mesh.is_some(),
+                    source = if mesh.is_some() { "store" } else { "task_db" },
+                    "no published ports on this node; the satl/rdr anchor is empty"
                 );
             }
             Some(report)
@@ -984,8 +1020,18 @@ pub fn spawn_dataset_sweep(
                 _ = ticker.tick() => {
                     if let Some(core) = slot.get() {
                         let start = std::time::Instant::now();
-                        let claimed =
-                            claimed_tasks(core.store(), &core.node_id, &node).await;
+                        // A claim set we could not build is not an empty one:
+                        // these two sweeps destroy whatever it does not name.
+                        let Ok(claimed) =
+                            claimed_tasks(core.store(), &core.node_id, &node).await
+                        else {
+                            tracing::warn!(
+                                "cannot read the local task db; skipping the mount and \
+                                 dataset sweeps for this pass"
+                            );
+                            satl_metrics::observe_reconcile_pass("dataset", "skipped", 0.0);
+                            continue;
+                        };
                         // Mounts first: a dataset cannot be destroyed while
                         // anything is mounted below it.
                         mount_sweep_pass(&node, &claimed, &mut mounts).await;
@@ -1048,6 +1094,7 @@ pub fn spawn_port_sweep(
                 biased;
                 () = shutdown.cancelled() => return,
                 _ = ticker.tick() => Wake::Tick,
+                () = node.port_sweep_kick.notified() => Wake::RoleChange,
                 received = async {
                     match events.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -1071,6 +1118,10 @@ pub fn spawn_port_sweep(
                     passes.is_multiple_of(PORT_REASSERT_EVERY)
                 }
                 Wake::StoreEvent => false,
+                // Forced: the anchor now describes a kernel state a different
+                // derivation produced, so "unchanged since I last wrote it" is
+                // a belief about somebody else's work.
+                Wake::RoleChange => true,
             };
             if let Some(core) = slot.get() {
                 let start = std::time::Instant::now();
@@ -1078,9 +1129,19 @@ pub fn spawn_port_sweep(
                     reconcile_ports(store, &core.node_id, &node, force).await;
                 } else {
                     // A worker's task DB is its assignment set,
-                    // persisted; the anchor is a function of it.
-                    let tasks = local_tasks(&node).await;
-                    reconcile_ports_over(&tasks, &core.node_id, &node, force, None).await;
+                    // persisted; the anchor is a function of it -- so a db
+                    // we could not read must skip the pass, not empty the
+                    // anchor.
+                    match local_tasks(&node).await {
+                        Ok(tasks) => {
+                            reconcile_ports_over(&tasks, &core.node_id, &node, force, None).await;
+                        }
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "cannot read the local task db; leaving the published-port \
+                             anchor as it is for this pass"
+                        ),
+                    }
                 }
                 satl_metrics::observe_reconcile_pass("port", "ok", start.elapsed().as_secs_f64());
             } else {
@@ -1096,6 +1157,10 @@ enum Wake {
     Tick,
     /// A pool-relevant store event (or a lost feed, which the pass resyncs).
     StoreEvent,
+    /// The cluster core was replaced -- a join, a leave, a promote or a
+    /// demote. The derivation itself changed (store or local task db), so the
+    /// pass is forced rather than left to notice a difference.
+    RoleChange,
 }
 
 /// Whether a store event can change a pool's membership: a task's state,
@@ -1256,7 +1321,7 @@ async fn claimed_tasks(
     store: Option<&ClusterStore>,
     node_id: &Id,
     node: &NodeRuntime,
-) -> BTreeSet<String> {
+) -> Result<BTreeSet<String>, DbError> {
     let mut claimed: BTreeSet<String> = match store {
         Some(store) => {
             // Scope the view: its guard is !Send.
@@ -1268,7 +1333,7 @@ async fn claimed_tasks(
                 .collect()
         }
         None => local_tasks(node)
-            .await
+            .await?
             .into_iter()
             .map(|task| task.id.as_str().to_owned())
             .collect(),
@@ -1280,7 +1345,7 @@ async fn claimed_tasks(
             .into_iter()
             .map(|id| id.as_str().to_owned()),
     );
-    claimed
+    Ok(claimed)
 }
 
 /// Delete every jail in ocijail's state db whose id is not a live task.

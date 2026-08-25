@@ -32,7 +32,7 @@ license-check:
 	for f in `find crates tests -name '*.rs' -not -path '*/target/*' -not -path '*/fixtures/*'` \
 	    proto/*.proto rc.d/satld Makefile ${MAN_PAGES} \
 	    `find . -name '*.sh' -not -path './target/*' -not -path './.git/*'` \
-	    `find hack -name '*.c' -not -path './target/*'`; do \
+	    `[ -d hack ] && find hack -name '*.c' -not -path './target/*'`; do \
 	    if ! head -2 "$$f" | grep -q 'SPDX-License-Identifier'; then \
 	        echo "license-check: $$f lacks an SPDX header"; missing=1; \
 	    fi; \

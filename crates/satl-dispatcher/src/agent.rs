@@ -38,8 +38,8 @@ use std::time::Duration;
 
 use satl_core::defaults::DESCRIPTION_REFRESH;
 use satl_core::{DesiredState, Id, Node, NodeDescription, ResourceRequirements, Task, TaskStatus};
-use satl_proto::v1;
-use satl_proto::v1::dispatcher_client::DispatcherClient;
+use satl_proto::v2;
+use satl_proto::v2::dispatcher_client::DispatcherClient;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -605,12 +605,12 @@ impl AssignmentApplier {
 
 /// Decodes one assignment message into domain changes.
 fn decode_message(
-    message: &v1::AssignmentsMessage,
+    message: &v2::AssignmentsMessage,
 ) -> Result<(MessageKind, Vec<AssignmentChange>), codec::CodecError> {
     let kind = match message.r#type() {
-        v1::assignments_message::Type::Complete => MessageKind::Complete,
-        v1::assignments_message::Type::Incremental => MessageKind::Incremental,
-        v1::assignments_message::Type::Unspecified => {
+        v2::assignments_message::Type::Complete => MessageKind::Complete,
+        v2::assignments_message::Type::Incremental => MessageKind::Incremental,
+        v2::assignments_message::Type::Unspecified => {
             return Err(codec::CodecError::Enum {
                 enum_name: "AssignmentsMessage.Type",
                 value: message.r#type,
@@ -620,9 +620,9 @@ fn decode_message(
     let mut changes = Vec::with_capacity(message.changes.len());
     for change in &message.changes {
         let action = match change.action() {
-            v1::assignment_change::Action::Update => ChangeAction::Update,
-            v1::assignment_change::Action::Remove => ChangeAction::Remove,
-            v1::assignment_change::Action::Unspecified => {
+            v2::assignment_change::Action::Update => ChangeAction::Update,
+            v2::assignment_change::Action::Remove => ChangeAction::Remove,
+            v2::assignment_change::Action::Unspecified => {
                 return Err(codec::CodecError::Enum {
                     enum_name: "AssignmentChange.Action",
                     value: change.action,
@@ -644,41 +644,41 @@ fn decode_message(
 
 fn decode_change(
     action: ChangeAction,
-    item: &v1::assignment::Item,
+    item: &v2::assignment::Item,
 ) -> Result<AssignmentChange, codec::CodecError> {
     // A removal carries only an ID by contract, so it is never decoded as a
     // payload — doing so would reject perfectly legal messages.
     match (action, item) {
-        (ChangeAction::Remove, v1::assignment::Item::Task(task)) => Ok(AssignmentChange::remove(
+        (ChangeAction::Remove, v2::assignment::Item::Task(task)) => Ok(AssignmentChange::remove(
             ObjectRef::Task,
             parse_id("Task", &task.id)?,
         )),
-        (ChangeAction::Remove, v1::assignment::Item::Secret(secret)) => Ok(
+        (ChangeAction::Remove, v2::assignment::Item::Secret(secret)) => Ok(
             AssignmentChange::remove(ObjectRef::Secret, parse_id("Secret", &secret.id)?),
         ),
-        (ChangeAction::Remove, v1::assignment::Item::Config(config)) => Ok(
+        (ChangeAction::Remove, v2::assignment::Item::Config(config)) => Ok(
             AssignmentChange::remove(ObjectRef::Config, parse_id("Config", &config.id)?),
         ),
-        (ChangeAction::Remove, v1::assignment::Item::Network(network)) => {
+        (ChangeAction::Remove, v2::assignment::Item::Network(network)) => {
             Ok(AssignmentChange::remove(
                 ObjectRef::Network,
                 parse_id("NetworkAssignment", &network.id)?,
             ))
         }
-        (ChangeAction::Update, v1::assignment::Item::Network(network)) => {
+        (ChangeAction::Update, v2::assignment::Item::Network(network)) => {
             Ok(AssignmentChange::update(AssignmentItem::Network(Box::new(
                 codec::decode_network(network)?,
             ))))
         }
-        (ChangeAction::Update, v1::assignment::Item::Task(task)) => Ok(AssignmentChange::update(
+        (ChangeAction::Update, v2::assignment::Item::Task(task)) => Ok(AssignmentChange::update(
             AssignmentItem::Task(Box::new(codec::decode_task(task)?)),
         )),
-        (ChangeAction::Update, v1::assignment::Item::Secret(secret)) => {
+        (ChangeAction::Update, v2::assignment::Item::Secret(secret)) => {
             Ok(AssignmentChange::update(AssignmentItem::Secret(Box::new(
                 codec::decode_secret(secret)?,
             ))))
         }
-        (ChangeAction::Update, v1::assignment::Item::Config(config)) => {
+        (ChangeAction::Update, v2::assignment::Item::Config(config)) => {
             Ok(AssignmentChange::update(AssignmentItem::Config(Box::new(
                 codec::decode_config(config)?,
             ))))
@@ -857,7 +857,7 @@ impl<S: AssignmentSink, C: ChannelFactory> Agent<S, C> {
         let encoded = codec::encode_description(&description)?;
         let mut stream = tokio::time::timeout(
             self.config.rpc_timeout,
-            client.clone().session(v1::SessionRequest {
+            client.clone().session(v2::SessionRequest {
                 description: encoded,
                 // Session IDs are never persisted and never reused
                 // (SWK §13.1): a fresh process always registers.
@@ -921,7 +921,7 @@ impl<S: AssignmentSink, C: ChannelFactory> Agent<S, C> {
         loop {
             let response = tokio::time::timeout(
                 self.config.rpc_timeout,
-                client.heartbeat(v1::HeartbeatRequest {
+                client.heartbeat(v2::HeartbeatRequest {
                     session_id: session_id.to_owned(),
                 }),
             )
@@ -939,7 +939,7 @@ impl<S: AssignmentSink, C: ChannelFactory> Agent<S, C> {
     /// Consumes session messages and refreshes the node description.
     async fn session_activity(
         &self,
-        mut stream: tonic::Streaming<v1::SessionMessage>,
+        mut stream: tonic::Streaming<v2::SessionMessage>,
         session_id: &str,
         description: NodeDescription,
     ) -> Result<(), SessionError> {
@@ -981,7 +981,7 @@ impl<S: AssignmentSink, C: ChannelFactory> Agent<S, C> {
         loop {
             let mut sequence = SequenceTracker::new();
             let mut stream = client
-                .assignments(v1::AssignmentsRequest {
+                .assignments(v2::AssignmentsRequest {
                     session_id: session_id.to_owned(),
                 })
                 .await
@@ -1043,7 +1043,7 @@ impl<S: AssignmentSink, C: ChannelFactory> Agent<S, C> {
                 }
                 let result = tokio::time::timeout(
                     self.config.rpc_timeout,
-                    client.update_task_status(v1::UpdateTaskStatusRequest {
+                    client.update_task_status(v2::UpdateTaskStatusRequest {
                         session_id: session_id.to_owned(),
                         updates,
                     }),
@@ -1076,7 +1076,7 @@ impl<S: AssignmentSink, C: ChannelFactory> Agent<S, C> {
     }
 
     /// Folds a session message into the published state.
-    fn absorb(&self, session_id: &str, message: &v1::SessionMessage) {
+    fn absorb(&self, session_id: &str, message: &v2::SessionMessage) {
         let node = match message.node.as_ref().map(codec::decode_node) {
             Some(Ok(node)) => Some(node),
             Some(Err(error)) => {
@@ -1775,8 +1775,8 @@ mod tests {
 
     #[test]
     fn an_unspecified_message_type_is_a_protocol_error() {
-        let message = v1::AssignmentsMessage {
-            r#type: v1::assignments_message::Type::Unspecified as i32,
+        let message = v2::AssignmentsMessage {
+            r#type: v2::assignments_message::Type::Unspecified as i32,
             applies_to: String::new(),
             results_in: "s-1".to_owned(),
             changes: Vec::new(),
@@ -1789,19 +1789,19 @@ mod tests {
 
     #[test]
     fn an_unspecified_action_is_a_protocol_error() {
-        let message = v1::AssignmentsMessage {
-            r#type: v1::assignments_message::Type::Incremental as i32,
+        let message = v2::AssignmentsMessage {
+            r#type: v2::assignments_message::Type::Incremental as i32,
             applies_to: "s-1".to_owned(),
             results_in: "s-2".to_owned(),
-            changes: vec![v1::AssignmentChange {
-                assignment: Some(v1::Assignment {
-                    item: Some(v1::assignment::Item::Secret(v1::Secret {
+            changes: vec![v2::AssignmentChange {
+                assignment: Some(v2::Assignment {
+                    item: Some(v2::assignment::Item::Secret(v2::Secret {
                         id: Id::generate().to_string(),
                         meta: None,
                         payload: Vec::new(),
                     })),
                 }),
-                action: v1::assignment_change::Action::Unspecified as i32,
+                action: v2::assignment_change::Action::Unspecified as i32,
             }],
         };
         assert!(matches!(
@@ -1813,15 +1813,15 @@ mod tests {
     #[test]
     fn a_removal_decodes_from_the_id_alone() {
         let id = Id::generate();
-        let message = v1::AssignmentsMessage {
-            r#type: v1::assignments_message::Type::Incremental as i32,
+        let message = v2::AssignmentsMessage {
+            r#type: v2::assignments_message::Type::Incremental as i32,
             applies_to: "s-1".to_owned(),
             results_in: "s-2".to_owned(),
-            changes: vec![v1::AssignmentChange {
-                assignment: Some(v1::Assignment {
-                    item: Some(v1::assignment::Item::Task(codec::task_removal(&id))),
+            changes: vec![v2::AssignmentChange {
+                assignment: Some(v2::Assignment {
+                    item: Some(v2::assignment::Item::Task(codec::task_removal(&id))),
                 }),
-                action: v1::assignment_change::Action::Remove as i32,
+                action: v2::assignment_change::Action::Remove as i32,
             }],
         };
         let (kind, changes) = decode_message(&message).expect("decode");

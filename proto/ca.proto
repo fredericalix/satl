@@ -44,7 +44,7 @@
 
 syntax = "proto3";
 
-package satl.internal.v1;
+package satl.internal.v2;
 
 import "common.proto";
 

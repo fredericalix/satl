@@ -44,7 +44,7 @@ carries a numbered entry in `docs/api-compat.md`, cited inline throughout this \
 document.
 
 The daemon listens on the unix socket `/var/run/satl.sock`. There is no TCP \
-listener for this API: the cluster's own protocol (`satl.internal.v1`) is a \
+listener for this API: the cluster's own protocol (`satl.internal.v2`) is a \
 separate, node-to-node-only surface on ports 2377 and 2378.
 
 ## Version prefixes

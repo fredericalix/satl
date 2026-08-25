@@ -73,6 +73,14 @@ pub struct NodeRuntime {
     /// The local task database, which the agent re-reports from on every
     /// registration (architecture §7.2).
     pub task_db: TaskDb,
+    /// Wakes the published-port sweep out of band.
+    ///
+    /// The sweep is level-triggered on a 5 s tick and only *forces* a
+    /// re-assert every twelfth pass, so a change of role -- which swaps the
+    /// whole derivation, store to local task db -- would otherwise take up to
+    /// a minute to be reflected in `satl/rdr`. `satld` notifies this whenever
+    /// it republishes the cluster core.
+    pub port_sweep_kick: Arc<tokio::sync::Notify>,
     /// The L4 PROXY-protocol listeners (M6e), fed by the port sweep.
     pub proxy: std::sync::Arc<crate::proxy::ProxyManager>,
     /// Secrets and configs the assignment stream ships, read by task
@@ -362,6 +370,7 @@ pub async fn build(
         worker,
         overlay,
         task_db: db,
+        port_sweep_kick: Arc::new(tokio::sync::Notify::new()),
         dependencies,
         datasets,
         linux,

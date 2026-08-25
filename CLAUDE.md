@@ -117,7 +117,7 @@ and load-bearing, extend, never renumber**.
    and logs name the object, never the payload.
 8. **The Docker REST API is the only external surface**, and every intentional deviation
    from it gets a numbered entry in `api-compat.md` in the same change. The internal gRPC
-   protocol (`satl.internal.v1`) is node-to-node only, with no compatibility promise
+   protocol (`satl.internal.v2`) is node-to-node only, with no compatibility promise
    outside this workspace.
 
 ## Definition of done
@@ -189,7 +189,7 @@ no certificate yet; it pins the CA against the digest in its join token).
   `crates/satl-dispatcher/tests/span_scoping.rs` pins this.
 - Wire payloads are CBOR-encoded `satl-core`/openraft types inside protobuf envelopes, so
   compatibility is governed by serde rules: additive fields with `#[serde(default)]`, never
-  repurpose a name. Anything non-additive means `satl.internal.v2`.
+  repurpose a name. Anything non-additive means `satl.internal.v3`.
 - Node addresses live in `tests/cluster/inventory.toml` **only**, never hardcoded in a
   script or a test.
 

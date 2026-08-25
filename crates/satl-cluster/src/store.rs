@@ -5,8 +5,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use openraft::ServerState;
 use openraft::error::{ClientWriteError, RaftError};
-use openraft::{BasicNode, Raft, ServerState};
 use parking_lot::{RwLock, RwLockReadGuard};
 use tokio::sync::broadcast;
 
@@ -16,7 +16,9 @@ use satl_core::{
 };
 
 use crate::state_machine::StoreInner;
-use crate::types::{Proposal, ProposalRejection, ProposalResponse, TypeConfig};
+use openraft::async_runtime::watch::WatchReceiver;
+
+use crate::types::{Proposal, ProposalRejection, ProposalResponse, Raft, TypeConfig};
 
 /// Why a proposal could not be committed.
 #[derive(Debug, thiserror::Error)]
@@ -41,7 +43,7 @@ pub enum ProposeError {
     /// proposal timeout** (architecture §6.2: a timeout cannot retract an
     /// appended entry and desyncs store vs log).
     #[error("raft error: {0}")]
-    Raft(#[source] Box<RaftError<u64, ClientWriteError<u64, BasicNode>>>),
+    Raft(#[source] Box<RaftError<TypeConfig, ClientWriteError<TypeConfig>>>),
 }
 
 /// Point-in-time metrics of the local Raft node.
@@ -86,7 +88,7 @@ impl ClusterMetrics {
 pub struct ClusterStore {
     inner: Arc<RwLock<StoreInner>>,
     events: broadcast::Sender<StoreEvent>,
-    raft: Raft<TypeConfig>,
+    raft: Raft,
 }
 
 impl ClusterStore {
@@ -95,7 +97,7 @@ impl ClusterStore {
     pub(crate) fn new(
         inner: Arc<RwLock<StoreInner>>,
         events: broadcast::Sender<StoreEvent>,
-        raft: Raft<TypeConfig>,
+        raft: Raft,
     ) -> Self {
         Self {
             inner,
@@ -160,7 +162,7 @@ impl ClusterStore {
     /// Point-in-time Raft metrics of this node.
     #[must_use]
     pub fn metrics(&self) -> ClusterMetrics {
-        let metrics = self.raft.metrics().borrow().clone();
+        let metrics = self.raft.metrics().borrow_watched().clone();
         ClusterMetrics {
             node_raft_id: metrics.id,
             state: metrics.state,
@@ -178,7 +180,7 @@ impl ClusterStore {
     /// effective config is the one that matters for quorum arithmetic.
     #[must_use]
     pub fn raft_members(&self) -> Vec<RaftMember> {
-        let metrics = self.raft.metrics().borrow().clone();
+        let metrics = self.raft.metrics().borrow_watched().clone();
         let voters: BTreeSet<u64> = metrics.membership_config.voter_ids().collect();
         metrics
             .membership_config
@@ -197,7 +199,7 @@ impl ClusterStore {
     /// (`satl-leader-addr` response metadata, architecture §6.5).
     #[must_use]
     pub fn leader_addr(&self) -> Option<String> {
-        let metrics = self.raft.metrics().borrow().clone();
+        let metrics = self.raft.metrics().borrow_watched().clone();
         let leader = metrics.current_leader?;
         metrics
             .membership_config
@@ -213,7 +215,7 @@ impl ClusterStore {
     /// ready" rather than serve an empty list as if it were the truth.
     #[must_use]
     pub fn is_caught_up(&self) -> bool {
-        let metrics = self.raft.metrics().borrow().clone();
+        let metrics = self.raft.metrics().borrow_watched().clone();
         match (
             metrics.last_applied.map(|l| l.index),
             metrics.last_log_index,

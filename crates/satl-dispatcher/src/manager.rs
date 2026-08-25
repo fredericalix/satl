@@ -47,7 +47,7 @@ use satl_core::{
     Availability, Config, Id, Ipv4Cidr, Network, Node, NodeState, ObjectKind, Secret, StoreAction,
     StoreEvent, StoreObject, Task, TaskState,
 };
-use satl_proto::v1;
+use satl_proto::v2;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -150,7 +150,7 @@ impl Inner {
 /// task status moving.
 ///
 /// Cheap to clone (`Arc` inside) — clone it into
-/// [`v1::dispatcher_server::DispatcherServer`] and keep one for the
+/// [`v2::dispatcher_server::DispatcherServer`] and keep one for the
 /// leadership supervisor.
 #[derive(Clone)]
 pub struct Dispatcher {
@@ -201,8 +201,8 @@ impl Dispatcher {
     /// [`identity_interceptor`] instead. Without either, every RPC is
     /// `UNAUTHENTICATED`: this service never guesses who is calling.
     #[must_use]
-    pub fn server(&self) -> v1::dispatcher_server::DispatcherServer<Self> {
-        v1::dispatcher_server::DispatcherServer::new(self.clone())
+    pub fn server(&self) -> v2::dispatcher_server::DispatcherServer<Self> {
+        v2::dispatcher_server::DispatcherServer::new(self.clone())
             .max_decoding_message_size(satl_proto::MAX_MESSAGE_SIZE)
             .max_encoding_message_size(satl_proto::MAX_MESSAGE_SIZE)
     }
@@ -605,11 +605,11 @@ fn session_message(
     session_id: &str,
     current: &SessionSnapshot,
     previous: Option<&SessionSnapshot>,
-) -> Result<v1::SessionMessage, codec::CodecError> {
+) -> Result<v2::SessionMessage, codec::CodecError> {
     let node_changed = previous.is_none_or(|old| old.node != current.node);
     let managers_changed = previous.is_none_or(|old| old.managers != current.managers);
     let ca_changed = previous.is_none_or(|old| old.root_ca != current.root_ca);
-    Ok(v1::SessionMessage {
+    Ok(v2::SessionMessage {
         session_id: session_id.to_owned(),
         node: node_changed
             .then(|| codec::encode_node(&current.node))
@@ -618,7 +618,7 @@ fn session_message(
             current
                 .managers
                 .iter()
-                .map(|peer| v1::WeightedPeer {
+                .map(|peer| v2::WeightedPeer {
                     node_id: peer.node_id.to_string(),
                     addr: peer.addr.clone(),
                     weight: peer.weight,
@@ -637,48 +637,48 @@ fn session_message(
 
 /// One assignment message on the wire.
 fn assignments_message(
-    kind: v1::assignments_message::Type,
+    kind: v2::assignments_message::Type,
     applies_to: &str,
     results_in: &str,
     changes: &[AssignmentChange],
-) -> Result<v1::AssignmentsMessage, codec::CodecError> {
+) -> Result<v2::AssignmentsMessage, codec::CodecError> {
     let mut wire = Vec::with_capacity(changes.len());
     for change in changes {
         let item = match (&change.item, change.key.kind) {
             (Some(AssignmentItem::Task(task)), _) => {
-                v1::assignment::Item::Task(codec::encode_task(task)?)
+                v2::assignment::Item::Task(codec::encode_task(task)?)
             }
             (Some(AssignmentItem::Secret(secret)), _) => {
-                v1::assignment::Item::Secret(codec::encode_secret(secret)?)
+                v2::assignment::Item::Secret(codec::encode_secret(secret)?)
             }
             (Some(AssignmentItem::Config(config)), _) => {
-                v1::assignment::Item::Config(codec::encode_config(config)?)
+                v2::assignment::Item::Config(codec::encode_config(config)?)
             }
             (Some(AssignmentItem::Network(network)), _) => {
-                v1::assignment::Item::Network(codec::encode_network(network)?)
+                v2::assignment::Item::Network(codec::encode_network(network)?)
             }
             (None, ObjectRef::Task) => {
-                v1::assignment::Item::Task(codec::task_removal(&change.key.id))
+                v2::assignment::Item::Task(codec::task_removal(&change.key.id))
             }
             (None, ObjectRef::Secret) => {
-                v1::assignment::Item::Secret(codec::secret_removal(&change.key.id))
+                v2::assignment::Item::Secret(codec::secret_removal(&change.key.id))
             }
             (None, ObjectRef::Config) => {
-                v1::assignment::Item::Config(codec::config_removal(&change.key.id))
+                v2::assignment::Item::Config(codec::config_removal(&change.key.id))
             }
             (None, ObjectRef::Network) => {
-                v1::assignment::Item::Network(codec::network_removal(&change.key.id))
+                v2::assignment::Item::Network(codec::network_removal(&change.key.id))
             }
         };
-        wire.push(v1::AssignmentChange {
-            assignment: Some(v1::Assignment { item: Some(item) }),
+        wire.push(v2::AssignmentChange {
+            assignment: Some(v2::Assignment { item: Some(item) }),
             action: match change.action {
-                ChangeAction::Update => v1::assignment_change::Action::Update as i32,
-                ChangeAction::Remove => v1::assignment_change::Action::Remove as i32,
+                ChangeAction::Update => v2::assignment_change::Action::Update as i32,
+                ChangeAction::Remove => v2::assignment_change::Action::Remove as i32,
             },
         });
     }
-    Ok(v1::AssignmentsMessage {
+    Ok(v2::AssignmentsMessage {
         r#type: kind as i32,
         applies_to: applies_to.to_owned(),
         results_in: results_in.to_owned(),
@@ -687,14 +687,14 @@ fn assignments_message(
 }
 
 #[tonic::async_trait]
-impl v1::dispatcher_server::Dispatcher for Dispatcher {
-    type SessionStream = ReceiverStream<Result<v1::SessionMessage, Status>>;
-    type AssignmentsStream = ReceiverStream<Result<v1::AssignmentsMessage, Status>>;
+impl v2::dispatcher_server::Dispatcher for Dispatcher {
+    type SessionStream = ReceiverStream<Result<v2::SessionMessage, Status>>;
+    type AssignmentsStream = ReceiverStream<Result<v2::AssignmentsMessage, Status>>;
 
     #[tracing::instrument(skip_all, fields(node_id, session_id))]
     async fn session(
         &self,
-        request: Request<v1::SessionRequest>,
+        request: Request<v2::SessionRequest>,
     ) -> Result<Response<Self::SessionStream>, Status> {
         let identity = self.identify(&request)?;
         require_leader(&self.inner.store)?;
@@ -775,8 +775,8 @@ impl v1::dispatcher_server::Dispatcher for Dispatcher {
     #[tracing::instrument(skip_all, fields(node_id))]
     async fn heartbeat(
         &self,
-        request: Request<v1::HeartbeatRequest>,
-    ) -> Result<Response<v1::HeartbeatResponse>, Status> {
+        request: Request<v2::HeartbeatRequest>,
+    ) -> Result<Response<v2::HeartbeatResponse>, Status> {
         let session_id = request.get_ref().session_id.clone();
         let node_id = self.authorize(&request, &session_id)?;
         tracing::Span::current().record("node_id", tracing::field::display(&node_id));
@@ -790,7 +790,7 @@ impl v1::dispatcher_server::Dispatcher for Dispatcher {
             .heartbeat(&node_id, &session_id, period, Instant::now())
             .map_err(|rejection| rejection_status(&rejection))?;
         tracing::trace!(period_ms = period.as_millis(), "heartbeat");
-        Ok(Response::new(v1::HeartbeatResponse {
+        Ok(Response::new(v2::HeartbeatResponse {
             period: Some(codec::duration_to_proto(period)),
         }))
     }
@@ -798,8 +798,8 @@ impl v1::dispatcher_server::Dispatcher for Dispatcher {
     #[tracing::instrument(skip_all, fields(node_id, updates = request.get_ref().updates.len()))]
     async fn update_task_status(
         &self,
-        request: Request<v1::UpdateTaskStatusRequest>,
-    ) -> Result<Response<v1::UpdateTaskStatusResponse>, Status> {
+        request: Request<v2::UpdateTaskStatusRequest>,
+    ) -> Result<Response<v2::UpdateTaskStatusResponse>, Status> {
         let session_id = request.get_ref().session_id.clone();
         let node_id = self.authorize(&request, &session_id)?;
         tracing::Span::current().record("node_id", tracing::field::display(&node_id));
@@ -842,13 +842,13 @@ impl v1::dispatcher_server::Dispatcher for Dispatcher {
             self.inner.status_ready.notify_one();
         }
         tracing::debug!(accepted, pending, "task status batch queued");
-        Ok(Response::new(v1::UpdateTaskStatusResponse {}))
+        Ok(Response::new(v2::UpdateTaskStatusResponse {}))
     }
 
     #[tracing::instrument(skip_all, fields(node_id))]
     async fn assignments(
         &self,
-        request: Request<v1::AssignmentsRequest>,
+        request: Request<v2::AssignmentsRequest>,
     ) -> Result<Response<Self::AssignmentsStream>, Status> {
         let session_id = request.get_ref().session_id.clone();
         let node_id = self.authorize(&request, &session_id)?;
@@ -1422,7 +1422,7 @@ async fn session_loop(
     inner: Arc<Inner>,
     node_id: Id,
     session_id: String,
-    tx: mpsc::Sender<Result<v1::SessionMessage, Status>>,
+    tx: mpsc::Sender<Result<v2::SessionMessage, Status>>,
     cancel: CancellationToken,
 ) {
     let mut events = inner.store.watch();
@@ -1485,7 +1485,7 @@ async fn session_loop(
     }
 }
 
-async fn session_ended(tx: &mpsc::Sender<Result<v1::SessionMessage, Status>>, why: &str) {
+async fn session_ended(tx: &mpsc::Sender<Result<v2::SessionMessage, Status>>, why: &str) {
     tracing::info!(why, "session stream ending");
     let _ = tx
         .send(Err(Status::failed_precondition(why.to_owned())))
@@ -1532,7 +1532,7 @@ async fn assignment_loop(
     inner: Arc<Inner>,
     node_id: Id,
     session_id: String,
-    tx: mpsc::Sender<Result<v1::AssignmentsMessage, Status>>,
+    tx: mpsc::Sender<Result<v2::AssignmentsMessage, Status>>,
     cancel: CancellationToken,
 ) {
     // Subscribe before the snapshot so that nothing committed between the two
@@ -1574,7 +1574,7 @@ async fn assignment_loop(
                     let applies_to = generator.current().to_owned();
                     let results_in = generator.advance();
                     let message = match assignments_message(
-                        v1::assignments_message::Type::Incremental,
+                        v2::assignments_message::Type::Incremental,
                         &applies_to,
                         &results_in,
                         &batch,
@@ -1627,7 +1627,7 @@ async fn send_snapshot(
     inner: &Arc<Inner>,
     tracker: &mut AssignmentTracker,
     generator: &mut SequenceGenerator,
-    tx: &mpsc::Sender<Result<v1::AssignmentsMessage, Status>>,
+    tx: &mpsc::Sender<Result<v2::AssignmentsMessage, Status>>,
 ) -> bool {
     let node_id = tracker.node_id().clone();
     let tasks: Vec<Task> = {
@@ -1660,7 +1660,7 @@ async fn send_snapshot(
     let changes = tracker.snapshot();
     let results_in = generator.advance();
     let message = match assignments_message(
-        v1::assignments_message::Type::Complete,
+        v2::assignments_message::Type::Complete,
         "",
         &results_in,
         &changes,
@@ -1887,22 +1887,22 @@ mod tests {
             AssignmentChange::update(AssignmentItem::Task(Box::new(task.clone()))),
         ];
         let message =
-            assignments_message(v1::assignments_message::Type::Complete, "", "s-1", &changes)
+            assignments_message(v2::assignments_message::Type::Complete, "", "s-1", &changes)
                 .expect("encode");
-        assert_eq!(message.r#type(), v1::assignments_message::Type::Complete);
+        assert_eq!(message.r#type(), v2::assignments_message::Type::Complete);
         assert!(message.applies_to.is_empty());
         assert_eq!(message.results_in, "s-1");
         assert_eq!(message.changes.len(), 2);
         assert_eq!(
             message.changes[0].action(),
-            v1::assignment_change::Action::Update
+            v2::assignment_change::Action::Update
         );
         match message.changes[0]
             .assignment
             .as_ref()
             .and_then(|a| a.item.as_ref())
         {
-            Some(v1::assignment::Item::Secret(wire)) => assert_eq!(wire.id, secret.id.to_string()),
+            Some(v2::assignment::Item::Secret(wire)) => assert_eq!(wire.id, secret.id.to_string()),
             other => panic!("expected a secret first, got {other:?}"),
         }
     }
@@ -1912,7 +1912,7 @@ mod tests {
         let id = Id::generate();
         let changes = vec![AssignmentChange::remove(ObjectRef::Task, id.clone())];
         let message = assignments_message(
-            v1::assignments_message::Type::Incremental,
+            v2::assignments_message::Type::Incremental,
             "s-1",
             "s-2",
             &changes,
@@ -1920,14 +1920,14 @@ mod tests {
         .expect("encode");
         assert_eq!(
             message.changes[0].action(),
-            v1::assignment_change::Action::Remove
+            v2::assignment_change::Action::Remove
         );
         match message.changes[0]
             .assignment
             .as_ref()
             .and_then(|a| a.item.as_ref())
         {
-            Some(v1::assignment::Item::Task(wire)) => {
+            Some(v2::assignment::Item::Task(wire)) => {
                 assert_eq!(wire.id, id.to_string());
                 assert!(wire.payload.is_empty());
             }

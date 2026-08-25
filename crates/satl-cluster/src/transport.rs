@@ -57,18 +57,22 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use openraft::error::{
-    InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Timeout, Unreachable,
+    NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Timeout, Unreachable,
 };
-use openraft::network::{RPCOption, RPCTypes};
+use openraft::network::{RPCOption, RPCTypes, RaftNetworkFactory, RaftNetworkV2};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, TransferLeaderRequest,
+    TransferLeaderResponse, VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory};
+use openraft::storage::Snapshot;
+use openraft::type_config::alias::{SnapshotMetaOf, SnapshotOf, VoteOf};
+use openraft::{BasicNode, OptionalSend};
 use parking_lot::Mutex;
 use rustls::ClientConfig;
 use serde::Serialize;
@@ -79,9 +83,9 @@ use tonic::{Request, Response, Status};
 
 use satl_ca::{LiveIdentity, RoleRequirement, SAN_MANAGER};
 use satl_proto::MAX_MESSAGE_SIZE;
-use satl_proto::v1::raft_client::RaftClient;
-use satl_proto::v1::raft_server::Raft as RaftRpc;
-use satl_proto::v1::{self as pb};
+use satl_proto::v2::raft_client::RaftClient;
+use satl_proto::v2::raft_server::Raft as RaftRpc;
+use satl_proto::v2::{self as pb};
 
 use crate::server::ManagerSlot;
 use crate::types::TypeConfig;
@@ -342,10 +346,92 @@ impl PeerChannels {
 // RaftNetworkFactory
 // ---------------------------------------------------------------------------
 
+/// Set when peers refuse this node's raft messages because its own raft ID is
+/// on the removal blacklist.
+///
+/// A blacklisted ID can never be re-admitted, so a node still carrying one
+/// campaigns for ever and no amount of retrying changes anything: it is a
+/// manager by role and a non-member in fact, and nothing else notices.
+/// Architecture §6.6 already says a node told it was removed wipes its raft
+/// state -- this is that signal arriving from a vote refusal instead of from
+/// the dispatcher, which is the path that had no handler.
+///
+/// Measured: a demote followed quickly by a promote leaves exactly this state,
+/// because the role watcher rebuilds on a *change* and saw worker -> manager
+/// net-zero, so the raft directory was never wiped (decision log, 2026-08-25).
+#[derive(Clone, Debug, Default)]
+pub struct Eviction {
+    /// The raft ID a peer said was blacklisted, once one has.
+    evicted: Arc<Mutex<Option<u64>>>,
+    /// Wakes whoever is waiting to act on the eviction.
+    ///
+    /// The signal has to *push*. The role watcher that acts on it is parked on
+    /// the agent session's watch channel, and an evicted manager's session is
+    /// exactly the thing that does not progress: it dials its own dispatcher,
+    /// which refuses because this node is not the raft leader and never will
+    /// be, so the watch never changes and a flag nobody reads changes nothing.
+    /// Measured on fbsd3 (decision log, 2026-08-25).
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl Eviction {
+    /// A fresh, unset handle.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records that `raft_id` was refused as blacklisted, and wakes waiters.
+    ///
+    /// Only the first refusal is kept, but *every* one notifies: a waiter that
+    /// woke, failed to re-join and went back to sleep must be woken again by
+    /// the next refusal rather than depending on its retry timer alone.
+    pub fn record(&self, raft_id: u64) {
+        {
+            let mut slot = self.evicted.lock();
+            if slot.is_none() {
+                *slot = Some(raft_id);
+            }
+        }
+        self.wake.notify_waiters();
+    }
+
+    /// The raft ID a peer refused, if any.
+    #[must_use]
+    pub fn evicted_raft_id(&self) -> Option<u64> {
+        *self.evicted.lock()
+    }
+
+    /// Consumes the signal, so a rebuild is not requested twice for it.
+    ///
+    /// The rebuild's own role watcher is spawned inside `apply_role`, which
+    /// runs *before* the supervisor publishes the new core to the slot, so for
+    /// a few hundred microseconds a fresh watcher reads the **old** context --
+    /// and would find this flag still set and rebuild all over again. Measured
+    /// on fbsd3: two full wipe-and-re-join cycles 180 us apart for one
+    /// eviction, bounded only by which read won the race (decision log,
+    /// 2026-08-25).
+    ///
+    /// Losing the signal on a rebuild that then fails costs nothing: the peers
+    /// go on refusing, and the next refusal records it again.
+    pub fn clear(&self) {
+        *self.evicted.lock() = None;
+    }
+
+    /// Resolves when a refusal is recorded.
+    ///
+    /// Check [`Self::evicted_raft_id`] *after* creating this future and before
+    /// awaiting it: `notify_waiters` only reaches waiters already registered,
+    /// so a refusal that landed first would otherwise be waited on for ever.
+    pub async fn recorded(&self) {
+        self.wake.notified().await;
+    }
+}
+
 /// openraft's network factory over the internal gRPC `Raft` service.
 ///
-/// A node started without TLS material — a single-node cluster with no
-/// internal listener — gets an **offline** transport instead of a second
+/// A node started without TLS material -- a single-node cluster with no
+/// internal listener -- gets an **offline** transport instead of a second
 /// implementation: every RPC reports [`Unreachable`], which is the same
 /// answer the M0 stub gave and keeps openraft backing off rather than
 /// hot-looping if it is ever invoked. A single-node cluster never invokes it.
@@ -354,6 +440,7 @@ pub struct RaftTransport {
     local_raft_id: u64,
     channels: Option<PeerChannels>,
     liveness: PeerLiveness,
+    eviction: Eviction,
 }
 
 impl RaftTransport {
@@ -373,6 +460,7 @@ impl RaftTransport {
             local_raft_id,
             channels: Some(channels),
             liveness: PeerLiveness::new(),
+            eviction: Eviction::new(),
         }
     }
 
@@ -383,6 +471,7 @@ impl RaftTransport {
             local_raft_id,
             channels: None,
             liveness: PeerLiveness::new(),
+            eviction: Eviction::new(),
         }
     }
 
@@ -390,6 +479,13 @@ impl RaftTransport {
     #[must_use]
     pub fn liveness(&self) -> PeerLiveness {
         self.liveness.clone()
+    }
+
+    /// The shared eviction signal: set when a peer refuses this node's raft
+    /// messages because its own raft ID is blacklisted.
+    #[must_use]
+    pub fn eviction(&self) -> Eviction {
+        self.eviction.clone()
     }
 
     /// The shared channel pool, absent on an offline transport.
@@ -412,6 +508,7 @@ impl RaftNetworkFactory<TypeConfig> for RaftTransport {
             addr: node.addr.clone(),
             channels: self.channels.clone(),
             liveness: self.liveness.clone(),
+            eviction: self.eviction.clone(),
         }
     }
 }
@@ -425,6 +522,7 @@ pub struct RaftConnection {
     addr: String,
     channels: Option<PeerChannels>,
     liveness: PeerLiveness,
+    eviction: Eviction,
 }
 
 impl fmt::Debug for RaftConnection {
@@ -508,7 +606,7 @@ impl RaftConnection {
         }
     }
 
-    fn unreachable(&self, err: &PeerRpcError) -> Unreachable {
+    fn unreachable(&self, err: &PeerRpcError) -> Unreachable<TypeConfig> {
         tracing::debug!(
             target = self.target,
             addr = %self.addr,
@@ -519,7 +617,7 @@ impl RaftConnection {
         Unreachable::new(err)
     }
 
-    fn timeout(&self, action: RPCTypes, timeout: Duration) -> Timeout<u64> {
+    fn timeout(&self, action: RPCTypes, timeout: Duration) -> Timeout<TypeConfig> {
         Timeout {
             action,
             id: self.local_raft_id,
@@ -534,7 +632,37 @@ impl RaftConnection {
     /// openraft backs off instead of hot-looping: a refused role, a
     /// blacklisted sender and a dead peer are all "stop hammering this
     /// address for a while".
+    /// One refusal is special and is recorded rather than only reported: a
+    /// peer saying **this node's own** raft ID is blacklisted. That is
+    /// terminal, not transient -- a blacklisted ID can never be re-admitted --
+    /// so backing off and retrying, which is what `Unreachable` buys, buys
+    /// nothing at all. `satld` watches the flag and rebuilds the node from a
+    /// wiped raft directory, which is architecture §6.6's own rule applied to
+    /// a signal that previously had no handler (decision log, 2026-08-25).
+    ///
+    /// Matched on the message rather than on a code, because
+    /// `PERMISSION_DENIED` is also how a peer refuses a wrong role or a
+    /// foreign cluster, and those are emphatically not "wipe your state".
+    /// `RaftService::accept` is the single producer of this text.
     fn status_error(&self, op: &'static str, status: &Status) -> PeerRpcError {
+        if status.code() == tonic::Code::PermissionDenied
+            && status.message().contains("its raft ID is blacklisted")
+            && status
+                .message()
+                .contains(&format!("raft member {}", self.local_raft_id))
+        {
+            if self.eviction.evicted_raft_id().is_none() {
+                tracing::error!(
+                    raft_id = self.local_raft_id,
+                    peer = self.target,
+                    addr = %self.addr,
+                    op,
+                    "this node's raft ID was removed from the cluster and can never be \
+                     re-admitted; its raft state will be wiped and the node re-joined"
+                );
+            }
+            self.eviction.record(self.local_raft_id);
+        }
         PeerRpcError {
             op,
             target: self.target,
@@ -542,14 +670,42 @@ impl RaftConnection {
             reason: format!("{:?}: {}", status.code(), status.message()),
         }
     }
+
+    /// A raft-level failure reported *by the peer*.
+    ///
+    /// openraft 0.10 fixes the network RPCs' error parameter to `Infallible`:
+    /// a rejection the protocol has an answer for (a higher vote, a log
+    /// conflict) now travels as DATA inside the response, so anything still
+    /// arriving here as a `RaftError` is the remote's own `Fatal` -- its raft
+    /// is shutting down or has panicked. That is not worth retrying
+    /// immediately, so it becomes `Unreachable` and openraft backs off,
+    /// carrying the peer's own message so an operator sees which node failed
+    /// and why.
+    fn remote_raft_error(
+        &self,
+        op: &'static str,
+        source: &RaftError<TypeConfig>,
+    ) -> Unreachable<TypeConfig> {
+        self.unreachable(&PeerRpcError {
+            op,
+            target: self.target,
+            addr: self.addr.clone(),
+            reason: source.to_string(),
+        })
+    }
 }
 
-impl RaftNetwork<TypeConfig> for RaftConnection {
+impl RaftNetworkV2<TypeConfig> for RaftConnection {
+    /// One sealed CBOR blob, as `state_machine` builds it. openraft 0.10 makes
+    /// the snapshot handle a property of the *network* as well as of the state
+    /// machine, because the transport now owns the fragmentation.
+    type SnapshotData = Cursor<Vec<u8>>;
+
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
-    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+    ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
         const OP: &str = "append_entries";
 
         let payload = encode(OP, "AppendEntriesRequest", &rpc)
@@ -577,20 +733,20 @@ impl RaftNetwork<TypeConfig> for RaftConnection {
         };
 
         self.liveness.record_success(self.target);
-        let result: Result<AppendEntriesResponse<u64>, RaftError<u64>> = decode(
+        let result: Result<AppendEntriesResponse<TypeConfig>, RaftError<TypeConfig>> = decode(
             OP,
             "Result<AppendEntriesResponse, RaftError>",
             &response.payload,
         )
         .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        result.map_err(|source| RPCError::RemoteError(RemoteError::new(self.target, source)))
+        result.map_err(|source| RPCError::Unreachable(self.remote_raft_error(OP, &source)))
     }
 
     async fn vote(
         &mut self,
-        rpc: VoteRequest<u64>,
+        rpc: VoteRequest<TypeConfig>,
         option: RPCOption,
-    ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+    ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
         const OP: &str = "vote";
 
         let payload = encode(OP, "VoteRequest", &rpc)
@@ -618,35 +774,156 @@ impl RaftNetwork<TypeConfig> for RaftConnection {
         };
 
         self.liveness.record_success(self.target);
-        let result: Result<VoteResponse<u64>, RaftError<u64>> =
+        let result: Result<VoteResponse<TypeConfig>, RaftError<TypeConfig>> =
             decode(OP, "Result<VoteResponse, RaftError>", &response.payload)
                 .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        result.map_err(|source| RPCError::RemoteError(RemoteError::new(self.target, source)))
+        result.map_err(|source| RPCError::Unreachable(self.remote_raft_error(OP, &source)))
     }
 
-    async fn install_snapshot(
+    /// Sends one whole snapshot as an ordered `SnapshotChunk` stream.
+    ///
+    /// openraft 0.9 chunked snapshots itself and this transport carried one
+    /// chunk per unary call. 0.10 hands the whole snapshot over once and makes
+    /// the fragmentation the transport's business, which is what
+    /// `proto/raft.proto`'s streaming `FullSnapshot` was declared for.
+    ///
+    /// The first frame carries the leader's vote and the snapshot metadata;
+    /// the rest carry [`crate::node::SNAPSHOT_MAX_CHUNK_SIZE`] bytes of body
+    /// each. The deadline is **the whole transfer's**, scaled by the number of
+    /// frames, because tonic gives one future for the whole client-streaming
+    /// call and there is no per-frame hook to reset a timer on: a per-frame
+    /// deadline would need a hand-rolled sender, and the budget below buys the
+    /// same thing (a big snapshot gets proportionally longer) for none of the
+    /// complexity. `soft_ttl` is the per-frame allowance.
+    ///
+    /// `cancel` resolves when the replication task gives up on this transfer;
+    /// it is raced against the send so an abandoned snapshot stops occupying
+    /// the link rather than running to completion into a closed stream.
+    async fn full_snapshot(
         &mut self,
-        rpc: InstallSnapshotRequest<TypeConfig>,
+        vote: VoteOf<TypeConfig>,
+        snapshot: SnapshotOf<TypeConfig, Self::SnapshotData>,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<u64>,
-        RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
-    > {
-        const OP: &str = "install_snapshot";
+    ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
+        const OP: &str = "full_snapshot";
 
-        let payload = encode(OP, "InstallSnapshotRequest", &rpc)
+        let header = encode(OP, "(Vote, SnapshotMeta)", &(&vote, &snapshot.meta))
+            .map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
+        let mut client = self.client(OP).map_err(|e| self.unreachable(&e))?;
+
+        let body = snapshot.snapshot.into_inner();
+        let chunk_size = usize::try_from(crate::node::SNAPSHOT_MAX_CHUNK_SIZE)
+            .expect("the chunk size is a small constant and fits in usize");
+        let from = self.local_raft_id;
+
+        // Built eagerly rather than lazily so the only await inside the stream
+        // is tonic's own send: a chunk that cannot be produced must fail here,
+        // where the error still has somewhere to go.
+        //
+        // The cost is one extra copy of the snapshot -- `body` is borrowed by
+        // the chunk iterator, so it and the frames are both live at the peak.
+        // Accepted because this store holds object metadata and not blobs
+        // (layers are ZFS datasets, never raft entries), so a snapshot is
+        // megabytes rather than gigabytes. If that ever stops being true, the
+        // fix is a lazy sender that pre-validates, not simply dropping the
+        // eager build: the reason above still stands.
+        let mut frames: Vec<pb::SnapshotChunk> = Vec::new();
+        let mut body_chunks = body.chunks(chunk_size).peekable();
+        let mut header = Some(header);
+        while let Some(data) = body_chunks.next() {
+            frames.push(pb::SnapshotChunk {
+                from,
+                header: header.take().unwrap_or_default(),
+                data: data.to_vec(),
+                last: body_chunks.peek().is_none(),
+            });
+        }
+        // An empty snapshot is still a snapshot: it must reach the peer as one
+        // header-only frame, or the receiver would wait for a stream that
+        // never comes.
+        if frames.is_empty() {
+            frames.push(pb::SnapshotChunk {
+                from,
+                header: header.take().unwrap_or_default(),
+                data: Vec::new(),
+                last: true,
+            });
+        }
+
+        // One frame's allowance times the number of frames, so the budget
+        // tracks the snapshot's size instead of capping every transfer at the
+        // same wall clock. `hard_ttl` is the floor: a one-frame snapshot still
+        // gets the ordinary RPC budget.
+        let frame_ttl = option.soft_ttl();
+        let frames_len = u32::try_from(frames.len()).unwrap_or(u32::MAX);
+        let transfer_ttl = frame_ttl.saturating_mul(frames_len).max(option.hard_ttl());
+        let stream = tokio_stream::iter(frames);
+        let call = client.full_snapshot(Request::new(stream));
+
+        let response = tokio::select! {
+            // Cancellation wins the race deliberately: a transfer the
+            // replication task has abandoned should stop using the link now.
+            reason = cancel => return Err(StreamingError::Closed(reason)),
+            sent = tokio::time::timeout(transfer_ttl, call) => match sent {
+                Err(_) => {
+                    return Err(StreamingError::Timeout(
+                        self.timeout(RPCTypes::InstallSnapshot, transfer_ttl),
+                    ));
+                }
+                Ok(Err(status)) => {
+                    self.discard_broken_connection(OP, &status);
+                    return Err(StreamingError::Unreachable(
+                        self.unreachable(&self.status_error(OP, &status)),
+                    ));
+                }
+                Ok(Ok(response)) => response.into_inner(),
+            },
+        };
+
+        self.liveness.record_success(self.target);
+        let result: Result<SnapshotResponse<TypeConfig>, RaftError<TypeConfig>> =
+            decode(OP, "Result<SnapshotResponse, RaftError>", &response.payload)
+                .map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
+        // `StreamingError` has no remote-error variant, and a raft-level
+        // failure on the peer is not something to retry immediately: it gets
+        // the backoff that `Unreachable` carries, with the peer's own message.
+        result.map_err(|source| {
+            StreamingError::Unreachable(self.unreachable(&PeerRpcError {
+                op: OP,
+                target: self.target,
+                addr: self.addr.clone(),
+                reason: source.to_string(),
+            }))
+        })
+    }
+
+    /// The call that makes demoting the current leader terminate.
+    ///
+    /// Without it openraft's default returns `Unreachable` and every peer
+    /// falls back to waiting out the leader lease -- which is exactly the
+    /// 30-40 s stall that made `satl node demote <leader>` retry for ever
+    /// against openraft 0.9, where no such RPC existed at all.
+    async fn transfer_leader(
+        &mut self,
+        req: TransferLeaderRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<TransferLeaderResponse<TypeConfig>, RPCError<TypeConfig>> {
+        const OP: &str = "transfer_leader";
+
+        let payload = encode(OP, "TransferLeaderRequest", &req)
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let mut client = self.client(OP).map_err(|e| self.unreachable(&e))?;
-        let request = Request::new(pb::InstallSnapshotRequest {
+        let request = Request::new(pb::TransferLeaderRequest {
             from: self.local_raft_id,
             payload,
         });
 
-        let call = client.install_snapshot(request);
+        let call = client.transfer_leader(request);
         let response = match tokio::time::timeout(option.hard_ttl(), call).await {
             Err(_) => {
                 return Err(RPCError::Timeout(
-                    self.timeout(RPCTypes::InstallSnapshot, option.hard_ttl()),
+                    self.timeout(RPCTypes::TransferLeader, option.hard_ttl()),
                 ));
             }
             Ok(Err(status)) => {
@@ -659,14 +936,13 @@ impl RaftNetwork<TypeConfig> for RaftConnection {
         };
 
         self.liveness.record_success(self.target);
-        let result: Result<InstallSnapshotResponse<u64>, RaftError<u64, InstallSnapshotError>> =
-            decode(
-                OP,
-                "Result<InstallSnapshotResponse, RaftError<InstallSnapshotError>>",
-                &response.payload,
-            )
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        result.map_err(|source| RPCError::RemoteError(RemoteError::new(self.target, source)))
+        let result: Result<TransferLeaderResponse<TypeConfig>, RaftError<TypeConfig>> = decode(
+            OP,
+            "Result<TransferLeaderResponse, RaftError>",
+            &response.payload,
+        )
+        .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        result.map_err(|source| RPCError::Unreachable(self.remote_raft_error(OP, &source)))
     }
 }
 
@@ -763,7 +1039,7 @@ impl RaftRpc for RaftService {
             )));
         }
 
-        let rpc: VoteRequest<u64> =
+        let rpc: VoteRequest<TypeConfig> =
             decode(OP, "VoteRequest", &request.payload).map_err(|e| decode_status(&e))?;
         let result = ctx.raft.vote(rpc).await;
         let payload = encode(OP, "Result<VoteResponse, RaftError>", &result)
@@ -771,40 +1047,91 @@ impl RaftRpc for RaftService {
         Ok(Response::new(pb::VoteResponse { payload }))
     }
 
-    async fn install_snapshot(
+    /// Reassembles a streamed snapshot and hands it to openraft whole.
+    ///
+    /// The first frame carries the leader's vote and the snapshot metadata;
+    /// every frame carries body bytes. Nothing is applied until the frame
+    /// marked `last` arrives -- an aborted stream is discarded and the leader
+    /// retries, which is what keeps a half-received snapshot from replacing a
+    /// good store.
+    async fn full_snapshot(
         &self,
-        request: Request<pb::InstallSnapshotRequest>,
-    ) -> Result<Response<pb::InstallSnapshotResponse>, Status> {
-        const OP: &str = "install_snapshot";
+        request: Request<tonic::Streaming<pb::SnapshotChunk>>,
+    ) -> Result<Response<pb::FullSnapshotResponse>, Status> {
+        const OP: &str = "full_snapshot";
+        let mut stream = request.into_inner();
+
+        let mut ctx = None;
+        let mut header: Option<(VoteOf<TypeConfig>, SnapshotMetaOf<TypeConfig>)> = None;
+        let mut body: Vec<u8> = Vec::new();
+        let mut complete = false;
+
+        while let Some(chunk) = stream.message().await? {
+            // The admission check runs on the first frame, before any body
+            // byte is buffered: a sender that may not talk to us must not be
+            // able to make us allocate.
+            if ctx.is_none() {
+                ctx = Some(self.accept(chunk.from, OP)?);
+            }
+            if header.is_none() {
+                if chunk.header.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "the first SnapshotChunk of a FullSnapshot stream must carry a header",
+                    ));
+                }
+                header = Some(
+                    decode(OP, "(Vote, SnapshotMeta)", &chunk.header)
+                        .map_err(|e| decode_status(&e))?,
+                );
+            }
+            body.extend_from_slice(&chunk.data);
+            if chunk.last {
+                complete = true;
+                break;
+            }
+        }
+
+        let (Some(ctx), Some((vote, meta))) = (ctx, header) else {
+            return Err(Status::invalid_argument(
+                "the FullSnapshot stream ended before its first frame",
+            ));
+        };
+        if !complete {
+            return Err(Status::aborted(
+                "the FullSnapshot stream ended before the frame marked last; nothing was \
+                 installed and the leader should retry",
+            ));
+        }
+
+        let snapshot = Snapshot {
+            meta,
+            snapshot: Cursor::new(body),
+        };
+        let result = ctx.raft.install_full_snapshot(vote, snapshot).await;
+        let payload = encode(OP, "Result<SnapshotResponse, RaftError>", &result)
+            .map_err(|e| encode_status(&e))?;
+        Ok(Response::new(pb::FullSnapshotResponse { payload }))
+    }
+
+    /// The leader is asking this node to take over now (openraft 0.10).
+    ///
+    /// Handing the request to openraft is the whole job: it disarms this
+    /// node's leader lease for the designated target and campaigns, instead of
+    /// waiting the lease out.
+    async fn transfer_leader(
+        &self,
+        request: Request<pb::TransferLeaderRequest>,
+    ) -> Result<Response<pb::TransferLeaderResponse>, Status> {
+        const OP: &str = "transfer_leader";
         let request = request.into_inner();
         let ctx = self.accept(request.from, OP)?;
 
-        let rpc: InstallSnapshotRequest<TypeConfig> =
-            decode(OP, "InstallSnapshotRequest", &request.payload)
-                .map_err(|e| decode_status(&e))?;
-        let result = ctx.raft.install_snapshot(rpc).await;
-        let payload = encode(
-            OP,
-            "Result<InstallSnapshotResponse, RaftError<InstallSnapshotError>>",
-            &result,
-        )
-        .map_err(|e| encode_status(&e))?;
-        Ok(Response::new(pb::InstallSnapshotResponse { payload }))
-    }
-
-    async fn stream_install_snapshot(
-        &self,
-        _request: Request<tonic::Streaming<pb::SnapshotChunk>>,
-    ) -> Result<Response<pb::InstallSnapshotResponse>, Status> {
-        // Defined in the wire contract so adding it later is not a
-        // compatibility event; M2 ships the unary form and relies on
-        // openraft's own chunking (`proto/raft.proto`). Clients probe with a
-        // fallback on UNIMPLEMENTED, exactly as SwarmKit falls back to
-        // `ProcessRaftMessage`.
-        Err(Status::unimplemented(
-            "StreamInstallSnapshot is not served in this version: snapshots are transferred with \
-             the unary InstallSnapshot RPC and openraft's own chunking",
-        ))
+        let rpc: TransferLeaderRequest<TypeConfig> =
+            decode(OP, "TransferLeaderRequest", &request.payload).map_err(|e| decode_status(&e))?;
+        let result = ctx.raft.handle_transfer_leader(rpc).await;
+        let payload = encode(OP, "Result<TransferLeaderResponse, RaftError>", &result)
+            .map_err(|e| encode_status(&e))?;
+        Ok(Response::new(pb::TransferLeaderResponse { payload }))
     }
 }
 
@@ -823,9 +1150,68 @@ fn encode_status(err: &CodecError) -> Status {
 mod tests {
     use std::collections::BTreeSet;
 
+    /// The eviction signal fires on **this node's own** blacklisting, and on
+    /// nothing else.
+    ///
+    /// The discrimination is the whole point. `PERMISSION_DENIED` is also how
+    /// a peer refuses a wrong role or a foreign cluster, and treating those as
+    /// "wipe your raft state" would destroy a healthy node's identity over a
+    /// misconfiguration. A blacklist refusal naming a *different* member is
+    /// likewise not this node's business: it is what a leader sees while
+    /// relaying for somebody else.
+    #[test]
+    fn only_this_nodes_own_blacklisting_sets_the_eviction_signal() {
+        let conn = |eviction: &Eviction| RaftConnection {
+            local_raft_id: 7,
+            target: 9,
+            addr: "10.0.0.9:2377".to_owned(),
+            channels: None,
+            liveness: PeerLiveness::new(),
+            eviction: eviction.clone(),
+        };
+        let mine = "raft member 7 was removed from this cluster: its raft ID is blacklisted \
+                    and can never be re-admitted. Wipe its raft directory and re-join with a \
+                    fresh join token";
+
+        // A refusal that is not about the blacklist at all.
+        let e = Eviction::new();
+        conn(&e).status_error(
+            "vote",
+            &Status::permission_denied("certificate OU satl-worker cannot call Raft.Vote"),
+        );
+        assert_eq!(
+            e.evicted_raft_id(),
+            None,
+            "a role refusal is not an eviction"
+        );
+
+        // A blacklist refusal about somebody else.
+        let e = Eviction::new();
+        conn(&e).status_error(
+            "append_entries",
+            &Status::permission_denied(mine.replace("raft member 7", "raft member 42")),
+        );
+        assert_eq!(
+            e.evicted_raft_id(),
+            None,
+            "another member's blacklisting is not this node's eviction"
+        );
+
+        // The right code, the right text, this node's own id.
+        let e = Eviction::new();
+        conn(&e).status_error("vote", &Status::permission_denied(mine));
+        assert_eq!(e.evicted_raft_id(), Some(7));
+
+        // The same text under a different code is not a refusal by the
+        // authorizer, so it must not act either.
+        let e = Eviction::new();
+        conn(&e).status_error("vote", &Status::unavailable(mine));
+        assert_eq!(e.evicted_raft_id(), None, "only PERMISSION_DENIED counts");
+    }
+
     use openraft::error::{ClientWriteError, ForwardToLeader};
     use openraft::raft::{AppendEntriesResponse, VoteResponse};
-    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership, Vote};
+    use openraft::{Entry, EntryPayload, Membership, Vote};
 
     use satl_core::{Id, ObjectKind, StoreAction};
 
@@ -837,14 +1223,14 @@ mod tests {
     fn append_entries_request_round_trips_through_cbor() {
         let rpc = AppendEntriesRequest::<TypeConfig> {
             vote: Vote::new(3, 7),
-            prev_log_id: Some(LogId::new(CommittedLeaderId::new(3, 7), 11)),
+            prev_log_id: Some(openraft::testing::log_id::<TypeConfig>(3, 7, 11)),
             entries: vec![
                 Entry {
-                    log_id: LogId::new(CommittedLeaderId::new(3, 7), 12),
+                    log_id: openraft::testing::log_id::<TypeConfig>(3, 7, 12),
                     payload: EntryPayload::Blank,
                 },
                 Entry {
-                    log_id: LogId::new(CommittedLeaderId::new(3, 7), 13),
+                    log_id: openraft::testing::log_id::<TypeConfig>(3, 7, 13),
                     payload: EntryPayload::Normal(Proposal {
                         actions: vec![StoreAction::Remove {
                             kind: ObjectKind::Service,
@@ -853,14 +1239,14 @@ mod tests {
                     }),
                 },
                 Entry {
-                    log_id: LogId::new(CommittedLeaderId::new(3, 7), 14),
-                    payload: EntryPayload::Membership(Membership::new(
+                    log_id: openraft::testing::log_id::<TypeConfig>(3, 7, 14),
+                    payload: EntryPayload::Membership(Membership::new_with_defaults(
                         vec![BTreeSet::from([7_u64, 9])],
-                        None,
+                        [],
                     )),
                 },
             ],
-            leader_commit: Some(LogId::new(CommittedLeaderId::new(3, 7), 12)),
+            leader_commit: Some(openraft::testing::log_id::<TypeConfig>(3, 7, 12)),
         };
 
         let bytes = encode("append_entries", "AppendEntriesRequest", &rpc).expect("encode");
@@ -871,21 +1257,21 @@ mod tests {
 
     #[test]
     fn vote_and_append_responses_round_trip() {
-        let vote = VoteResponse::<u64> {
+        let vote = VoteResponse::<TypeConfig> {
             vote: Vote::new_committed(4, 2),
             vote_granted: true,
-            last_log_id: Some(LogId::new(CommittedLeaderId::new(4, 2), 30)),
+            last_log_id: Some(openraft::testing::log_id::<TypeConfig>(4, 2, 30)),
         };
-        let ok: Result<VoteResponse<u64>, RaftError<u64>> = Ok(vote.clone());
+        let ok: Result<VoteResponse<TypeConfig>, RaftError<TypeConfig>> = Ok(vote.clone());
         let bytes = encode("vote", "Result", &ok).expect("encode");
-        let back: Result<VoteResponse<u64>, RaftError<u64>> =
+        let back: Result<VoteResponse<TypeConfig>, RaftError<TypeConfig>> =
             decode("vote", "Result", &bytes).expect("decode");
         assert_eq!(back.expect("ok"), vote);
 
-        let success = AppendEntriesResponse::<u64>::Success;
-        let ok: Result<AppendEntriesResponse<u64>, RaftError<u64>> = Ok(success);
+        let success = AppendEntriesResponse::<TypeConfig>::Success;
+        let ok: Result<AppendEntriesResponse<TypeConfig>, RaftError<TypeConfig>> = Ok(success);
         let bytes = encode("append_entries", "Result", &ok).expect("encode");
-        let back: Result<AppendEntriesResponse<u64>, RaftError<u64>> =
+        let back: Result<AppendEntriesResponse<TypeConfig>, RaftError<TypeConfig>> =
             decode("append_entries", "Result", &bytes).expect("decode");
         assert!(matches!(back.expect("ok"), AppendEntriesResponse::Success));
     }
@@ -894,15 +1280,15 @@ mod tests {
     /// intact, because openraft's retry logic reads it (`proto/raft.proto`).
     #[test]
     fn a_raft_error_response_round_trips_as_data() {
-        let forward = ForwardToLeader::<u64, BasicNode> {
+        let forward = ForwardToLeader::<TypeConfig> {
             leader_id: Some(9),
             leader_node: Some(BasicNode::new("10.0.0.9:2377")),
         };
-        let err: Result<(), RaftError<u64, ClientWriteError<u64, BasicNode>>> = Err(
+        let err: Result<(), RaftError<TypeConfig, ClientWriteError<TypeConfig>>> = Err(
             RaftError::APIError(ClientWriteError::ForwardToLeader(forward.clone())),
         );
         let bytes = encode("propose", "Result", &err).expect("encode");
-        let back: Result<(), RaftError<u64, ClientWriteError<u64, BasicNode>>> =
+        let back: Result<(), RaftError<TypeConfig, ClientWriteError<TypeConfig>>> =
             decode("propose", "Result", &bytes).expect("decode");
         match back {
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(got))) => {
@@ -913,17 +1299,17 @@ mod tests {
         }
 
         // And the shape the Raft service actually returns.
-        let err: Result<VoteResponse<u64>, RaftError<u64>> =
+        let err: Result<VoteResponse<TypeConfig>, RaftError<TypeConfig>> =
             Err(RaftError::Fatal(openraft::error::Fatal::Stopped));
         let bytes = encode("vote", "Result", &err).expect("encode");
-        let back: Result<VoteResponse<u64>, RaftError<u64>> =
+        let back: Result<VoteResponse<TypeConfig>, RaftError<TypeConfig>> =
             decode("vote", "Result", &bytes).expect("decode");
         assert!(matches!(back, Err(RaftError::Fatal(_))), "{back:?}");
     }
 
     #[test]
     fn decoding_garbage_names_the_operation_and_type() {
-        let err = decode::<VoteRequest<u64>>("vote", "VoteRequest", &[0xff, 0xff, 0xff])
+        let err = decode::<VoteRequest<TypeConfig>>("vote", "VoteRequest", &[0xff, 0xff, 0xff])
             .expect_err("garbage must not decode");
         let msg = err.to_string();
         assert!(msg.contains("vote"), "{msg}");
@@ -979,5 +1365,83 @@ mod tests {
             crate::node::SNAPSHOT_MAX_CHUNK_SIZE * 2 < limit,
             "snapshot chunks must stay comfortably below the 4 MiB gRPC limit"
         );
+    }
+
+    /// The eviction signal has to wake a waiter that is already parked.
+    ///
+    /// This is the half that was missing when the self-heal was first written:
+    /// the flag was set correctly and nothing ever read it, because its only
+    /// reader was blocked on a watch channel that an evicted node never
+    /// advances. A `record` that does not wake is a signal that does not exist.
+    #[tokio::test]
+    async fn recording_an_eviction_wakes_a_waiter_already_parked() {
+        let eviction = Eviction::new();
+        let waiter = eviction.clone();
+        let parked = tokio::spawn(async move { waiter.recorded().await });
+
+        // Give the task time to register before notifying: `notify_waiters`
+        // deliberately does not buffer, which is exactly why the caller checks
+        // the flag after registering.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        eviction.record(7);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+            .await
+            .expect("recording an eviction must wake a parked waiter")
+            .expect("the waiting task must not panic");
+        assert_eq!(eviction.evicted_raft_id(), Some(7));
+    }
+
+    /// A second refusal notifies again, so a re-join that failed is retried on
+    /// the next refusal rather than only on its timer.
+    #[tokio::test]
+    async fn a_repeat_refusal_wakes_again_without_changing_the_recorded_id() {
+        let eviction = Eviction::new();
+        eviction.record(7);
+
+        let waiter = eviction.clone();
+        let parked = tokio::spawn(async move { waiter.recorded().await });
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        eviction.record(9);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+            .await
+            .expect("a repeat refusal must wake a parked waiter")
+            .expect("the waiting task must not panic");
+        assert_eq!(
+            eviction.evicted_raft_id(),
+            Some(7),
+            "the first refusal is the one that identifies this node's dead ID"
+        );
+    }
+
+    /// An eviction is acted on once, not once per reader.
+    ///
+    /// The rebuild's own role watcher starts before the supervisor publishes
+    /// the new core, so it reads the *old* context; without a clear it finds
+    /// the flag still set and rebuilds again. Measured as two full
+    /// wipe-and-re-join cycles for one eviction.
+    #[test]
+    fn clearing_an_eviction_stops_a_second_reader_acting_on_it() {
+        let eviction = Eviction::new();
+        eviction.record(7);
+        assert_eq!(eviction.evicted_raft_id(), Some(7));
+
+        // The handler consumes it...
+        eviction.clear();
+        // ...and a stale reader holding the same handle now sees nothing.
+        let stale = eviction.clone();
+        assert_eq!(
+            stale.evicted_raft_id(),
+            None,
+            "a cleared eviction must not trigger a second rebuild"
+        );
+
+        // A refusal that keeps arriving re-arms it, so a failed rebuild is
+        // retried rather than lost.
+        stale.record(9);
+        assert_eq!(eviction.evicted_raft_id(), Some(9));
     }
 }

@@ -25,7 +25,7 @@
 
 syntax = "proto3";
 
-package satl.internal.v1;
+package satl.internal.v2;
 
 import "common.proto";
 
@@ -130,6 +130,16 @@ message LeaveRaftRequest {
   // The node ID that raft ID belongs to; the leader refuses a mismatch, which
   // is what stops a stale caller from evicting whoever inherited the slot.
   string node_id = 2;
+  // True when this removal is a DEMOTION rather than a node removal.
+  //
+  // The leader then writes `spec.role = worker` on the node object in the same
+  // breath as clearing its manager status, instead of leaving that to the
+  // caller. It has to: the caller may be the departing node itself, and once
+  // the membership change commits that node stops receiving replication, so
+  // its applied store freezes and every re-read loses the optimistic
+  // concurrency check for ever (measured -- see the decision log). The leader
+  // is the one holding a store that still moves.
+  bool demote = 3;
 }
 
 message LeaveRaftResponse {

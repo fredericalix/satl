@@ -45,8 +45,8 @@ use satl_ca::PeerIdentity;
 use satl_core::defaults::{MAX_TX_ACTIONS, MAX_TX_BYTES};
 use satl_core::{StoreAction, Version};
 use satl_proto::MAX_MESSAGE_SIZE;
-use satl_proto::v1::control_client::ControlClient;
-use satl_proto::v1::{self as pb};
+use satl_proto::v2::control_client::ControlClient;
+use satl_proto::v2::{self as pb};
 
 use crate::server::{ManagerContext, ManagerSlot, peer_identity};
 use crate::store::ProposeError;

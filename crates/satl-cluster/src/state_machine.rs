@@ -49,24 +49,26 @@
 //! arbitrarily far behind — it must re-sync from a snapshot read exactly as
 //! a lagged watcher does, rather than replay a synthetic diff.
 
-// Triaged pedantic allow: `StorageError<u64>` (~200 bytes) is the error type
+// Triaged pedantic allow: `StorageError<TypeConfig>` (~200 bytes) is the error type
 // imposed by openraft's storage trait signatures — it cannot be boxed here,
 // and these are cold error paths.
 #![allow(clippy::result_large_err)]
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use openraft::storage::RaftStateMachine;
+use openraft::storage::{EntryResponder, RaftStateMachine};
+use openraft::type_config::alias::{LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::{
-    AnyError, BasicNode, EntryPayload, ErrorSubject, ErrorVerb, LogId, OptionalSend,
-    RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StorageIOError, StoredMembership,
+    AnyError, EntryPayload, ErrorSubject, ErrorVerb, OptionalSend, RaftSnapshotBuilder, Snapshot,
+    SnapshotMeta, StorageError, StoredMembership,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use tokio_stream::{Stream, StreamExt};
 
 use satl_core::defaults::{MAX_TX_ACTIONS, MAX_TX_BYTES};
 use satl_core::{
@@ -78,7 +80,7 @@ use crate::crypto::{Dek, UnsealError};
 use crate::fs_util::atomic_write;
 use crate::types::{Proposal, ProposalRejection, ProposalResponse, TypeConfig};
 
-type Entry = openraft::Entry<TypeConfig>;
+type Entry = openraft::type_config::alias::EntryOf<TypeConfig>;
 
 /// Capacity of the store watch feed. Sized so that control loops that poll
 /// every few milliseconds never lag in practice; a consumer that still lags
@@ -137,8 +139,8 @@ pub(crate) struct StoreInner {
     /// indexed: task names are derived (`<service>.<slot>`) and resolved
     /// through their service.
     pub(crate) names: HashMap<(ObjectKind, String), Id>,
-    pub(crate) last_applied: Option<LogId<u64>>,
-    pub(crate) last_membership: StoredMembership<u64, BasicNode>,
+    pub(crate) last_applied: Option<LogIdOf<TypeConfig>>,
+    pub(crate) last_membership: StoredMembershipOf<TypeConfig>,
     /// Raft member IDs that have been removed from the group and must never
     /// be re-admitted or reused (SWK §11.1, architecture §6.6).
     ///
@@ -509,8 +511,8 @@ impl StoreInner {
 #[derive(Serialize, Deserialize)]
 struct SnapshotPayload {
     snapshot_id: String,
-    last_applied: Option<LogId<u64>>,
-    last_membership: StoredMembership<u64, BasicNode>,
+    last_applied: Option<LogIdOf<TypeConfig>>,
+    last_membership: StoredMembershipOf<TypeConfig>,
     /// Removed raft IDs (SWK §11.1). `default` so a snapshot written before
     /// this field existed still loads.
     #[serde(default)]
@@ -577,17 +579,16 @@ impl SnapshotPayload {
     }
 
     /// The snapshot metadata described by this payload.
-    fn meta(&self) -> SnapshotMeta<u64, BasicNode> {
+    fn meta(&self) -> SnapshotMetaOf<TypeConfig> {
         SnapshotMeta {
             last_log_id: self.last_applied,
             last_membership: self.last_membership.clone(),
-            snapshot_id: self.snapshot_id.clone(),
         }
     }
 }
 
 /// A unique snapshot id: last-applied log id plus wall-clock nanos.
-fn new_snapshot_id(last_applied: Option<LogId<u64>>) -> String {
+fn new_snapshot_id(last_applied: Option<LogIdOf<TypeConfig>>) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -657,8 +658,8 @@ impl StateMachine {
     }
 
     /// Storage error naming the snapshot file and operation.
-    fn snapshot_err(&self, verb: ErrorVerb, msg: &str) -> StorageError<u64> {
-        StorageIOError::new(
+    fn snapshot_err(&self, verb: ErrorVerb, msg: &str) -> StorageError<TypeConfig> {
+        StorageError::new(
             ErrorSubject::Snapshot(None),
             verb,
             AnyError::error(format!(
@@ -666,7 +667,6 @@ impl StateMachine {
                 self.snapshot_path.display()
             )),
         )
-        .into()
     }
 }
 
@@ -773,7 +773,11 @@ pub struct SnapshotBuilder {
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
+    type SnapshotData = Cursor<Vec<u8>>;
+
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<SnapshotOf<TypeConfig, Self::SnapshotData>, io::Error> {
         // Point-in-time copy under the read lock (pure in-memory), then
         // serialize/seal/write on the blocking pool.
         let payload = {
@@ -781,8 +785,10 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
             SnapshotPayload::from_store(&inner, new_snapshot_id(inner.last_applied))
         };
         let meta = payload.meta();
+        // openraft 0.10 dropped `snapshot_id` from `SnapshotMeta`; SatL keeps
+        // its own on the persisted blob, which is the one an operator greps.
         tracing::info!(
-            snapshot_id = %meta.snapshot_id,
+            snapshot_id = %payload.snapshot_id,
             last_log_id = ?meta.last_log_id,
             "building store snapshot"
         );
@@ -804,15 +810,15 @@ impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
 
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(plain)),
+            snapshot: Cursor::new(plain),
         })
     }
 }
 
 impl SnapshotBuilder {
     /// Storage error naming the snapshot file.
-    fn storage_err(&self, msg: &str) -> StorageError<u64> {
-        StorageIOError::new(
+    fn storage_err(&self, msg: &str) -> StorageError<TypeConfig> {
+        StorageError::new(
             ErrorSubject::Snapshot(None),
             ErrorVerb::Write,
             AnyError::error(format!(
@@ -820,50 +826,50 @@ impl SnapshotBuilder {
                 self.snapshot_path.display()
             )),
         )
-        .into()
     }
 }
 
-impl RaftStateMachine<TypeConfig> for StateMachine {
-    type SnapshotBuilder = SnapshotBuilder;
+/// The serialized size a proposal counts against
+/// [`satl_core::defaults::MAX_TX_BYTES`], computed outside the store lock.
+///
+/// The limit check must be deterministic across replicas, and serialization is
+/// CPU work that has no business inside the lock.
+fn proposal_size(entry: &Entry) -> Result<usize, io::Error> {
+    let EntryPayload::Normal(proposal) = &entry.payload else {
+        return Ok(0);
+    };
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(proposal, &mut buf).map_err(|e| {
+        StorageError::<TypeConfig>::apply(
+            entry.log_id,
+            AnyError::error(format!("re-serialize proposal for size check: {e}")),
+        )
+    })?;
+    Ok(buf.len())
+}
 
-    async fn applied_state(
-        &mut self,
-    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
-        let inner = self.store.read();
-        Ok((inner.last_applied, inner.last_membership.clone()))
-    }
-
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ProposalResponse>, StorageError<u64>>
-    where
-        I: IntoIterator<Item = Entry> + OptionalSend,
-        I::IntoIter: OptionalSend,
-    {
-        // Pre-compute proposal sizes outside the lock: the size limit check
-        // must be deterministic, and serialization is CPU work that has no
-        // business inside the store lock.
-        let mut prepared = Vec::new();
-        for entry in entries {
-            let size = if let EntryPayload::Normal(proposal) = &entry.payload {
-                let mut buf = Vec::new();
-                ciborium::ser::into_writer(proposal, &mut buf).map_err(|e| {
-                    StorageIOError::apply(
-                        entry.log_id,
-                        AnyError::error(format!("re-serialize proposal for size check: {e}")),
-                    )
-                })?;
-                buf.len()
-            } else {
-                0
-            };
-            prepared.push((entry, size));
-        }
-
-        let mut replies = Vec::with_capacity(prepared.len());
+impl StateMachine {
+    /// Applies a sized batch and returns one reply per entry, in order.
+    ///
+    /// The whole batch runs under a single write lock so a transaction's
+    /// actions are all-or-nothing across the apply, and the events are
+    /// published only after the lock is released.
+    ///
+    /// This is the half of [`RaftStateMachine::apply`] that touches the store.
+    /// It is separate because openraft 0.10 answers writers through an
+    /// `ApplyResponder` that only openraft can construct, so a unit test can
+    /// never observe a reply through the trait method -- and the replies are
+    /// the specification of the rejection semantics
+    /// (`ProposalRejection::SequenceConflict` and friends). Keeping the store
+    /// mutation and the event publication on one path means the tests exercise
+    /// what production runs; only the responder plumbing differs, and the
+    /// multi-node tests cover that through `Raft::client_write`.
+    fn apply_sized(&self, sized: Vec<(Entry, usize)>) -> Vec<ProposalResponse> {
+        let mut replies = Vec::with_capacity(sized.len());
         let mut pending_events = Vec::new();
         {
             let mut inner = self.store.write();
-            for (entry, size) in prepared {
+            for (entry, size) in sized {
                 replies.push(apply_entry(&mut inner, entry, size, &mut pending_events));
             }
         }
@@ -871,7 +877,88 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         for event in pending_events {
             let _ = self.events.send(event);
         }
-        Ok(replies)
+        replies
+    }
+
+    /// Applies entries the way openraft would, and hands back the replies.
+    ///
+    /// Test-only entry point onto [`Self::apply_sized`]; see its comment for
+    /// why the trait method cannot serve this purpose.
+    #[cfg(test)]
+    fn apply_for_test(&self, entries: Vec<Entry>) -> Vec<ProposalResponse> {
+        let sized = entries
+            .into_iter()
+            .map(|entry| {
+                let size = proposal_size(&entry).expect("test entries re-serialize");
+                (entry, size)
+            })
+            .collect();
+        self.apply_sized(sized)
+    }
+}
+
+impl RaftStateMachine<TypeConfig> for StateMachine {
+    /// One sealed CBOR blob (see the module docs). openraft 0.10 moved this
+    /// off `RaftTypeConfig` and dropped the `Box` around it.
+    type SnapshotData = Cursor<Vec<u8>>;
+
+    type SnapshotBuilder = SnapshotBuilder;
+
+    async fn applied_state(
+        &mut self,
+    ) -> Result<(Option<LogIdOf<TypeConfig>>, StoredMembershipOf<TypeConfig>), io::Error> {
+        let inner = self.store.read();
+        Ok((inner.last_applied, inner.last_membership.clone()))
+    }
+
+    /// openraft 0.10 hands entries in as a *stream* of
+    /// `(entry, Option<ApplyResponder>)` and expects each response to be sent
+    /// through its responder rather than returned in a `Vec`.
+    ///
+    /// The stream is drained in full **before** the store lock is taken. That
+    /// ordering is invariant #4, not a style choice: `.next().await` is an
+    /// await point, and the store lock must never be held across one. It also
+    /// keeps the batch atomic, which is what makes a transaction's actions
+    /// all-or-nothing across the whole apply.
+    ///
+    /// A `None` responder is an entry with no client waiting — every entry on
+    /// a follower, and the blank/membership entries a leader writes for
+    /// itself. Applying it still counts; only the reply is dropped.
+    async fn apply<Strm>(&mut self, entries: Strm) -> Result<(), io::Error>
+    where
+        Strm: Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin + OptionalSend,
+    {
+        // Drain the stream first: `.next().await` is an await point, and the
+        // store lock must never be held across one (invariant #4). Sizing is
+        // fallible, so it also has to finish before any responder exists that
+        // we would owe an answer to.
+        let mut prepared = Vec::new();
+        let mut entries = entries;
+        while let Some(item) = entries.next().await {
+            let (entry, responder) = item?;
+            let size = proposal_size(&entry)?;
+            prepared.push((entry, responder, size));
+        }
+
+        let (responders, sized): (Vec<_>, Vec<_>) = prepared
+            .into_iter()
+            .map(|(entry, responder, size)| (responder, (entry, size)))
+            .unzip();
+        let replies = self.apply_sized(sized);
+
+        // A responder that is never sent leaves `Raft::client_write` hanging
+        // for ever, so this loop must run for every entry that was applied.
+        // That is why the store is touched only once nothing above can fail:
+        // an error while draining drops the responders collected so far, and
+        // what saves those callers is not this function but openraft, which
+        // reads an `Err` from `apply` as fatal and shuts the node down,
+        // cancelling their waits. Do not add a fallible step below this line.
+        for (responder, reply) in responders.into_iter().zip(replies) {
+            if let Some(responder) = responder {
+                responder.send(reply);
+            }
+        }
+        Ok(())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -882,19 +969,12 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         }
     }
 
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
-    }
-
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<u64, BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<u64>> {
+        meta: &SnapshotMetaOf<TypeConfig>,
+        snapshot: Self::SnapshotData,
+    ) -> Result<(), io::Error> {
         tracing::info!(
-            snapshot_id = %meta.snapshot_id,
             last_log_id = ?meta.last_log_id,
             "installing store snapshot"
         );
@@ -928,9 +1008,9 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
 
     async fn get_current_snapshot(
         &mut self,
-    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
+    ) -> Result<Option<SnapshotOf<TypeConfig, Self::SnapshotData>>, io::Error> {
         /// The persisted snapshot's metadata and sealed bytes, if present.
-        type Loaded = Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>;
+        type Loaded = Option<(SnapshotMetaOf<TypeConfig>, Vec<u8>)>;
 
         let dek = self.dek.clone();
         let path = self.snapshot_path.clone();
@@ -952,7 +1032,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
 
         Ok(loaded.map(|(meta, bytes)| Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(bytes)),
+            snapshot: Cursor::new(bytes),
         }))
     }
 }
@@ -961,9 +1041,9 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
 mod tests {
     use std::collections::BTreeMap;
 
+    use openraft::Membership;
     use openraft::storage::RaftStateMachine;
     use openraft::testing::log_id;
-    use openraft::{CommittedLeaderId, Membership};
 
     use satl_core::{Annotations, IpamConfig, Meta, NetworkDriver, NetworkSpec, SecretSpec};
 
@@ -981,7 +1061,7 @@ mod tests {
 
     fn normal_entry(index: u64, actions: Vec<StoreAction>) -> Entry {
         Entry {
-            log_id: openraft::LogId::new(CommittedLeaderId::new(1, 1), index),
+            log_id: openraft::testing::log_id::<TypeConfig>(1, 1, index),
             payload: EntryPayload::Normal(Proposal { actions }),
         }
     }
@@ -1041,19 +1121,15 @@ mod tests {
         }
     }
 
-    async fn apply_one(
-        sm: &mut StateMachine,
-        index: u64,
-        actions: Vec<StoreAction>,
-    ) -> ProposalResponse {
-        let mut replies = sm.apply(vec![normal_entry(index, actions)]).await.unwrap();
+    fn apply_one(sm: &StateMachine, index: u64, actions: Vec<StoreAction>) -> ProposalResponse {
+        let mut replies = sm.apply_for_test(vec![normal_entry(index, actions)]);
         replies.pop().unwrap()
     }
 
     #[tokio::test]
     async fn create_update_remove_happy_path_stamps_log_index() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sm = open_sm(dir.path());
+        let sm = open_sm(dir.path());
         let store = sm.store_handle();
 
         let network = sample_network("backend");
@@ -1061,11 +1137,10 @@ mod tests {
 
         // Create at index 5 → version 5.
         let reply = apply_one(
-            &mut sm,
+            &sm,
             5,
             vec![StoreAction::Create(StoreObject::Network(network.clone()))],
-        )
-        .await;
+        );
         assert_eq!(
             reply,
             ProposalResponse::Applied {
@@ -1082,7 +1157,7 @@ mod tests {
                     .get(&(ObjectKind::Network, "backend".to_owned())),
                 Some(&id)
             );
-            assert_eq!(inner.last_applied, Some(log_id(1, 1, 5)));
+            assert_eq!(inner.last_applied, Some(log_id::<TypeConfig>(1, 1, 5)));
         }
 
         // Update at index 8 with the current version → version 8.
@@ -1090,11 +1165,10 @@ mod tests {
         updated.meta.version = Version(5);
         updated.vni = Some(4097);
         let reply = apply_one(
-            &mut sm,
+            &sm,
             8,
             vec![StoreAction::Update(StoreObject::Network(updated))],
-        )
-        .await;
+        );
         assert_eq!(
             reply,
             ProposalResponse::Applied {
@@ -1110,14 +1184,13 @@ mod tests {
 
         // Remove at index 9.
         let reply = apply_one(
-            &mut sm,
+            &sm,
             9,
             vec![StoreAction::Remove {
                 kind: ObjectKind::Network,
                 id: id.clone(),
             }],
-        )
-        .await;
+        );
         assert_eq!(
             reply,
             ProposalResponse::Applied {
@@ -1134,17 +1207,16 @@ mod tests {
     #[tokio::test]
     async fn sequence_conflict_rejects_whole_transaction() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sm = open_sm(dir.path());
+        let sm = open_sm(dir.path());
         let store = sm.store_handle();
 
         let existing = sample_network("existing");
         let existing_id = existing.id.clone();
         apply_one(
-            &mut sm,
+            &sm,
             1,
             vec![StoreAction::Create(StoreObject::Network(existing.clone()))],
-        )
-        .await;
+        );
 
         // Transaction: one valid create + one stale update. All-or-nothing:
         // the valid create must not apply.
@@ -1153,14 +1225,13 @@ mod tests {
         let mut stale = existing.clone();
         stale.meta.version = Version(0); // store has 1
         let reply = apply_one(
-            &mut sm,
+            &sm,
             2,
             vec![
                 StoreAction::Create(StoreObject::Network(fresh)),
                 StoreAction::Update(StoreObject::Network(stale)),
             ],
-        )
-        .await;
+        );
         assert_eq!(
             reply,
             ProposalResponse::Rejected(ProposalRejection::SequenceConflict {
@@ -1181,31 +1252,29 @@ mod tests {
                 Version(1)
             );
             // The rejected entry still advances the apply cursor.
-            assert_eq!(inner.last_applied, Some(log_id(1, 1, 2)));
+            assert_eq!(inner.last_applied, Some(log_id::<TypeConfig>(1, 1, 2)));
         }
     }
 
     #[tokio::test]
     async fn already_exists_and_not_found_rejections() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sm = open_sm(dir.path());
+        let sm = open_sm(dir.path());
 
         let network = sample_network("net");
         let id = network.id.clone();
         apply_one(
-            &mut sm,
+            &sm,
             1,
             vec![StoreAction::Create(StoreObject::Network(network.clone()))],
-        )
-        .await;
+        );
 
         // Duplicate create.
         let reply = apply_one(
-            &mut sm,
+            &sm,
             2,
             vec![StoreAction::Create(StoreObject::Network(network.clone()))],
-        )
-        .await;
+        );
         assert_eq!(
             reply,
             ProposalResponse::Rejected(ProposalRejection::AlreadyExists {
@@ -1218,11 +1287,10 @@ mod tests {
         let ghost = sample_network("ghost");
         let ghost_id = ghost.id.clone();
         let reply = apply_one(
-            &mut sm,
+            &sm,
             3,
             vec![StoreAction::Update(StoreObject::Network(ghost))],
-        )
-        .await;
+        );
         assert_eq!(
             reply,
             ProposalResponse::Rejected(ProposalRejection::NotFound {
@@ -1233,14 +1301,13 @@ mod tests {
 
         // Remove of a missing object.
         let reply = apply_one(
-            &mut sm,
+            &sm,
             4,
             vec![StoreAction::Remove {
                 kind: ObjectKind::Network,
                 id: ghost_id.clone(),
             }],
-        )
-        .await;
+        );
         assert_eq!(
             reply,
             ProposalResponse::Rejected(ProposalRejection::NotFound {
@@ -1253,22 +1320,21 @@ mod tests {
     #[tokio::test]
     async fn remove_then_create_same_id_in_one_transaction() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sm = open_sm(dir.path());
+        let sm = open_sm(dir.path());
         let store = sm.store_handle();
 
         let network = sample_network("net");
         let id = network.id.clone();
         apply_one(
-            &mut sm,
+            &sm,
             1,
             vec![StoreAction::Create(StoreObject::Network(network.clone()))],
-        )
-        .await;
+        );
 
         let mut replacement = network;
         replacement.spec.annotations.name = "renamed".to_owned();
         let reply = apply_one(
-            &mut sm,
+            &sm,
             2,
             vec![
                 StoreAction::Remove {
@@ -1277,8 +1343,7 @@ mod tests {
                 },
                 StoreAction::Create(StoreObject::Network(replacement)),
             ],
-        )
-        .await;
+        );
         assert_eq!(
             reply,
             ProposalResponse::Applied {
@@ -1303,27 +1368,26 @@ mod tests {
     #[tokio::test]
     async fn event_emission_order_and_commit_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sm = open_sm(dir.path());
+        let sm = open_sm(dir.path());
         let mut watch = sm.event_sender().subscribe();
 
         let network = sample_network("net");
         let secret = sample_secret("db.password", vec![42]);
         let secret_id = secret.id.clone();
         apply_one(
-            &mut sm,
+            &sm,
             1,
             vec![
                 StoreAction::Create(StoreObject::Network(network.clone())),
                 StoreAction::Create(StoreObject::Secret(secret.clone())),
             ],
-        )
-        .await;
+        );
 
         let mut updated = network.clone();
         updated.meta.version = Version(1);
         updated.vni = Some(9);
         apply_one(
-            &mut sm,
+            &sm,
             2,
             vec![
                 StoreAction::Update(StoreObject::Network(updated.clone())),
@@ -1332,8 +1396,7 @@ mod tests {
                     id: secret_id.clone(),
                 },
             ],
-        )
-        .await;
+        );
 
         // Expected stamped shapes.
         let mut created_network = network.clone();
@@ -1366,16 +1429,15 @@ mod tests {
     #[tokio::test]
     async fn rejected_transaction_emits_no_events() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sm = open_sm(dir.path());
+        let sm = open_sm(dir.path());
         let mut watch = sm.event_sender().subscribe();
 
         let ghost = sample_network("ghost");
         let reply = apply_one(
-            &mut sm,
+            &sm,
             1,
             vec![StoreAction::Update(StoreObject::Network(ghost))],
-        )
-        .await;
+        );
         assert!(matches!(reply, ProposalResponse::Rejected(_)));
         assert!(watch.try_recv().is_err(), "rejected tx must emit nothing");
     }
@@ -1383,14 +1445,14 @@ mod tests {
     #[tokio::test]
     async fn max_tx_actions_enforced() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sm = open_sm(dir.path());
+        let sm = open_sm(dir.path());
 
         let actions: Vec<StoreAction> = (0..=MAX_TX_ACTIONS)
             .map(|_| StoreAction::Create(StoreObject::Network(sample_network("n"))))
             .collect();
         let count = actions.len();
         assert_eq!(count, MAX_TX_ACTIONS + 1);
-        let reply = apply_one(&mut sm, 1, actions).await;
+        let reply = apply_one(&sm, 1, actions);
         assert_eq!(
             reply,
             ProposalResponse::Rejected(ProposalRejection::TooManyActions { count })
@@ -1400,7 +1462,7 @@ mod tests {
     #[tokio::test]
     async fn max_tx_bytes_enforced() {
         let dir = tempfile::tempdir().unwrap();
-        let mut sm = open_sm(dir.path());
+        let sm = open_sm(dir.path());
 
         // Two configs just under the per-object limit exceed the 1.5 MiB
         // transaction budget together.
@@ -1408,7 +1470,7 @@ mod tests {
             StoreAction::Create(StoreObject::Config(sample_config("a", vec![7; 900 * 1024]))),
             StoreAction::Create(StoreObject::Config(sample_config("b", vec![7; 900 * 1024]))),
         ];
-        let reply = apply_one(&mut sm, 1, actions).await;
+        let reply = apply_one(&sm, 1, actions);
         match reply {
             ProposalResponse::Rejected(ProposalRejection::TooLarge { bytes }) => {
                 assert!(bytes > MAX_TX_BYTES, "{bytes}");
@@ -1423,17 +1485,17 @@ mod tests {
         let mut sm = open_sm(dir.path());
 
         let blank = Entry {
-            log_id: openraft::LogId::new(CommittedLeaderId::new(1, 1), 1),
+            log_id: openraft::testing::log_id::<TypeConfig>(1, 1, 1),
             payload: EntryPayload::Blank,
         };
         let membership = Entry {
-            log_id: openraft::LogId::new(CommittedLeaderId::new(1, 1), 2),
-            payload: EntryPayload::Membership(Membership::new(
+            log_id: openraft::testing::log_id::<TypeConfig>(1, 1, 2),
+            payload: EntryPayload::Membership(Membership::new_with_defaults(
                 vec![std::collections::BTreeSet::from([1_u64])],
-                None,
+                [],
             )),
         };
-        let replies = sm.apply(vec![blank, membership]).await.unwrap();
+        let replies = sm.apply_for_test(vec![blank, membership]);
         assert_eq!(
             replies,
             vec![
@@ -1446,8 +1508,8 @@ mod tests {
             ]
         );
         let (last_applied, membership) = sm.applied_state().await.unwrap();
-        assert_eq!(last_applied, Some(log_id(1, 1, 2)));
-        assert_eq!(membership.log_id(), &Some(log_id(1, 1, 2)));
+        assert_eq!(last_applied, Some(log_id::<TypeConfig>(1, 1, 2)));
+        assert_eq!(membership.log_id(), &Some(log_id::<TypeConfig>(1, 1, 2)));
         assert_eq!(membership.voter_ids().collect::<Vec<_>>(), vec![1]);
     }
 
@@ -1462,41 +1524,31 @@ mod tests {
         let store = sm.store_handle();
 
         let membership = |index: u64, configs: Vec<BTreeSet<u64>>| Entry {
-            log_id: openraft::LogId::new(CommittedLeaderId::new(1, 1), index),
-            payload: EntryPayload::Membership(Membership::new(configs, None)),
+            log_id: openraft::testing::log_id::<TypeConfig>(1, 1, index),
+            payload: EntryPayload::Membership(Membership::new_with_defaults(configs, [])),
         };
 
         // {1,2,3} -> joint {1,2,3}/{1,2} -> uniform {1,2}: only the uniform
         // step drops node 3 from the node set.
-        sm.apply(vec![membership(1, vec![BTreeSet::from([1_u64, 2, 3])])])
-            .await
-            .unwrap();
+        sm.apply_for_test(vec![membership(1, vec![BTreeSet::from([1_u64, 2, 3])])]);
         assert!(store.read().removed_raft_ids.is_empty());
 
-        sm.apply(vec![membership(
+        sm.apply_for_test(vec![membership(
             2,
             vec![BTreeSet::from([1_u64, 2, 3]), BTreeSet::from([1_u64, 2])],
-        )])
-        .await
-        .unwrap();
+        )]);
         assert!(
             store.read().removed_raft_ids.is_empty(),
             "a joint config still lists the departing member"
         );
 
-        sm.apply(vec![membership(3, vec![BTreeSet::from([1_u64, 2])])])
-            .await
-            .unwrap();
+        sm.apply_for_test(vec![membership(3, vec![BTreeSet::from([1_u64, 2])])]);
         assert_eq!(store.read().removed_raft_ids, BTreeSet::from([3_u64]));
 
         // Re-applying the same config does not double-record, and a later
         // removal accumulates.
-        sm.apply(vec![membership(4, vec![BTreeSet::from([1_u64, 2])])])
-            .await
-            .unwrap();
-        sm.apply(vec![membership(5, vec![BTreeSet::from([1_u64])])])
-            .await
-            .unwrap();
+        sm.apply_for_test(vec![membership(4, vec![BTreeSet::from([1_u64, 2])])]);
+        sm.apply_for_test(vec![membership(5, vec![BTreeSet::from([1_u64])])]);
         assert_eq!(store.read().removed_raft_ids, BTreeSet::from([2_u64, 3]));
 
         // Snapshot -> install into a fresh machine: the blacklist travels.
@@ -1534,19 +1586,21 @@ mod tests {
         let secret = sample_secret("s", b"hunter2".to_vec());
         let secret_id = secret.id.clone();
         apply_one(
-            &mut sm_a,
+            &sm_a,
             7,
             vec![
                 StoreAction::Create(StoreObject::Network(network)),
                 StoreAction::Create(StoreObject::Secret(secret)),
             ],
-        )
-        .await;
+        );
 
         // Build on A; persisted to <dir_a>/snapshot and returned as a blob.
         let mut builder = sm_a.get_snapshot_builder().await;
         let snapshot = builder.build_snapshot().await.unwrap();
-        assert_eq!(snapshot.meta.last_log_id, Some(log_id(1, 1, 7)));
+        assert_eq!(
+            snapshot.meta.last_log_id,
+            Some(log_id::<TypeConfig>(1, 1, 7))
+        );
 
         // The persisted snapshot must be sealed, not plaintext.
         let raw = std::fs::read(dir_a.path().join(SNAPSHOT_FILE_NAME)).unwrap();
@@ -1577,10 +1631,13 @@ mod tests {
                 inner.names.get(&(ObjectKind::Network, "net".to_owned())),
                 Some(&network_id)
             );
-            assert_eq!(inner.last_applied, Some(log_id(1, 1, 7)));
+            assert_eq!(inner.last_applied, Some(log_id::<TypeConfig>(1, 1, 7)));
         }
         let current = sm_b.get_current_snapshot().await.unwrap().unwrap();
-        assert_eq!(current.meta.snapshot_id, snapshot.meta.snapshot_id);
+        // openraft 0.10 dropped `snapshot_id` from `SnapshotMeta`, so the
+        // cursors are what identify a snapshot on the wire now.
+        assert_eq!(current.meta.last_log_id, snapshot.meta.last_log_id);
+        assert_eq!(current.meta.last_membership, snapshot.meta.last_membership);
 
         // Restart both machines from their directories: contents recovered.
         drop(sm_a);
@@ -1594,10 +1651,13 @@ mod tests {
                     inner.networks.get(&network_id).unwrap().meta.version,
                     Version(7)
                 );
-                assert_eq!(inner.last_applied, Some(log_id(1, 1, 7)));
+                assert_eq!(inner.last_applied, Some(log_id::<TypeConfig>(1, 1, 7)));
             }
             let reloaded = sm.get_current_snapshot().await.unwrap().unwrap();
-            assert_eq!(reloaded.meta.last_log_id, Some(log_id(1, 1, 7)));
+            assert_eq!(
+                reloaded.meta.last_log_id,
+                Some(log_id::<TypeConfig>(1, 1, 7))
+            );
         }
     }
 

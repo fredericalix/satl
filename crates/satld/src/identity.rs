@@ -66,7 +66,7 @@ use satl_core::{
     Availability, CertificateStatus, Cluster, Id, Meta, Node, NodeRole, NodeSpec, NodeState,
     NodeStatus, StoreAction, StoreObject,
 };
-use satl_proto::v1;
+use satl_proto::v2;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
@@ -648,8 +648,8 @@ pub async fn join_remote(
 async fn fetch_root_ca(addr: &str) -> Result<Vec<u8>, IdentityError> {
     let channel = crate::channels::unverified_tls_channel(addr)
         .map_err(|err| IdentityError::rpc("GetRootCACertificate", addr, err))?;
-    let mut client = v1::node_ca_client::NodeCaClient::new(channel);
-    let mut request = Request::new(v1::GetRootCaCertificateRequest {});
+    let mut client = v2::node_ca_client::NodeCaClient::new(channel);
+    let mut request = Request::new(v2::GetRootCaCertificateRequest {});
     request.set_timeout(CA_RPC_TIMEOUT);
     let response = client
         .get_root_ca_certificate(request)
@@ -679,8 +679,8 @@ async fn issue(
 ) -> Result<(Id, NodeRole), IssueHop> {
     let channel = crate::channels::pinned_tls_channel(addr, bundle)
         .map_err(|err| IssueHop::failed(addr, err))?;
-    let mut client = v1::node_ca_client::NodeCaClient::new(channel);
-    let mut request = Request::new(v1::IssueNodeCertificateRequest {
+    let mut client = v2::node_ca_client::NodeCaClient::new(channel);
+    let mut request = Request::new(v2::IssueNodeCertificateRequest {
         csr: csr_pem.as_bytes().to_vec(),
         token: token.to_owned(),
         availability: proto_availability(availability) as i32,
@@ -710,10 +710,10 @@ async fn poll_certificate(
 ) -> Result<String, IdentityError> {
     let channel = crate::channels::pinned_tls_channel(addr, bundle)
         .map_err(|err| IdentityError::rpc("NodeCertificateStatus", addr, err))?;
-    let mut client = v1::node_ca_client::NodeCaClient::new(channel);
+    let mut client = v2::node_ca_client::NodeCaClient::new(channel);
     let deadline = SystemTime::now() + JOIN_POLL_TIMEOUT;
     loop {
-        let mut request = Request::new(v1::NodeCertificateStatusRequest {
+        let mut request = Request::new(v2::NodeCertificateStatusRequest {
             node_id: node_id.to_string(),
         });
         request.set_timeout(CA_RPC_TIMEOUT);
@@ -722,7 +722,7 @@ async fn poll_certificate(
             .await
             .map_err(|status| IdentityError::rpc("NodeCertificateStatus", addr, status))?
             .into_inner();
-        if response.status == v1::CertificateStatus::Issued as i32
+        if response.status == v2::CertificateStatus::Issued as i32
             && !response.certificate.is_empty()
         {
             return Ok(String::from_utf8_lossy(&response.certificate).into_owned());
@@ -841,11 +841,11 @@ async fn issue_renewal(
     let channel = channels.channel(addr).map_err(|error| {
         IssueHop::Failed(IdentityError::rpc("IssueNodeCertificate", addr, error))
     })?;
-    let mut client = v1::node_ca_client::NodeCaClient::new(channel);
-    let mut request = Request::new(v1::IssueNodeCertificateRequest {
+    let mut client = v2::node_ca_client::NodeCaClient::new(channel);
+    let mut request = Request::new(v2::IssueNodeCertificateRequest {
         csr: csr_pem.as_bytes().to_vec(),
         token: String::new(),
-        availability: v1::Availability::Unspecified as i32,
+        availability: v2::Availability::Unspecified as i32,
     });
     request.set_timeout(CA_RPC_TIMEOUT);
     match client.issue_node_certificate(request).await {
@@ -890,10 +890,10 @@ async fn poll_certificate_mtls(
     let channel = channels
         .channel(addr)
         .map_err(|error| IdentityError::rpc("NodeCertificateStatus", addr, error))?;
-    let mut client = v1::node_ca_client::NodeCaClient::new(channel);
+    let mut client = v2::node_ca_client::NodeCaClient::new(channel);
     let deadline = SystemTime::now() + JOIN_POLL_TIMEOUT;
     loop {
-        let mut request = Request::new(v1::NodeCertificateStatusRequest {
+        let mut request = Request::new(v2::NodeCertificateStatusRequest {
             node_id: node_id.to_string(),
         });
         request.set_timeout(CA_RPC_TIMEOUT);
@@ -902,7 +902,7 @@ async fn poll_certificate_mtls(
             .await
             .map_err(|status| IdentityError::rpc("NodeCertificateStatus", addr, status))?
             .into_inner();
-        if response.status == v1::CertificateStatus::Issued as i32
+        if response.status == v2::CertificateStatus::Issued as i32
             && !response.certificate.is_empty()
         {
             return Ok(String::from_utf8_lossy(&response.certificate).into_owned());
@@ -919,38 +919,38 @@ async fn poll_certificate_mtls(
 }
 
 /// The proto spelling of an availability.
-fn proto_availability(availability: Availability) -> v1::Availability {
+fn proto_availability(availability: Availability) -> v2::Availability {
     match availability {
-        Availability::Active => v1::Availability::Active,
-        Availability::Pause => v1::Availability::Pause,
-        Availability::Drain => v1::Availability::Drain,
+        Availability::Active => v2::Availability::Active,
+        Availability::Pause => v2::Availability::Pause,
+        Availability::Drain => v2::Availability::Drain,
     }
 }
 
 /// The domain spelling of a proto availability; `None` for `UNSPECIFIED`.
 fn availability_from_proto(value: i32) -> Option<Availability> {
-    match v1::Availability::try_from(value).ok()? {
-        v1::Availability::Unspecified => None,
-        v1::Availability::Active => Some(Availability::Active),
-        v1::Availability::Pause => Some(Availability::Pause),
-        v1::Availability::Drain => Some(Availability::Drain),
+    match v2::Availability::try_from(value).ok()? {
+        v2::Availability::Unspecified => None,
+        v2::Availability::Active => Some(Availability::Active),
+        v2::Availability::Pause => Some(Availability::Pause),
+        v2::Availability::Drain => Some(Availability::Drain),
     }
 }
 
 /// The domain spelling of a proto role; `None` for `UNSPECIFIED`.
 fn role_from_proto(value: i32) -> Option<NodeRole> {
-    match v1::NodeRole::try_from(value).ok()? {
-        v1::NodeRole::Unspecified => None,
-        v1::NodeRole::Worker => Some(NodeRole::Worker),
-        v1::NodeRole::Manager => Some(NodeRole::Manager),
+    match v2::NodeRole::try_from(value).ok()? {
+        v2::NodeRole::Unspecified => None,
+        v2::NodeRole::Worker => Some(NodeRole::Worker),
+        v2::NodeRole::Manager => Some(NodeRole::Manager),
     }
 }
 
 /// The proto spelling of a role.
-fn proto_role(role: NodeRole) -> v1::NodeRole {
+fn proto_role(role: NodeRole) -> v2::NodeRole {
     match role {
-        NodeRole::Worker => v1::NodeRole::Worker,
-        NodeRole::Manager => v1::NodeRole::Manager,
+        NodeRole::Worker => v2::NodeRole::Worker,
+        NodeRole::Manager => v2::NodeRole::Manager,
     }
 }
 
@@ -1088,8 +1088,8 @@ impl NodeCaService {
 
     /// The tonic service, with SatL's message-size limits applied.
     #[must_use]
-    pub fn server(&self) -> v1::node_ca_server::NodeCaServer<Self> {
-        v1::node_ca_server::NodeCaServer::new(self.clone())
+    pub fn server(&self) -> v2::node_ca_server::NodeCaServer<Self> {
+        v2::node_ca_server::NodeCaServer::new(self.clone())
             .max_decoding_message_size(satl_proto::MAX_MESSAGE_SIZE)
             .max_encoding_message_size(satl_proto::MAX_MESSAGE_SIZE)
     }
@@ -1181,26 +1181,26 @@ impl NodeCaService {
 }
 
 #[tonic::async_trait]
-impl v1::node_ca_server::NodeCa for NodeCaService {
+impl v2::node_ca_server::NodeCa for NodeCaService {
     /// Public material only; served by any manager, leader or not, because a
     /// joiner needs it before it can find the leader.
     async fn get_root_ca_certificate(
         &self,
-        _request: Request<v1::GetRootCaCertificateRequest>,
-    ) -> Result<Response<v1::GetRootCaCertificateResponse>, Status> {
+        _request: Request<v2::GetRootCaCertificateRequest>,
+    ) -> Result<Response<v2::GetRootCaCertificateResponse>, Status> {
         let cluster = self.cluster()?;
         let bundle = cluster.root_ca_cert.clone().ok_or_else(|| {
             Status::failed_precondition("this cluster has no root CA on its Cluster object")
         })?;
-        Ok(Response::new(v1::GetRootCaCertificateResponse {
+        Ok(Response::new(v2::GetRootCaCertificateResponse {
             root_ca_bundle: bundle,
         }))
     }
 
     async fn issue_node_certificate(
         &self,
-        request: Request<v1::IssueNodeCertificateRequest>,
-    ) -> Result<Response<v1::IssueNodeCertificateResponse>, Status> {
+        request: Request<v2::IssueNodeCertificateRequest>,
+    ) -> Result<Response<v2::IssueNodeCertificateResponse>, Status> {
         self.require_leader()?;
         let renewal_of = request
             .extensions()
@@ -1279,7 +1279,7 @@ impl v1::node_ca_server::NodeCa for NodeCaService {
             cross_signed = signer.intermediate.is_some(),
             "node certificate signed"
         );
-        Ok(Response::new(v1::IssueNodeCertificateResponse {
+        Ok(Response::new(v2::IssueNodeCertificateResponse {
             node_id: node_id.to_string(),
             role: proto_role(role) as i32,
         }))
@@ -1287,16 +1287,16 @@ impl v1::node_ca_server::NodeCa for NodeCaService {
 
     async fn node_certificate_status(
         &self,
-        request: Request<v1::NodeCertificateStatusRequest>,
-    ) -> Result<Response<v1::NodeCertificateStatusResponse>, Status> {
+        request: Request<v2::NodeCertificateStatusRequest>,
+    ) -> Result<Response<v2::NodeCertificateStatusResponse>, Status> {
         let node_id = request
             .into_inner()
             .node_id
             .parse::<Id>()
             .map_err(|err| Status::invalid_argument(format!("unusable node id: {err}")))?;
         if let Some(pem) = self.issued.recall(&node_id) {
-            return Ok(Response::new(v1::NodeCertificateStatusResponse {
-                status: v1::CertificateStatus::Issued as i32,
+            return Ok(Response::new(v2::NodeCertificateStatusResponse {
+                status: v2::CertificateStatus::Issued as i32,
                 certificate: pem.into_bytes(),
             }));
         }
@@ -1305,11 +1305,11 @@ impl v1::node_ca_server::NodeCa for NodeCaService {
         // restarted); `PENDING` tells the caller to keep polling, `UNKNOWN`
         // that the id means nothing here at all.
         let known = self.store.get()?.view().node(&node_id).is_some();
-        Ok(Response::new(v1::NodeCertificateStatusResponse {
+        Ok(Response::new(v2::NodeCertificateStatusResponse {
             status: if known {
-                v1::CertificateStatus::Pending as i32
+                v2::CertificateStatus::Pending as i32
             } else {
-                v1::CertificateStatus::Unknown as i32
+                v2::CertificateStatus::Unknown as i32
             },
             certificate: Vec::new(),
         }))
@@ -2098,7 +2098,7 @@ mod tests {
         for role in [NodeRole::Worker, NodeRole::Manager] {
             assert_eq!(role_from_proto(proto_role(role) as i32), Some(role));
         }
-        assert_eq!(role_from_proto(v1::NodeRole::Unspecified as i32), None);
+        assert_eq!(role_from_proto(v2::NodeRole::Unspecified as i32), None);
         for availability in [
             Availability::Active,
             Availability::Pause,
@@ -2110,7 +2110,7 @@ mod tests {
             );
         }
         assert_eq!(
-            availability_from_proto(v1::Availability::Unspecified as i32),
+            availability_from_proto(v2::Availability::Unspecified as i32),
             None
         );
     }
@@ -2193,7 +2193,7 @@ mod join_redirect_tests {
 
     use satl_ca::{JoinTokens, RootCa};
     use satl_core::{Availability, Id, NodeRole};
-    use satl_proto::v1;
+    use satl_proto::v2;
     use tokio_util::sync::CancellationToken;
     use tonic::{Request, Response, Status};
 
@@ -2224,20 +2224,20 @@ mod join_redirect_tests {
     }
 
     #[tonic::async_trait]
-    impl v1::node_ca_server::NodeCa for FakeCa {
+    impl v2::node_ca_server::NodeCa for FakeCa {
         async fn get_root_ca_certificate(
             &self,
-            _request: Request<v1::GetRootCaCertificateRequest>,
-        ) -> Result<Response<v1::GetRootCaCertificateResponse>, Status> {
-            Ok(Response::new(v1::GetRootCaCertificateResponse {
+            _request: Request<v2::GetRootCaCertificateRequest>,
+        ) -> Result<Response<v2::GetRootCaCertificateResponse>, Status> {
+            Ok(Response::new(v2::GetRootCaCertificateResponse {
                 root_ca_bundle: self.root.bundle().to_vec(),
             }))
         }
 
         async fn issue_node_certificate(
             &self,
-            request: Request<v1::IssueNodeCertificateRequest>,
-        ) -> Result<Response<v1::IssueNodeCertificateResponse>, Status> {
+            request: Request<v2::IssueNodeCertificateRequest>,
+        ) -> Result<Response<v2::IssueNodeCertificateResponse>, Status> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Behaviour::RedirectTo(leader) = &self.behaviour {
@@ -2268,7 +2268,7 @@ mod join_redirect_tests {
                 .lock()
                 .expect("issued cache")
                 .insert(node_id.to_string(), cert.as_str().to_owned());
-            Ok(Response::new(v1::IssueNodeCertificateResponse {
+            Ok(Response::new(v2::IssueNodeCertificateResponse {
                 node_id: node_id.to_string(),
                 role: proto_role(role) as i32,
             }))
@@ -2276,17 +2276,17 @@ mod join_redirect_tests {
 
         async fn node_certificate_status(
             &self,
-            request: Request<v1::NodeCertificateStatusRequest>,
-        ) -> Result<Response<v1::NodeCertificateStatusResponse>, Status> {
+            request: Request<v2::NodeCertificateStatusRequest>,
+        ) -> Result<Response<v2::NodeCertificateStatusResponse>, Status> {
             let id = request.into_inner().node_id;
             let cached = self.issued.lock().expect("issued cache").get(&id).cloned();
             Ok(Response::new(match cached {
-                Some(pem) => v1::NodeCertificateStatusResponse {
-                    status: v1::CertificateStatus::Issued as i32,
+                Some(pem) => v2::NodeCertificateStatusResponse {
+                    status: v2::CertificateStatus::Issued as i32,
                     certificate: pem.into_bytes(),
                 },
-                None => v1::NodeCertificateStatusResponse {
-                    status: v1::CertificateStatus::Unknown as i32,
+                None => v2::NodeCertificateStatusResponse {
+                    status: v2::CertificateStatus::Unknown as i32,
                     certificate: Vec::new(),
                 },
             }))
@@ -2319,7 +2319,7 @@ mod join_redirect_tests {
             .expect("bind");
         let addr = listener.local_addr().expect("local addr").to_string();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
-        let service = v1::node_ca_server::NodeCaServer::new(ca);
+        let service = v2::node_ca_server::NodeCaServer::new(ca);
         tokio::spawn(async move {
             let incoming = accept_tls(listener, acceptor, cancel.clone());
             let _ = tonic::transport::Server::builder()

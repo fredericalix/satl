@@ -28,20 +28,20 @@
 //! transaction runs inside [`tokio::task::spawn_blocking`] (CLAUDE.md
 //! invariant #4: no blocking I/O on the async runtime).
 
-// Triaged pedantic allow: `StorageError<u64>` (~200 bytes) is the error type
+// Triaged pedantic allow: `StorageError<TypeConfig>` (~200 bytes) is the error type
 // imposed by openraft's storage trait signatures — it cannot be boxed here,
 // and these are cold error paths.
 #![allow(clippy::result_large_err)]
 
+use std::io;
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
-use openraft::{
-    AnyError, ErrorSubject, ErrorVerb, LogId, OptionalSend, RaftLogReader, StorageError,
-    StorageIOError, Vote,
-};
+use openraft::storage::{IOFlushed, LogState, RaftLogStorage};
+use openraft::type_config::alias::{LogIdOf, VoteOf};
+use openraft::{AnyError, ErrorSubject, ErrorVerb, OptionalSend, RaftLogReader, StorageError};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::crypto::Dek;
@@ -65,7 +65,7 @@ const META_COMMITTED: &str = "committed";
 /// Filename of the redb database inside the raft directory.
 pub const LOG_FILE_NAME: &str = "log.redb";
 
-type Entry = openraft::Entry<TypeConfig>;
+type Entry = openraft::type_config::alias::EntryOf<TypeConfig>;
 
 /// Error opening the log store database.
 #[derive(Debug, thiserror::Error)]
@@ -95,14 +95,90 @@ pub enum LogStoreError {
 /// tasks.
 #[derive(Debug, Clone)]
 pub struct LogStore {
-    db: Arc<Database>,
+    db: Arc<DbHandle>,
     dek: Dek,
     /// Database file path, carried for error messages (SRE rule: say what
     /// file the failed operation touched).
     path: Arc<PathBuf>,
 }
 
+/// Owns the redb [`Database`] and announces, **after** it has been dropped,
+/// that the file lock is gone.
+///
+/// The flag cannot be replaced by an `Arc` strong count. `Arc`'s drop
+/// decrements the counter *before* running the inner value's `Drop`, so a
+/// `Weak::strong_count() == 0` can be observed while `Database::drop` -- which
+/// is what releases redb's lock -- is still executing on another thread. That
+/// window is small and entirely real: it is what made
+/// `tests/autolock.rs` fail with `DatabaseAlreadyOpen` against a
+/// count-based check that reported "released" a moment too early.
+#[derive(Debug)]
+struct DbHandle {
+    /// `Option` only so [`Drop`] can drop the database before the flag is set.
+    db: Option<Database>,
+    released: Arc<AtomicBool>,
+}
+
+impl Drop for DbHandle {
+    fn drop(&mut self) {
+        // Order matters: the lock must be gone before anyone is told so.
+        drop(self.db.take());
+        self.released.store(true, Ordering::Release);
+    }
+}
+
+impl std::ops::Deref for DbHandle {
+    type Target = Database;
+
+    fn deref(&self) -> &Database {
+        self.db
+            .as_ref()
+            .expect("the database is taken only by Drop, which ends this value's life")
+    }
+}
+
+/// Observes whether the redb log database file has been released.
+///
+/// openraft 0.10 hands `LogStore` clones to its core task, its state-machine
+/// worker and every replication task, and `Raft::shutdown()` joins only the
+/// core task -- so it can return while a clone is still alive. redb refuses a
+/// second open on a file it already holds (`DatabaseAlreadyOpen`), so
+/// re-opening the raft directory right after a shutdown is a race. SatL
+/// re-opens on exactly that boundary: `satld` shuts the manager runtime down
+/// and rebuilds it on every role change, so a demote that raced this would
+/// leave the node unable to open its own raft state.
+#[derive(Clone, Debug)]
+pub struct LogStoreRelease {
+    released: Arc<AtomicBool>,
+    path: Arc<PathBuf>,
+}
+
+impl LogStoreRelease {
+    /// True once the database has been dropped and the file can be opened
+    /// again.
+    #[must_use]
+    pub fn released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
+    /// The database file this watches, for error messages.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+}
+
 impl LogStore {
+    /// A handle that reports when every clone of this store is gone.
+    ///
+    /// See [`LogStoreRelease`] for why shutdown has to wait on this.
+    #[must_use]
+    pub fn release_watch(&self) -> LogStoreRelease {
+        LogStoreRelease {
+            released: Arc::clone(&self.db.released),
+            path: Arc::clone(&self.path),
+        }
+    }
     /// Opens (or creates) the log database at `<dir>/log.redb`.
     ///
     /// Synchronous (redb recovery may replay the file): callers on the async
@@ -127,28 +203,27 @@ impl LogStore {
             source: Box::new(e),
         })?;
         Ok(Self {
-            db: Arc::new(db),
+            db: Arc::new(DbHandle {
+                db: Some(db),
+                released: Arc::new(AtomicBool::new(false)),
+            }),
             dek,
             path: Arc::new(path),
         })
     }
 
     /// Serializes and seals one log entry for storage.
-    fn encode_entry(&self, entry: &Entry) -> Result<Vec<u8>, StorageError<u64>> {
+    fn encode_entry(&self, entry: &Entry) -> Result<Vec<u8>, StorageError<TypeConfig>> {
         let mut plain = Vec::new();
-        ciborium::ser::into_writer(entry, &mut plain).map_err(|e| {
-            StorageError::from(StorageIOError::write_log_entry(
-                entry.log_id,
-                AnyError::new(&e),
-            ))
-        })?;
+        ciborium::ser::into_writer(entry, &mut plain)
+            .map_err(|e| StorageError::write_log_entry(entry.log_id, AnyError::new(&e)))?;
         Ok(self.dek.seal(&plain))
     }
 
     /// Unseals and deserializes one log entry read from storage.
-    fn decode_entry(&self, index: u64, sealed: &[u8]) -> Result<Entry, StorageError<u64>> {
+    fn decode_entry(&self, index: u64, sealed: &[u8]) -> Result<Entry, StorageError<TypeConfig>> {
         let plain = self.dek.open(sealed).map_err(|e| {
-            StorageIOError::new(
+            StorageError::new(
                 ErrorSubject::LogIndex(index),
                 ErrorVerb::Read,
                 AnyError::error(format!(
@@ -158,7 +233,7 @@ impl LogStore {
             )
         })?;
         ciborium::de::from_reader(plain.as_slice()).map_err(|e| {
-            StorageIOError::new(
+            StorageError::new(
                 ErrorSubject::LogIndex(index),
                 ErrorVerb::Read,
                 AnyError::error(format!(
@@ -166,7 +241,6 @@ impl LogStore {
                     self.path.display()
                 )),
             )
-            .into()
         })
     }
 
@@ -175,7 +249,7 @@ impl LogStore {
         &self,
         key: &'static str,
         value: &T,
-    ) -> Result<Vec<u8>, StorageError<u64>> {
+    ) -> Result<Vec<u8>, StorageError<TypeConfig>> {
         let mut plain = Vec::new();
         ciborium::ser::into_writer(value, &mut plain).map_err(|e| {
             self.meta_err(key, ErrorVerb::Write, &format!("encode meta {key}: {e}"))
@@ -188,7 +262,7 @@ impl LogStore {
         &self,
         key: &'static str,
         sealed: &[u8],
-    ) -> Result<T, StorageError<u64>> {
+    ) -> Result<T, StorageError<TypeConfig>> {
         let plain = self
             .dek
             .open(sealed)
@@ -198,48 +272,46 @@ impl LogStore {
     }
 
     /// Builds a storage error for a meta-table operation, naming the file.
-    fn meta_err(&self, key: &'static str, verb: ErrorVerb, msg: &str) -> StorageError<u64> {
+    fn meta_err(&self, key: &'static str, verb: ErrorVerb, msg: &str) -> StorageError<TypeConfig> {
         let subject = if key == META_VOTE {
             ErrorSubject::Vote
         } else {
             ErrorSubject::Store
         };
-        StorageIOError::new(
+        StorageError::new(
             subject,
             verb,
             AnyError::error(format!("{msg} (database {})", self.path.display())),
         )
-        .into()
     }
 
     /// Builds a storage error from a redb error, naming the operation and
     /// file.
     fn db_err(
         &self,
-        subject: ErrorSubject<u64>,
+        subject: ErrorSubject<TypeConfig>,
         verb: ErrorVerb,
         op: &str,
         err: &redb::Error,
-    ) -> StorageError<u64> {
-        StorageIOError::new(
+    ) -> StorageError<TypeConfig> {
+        StorageError::new(
             subject,
             verb,
             AnyError::error(format!("{op} (database {}): {err}", self.path.display())),
         )
-        .into()
     }
 
     /// Runs a blocking redb operation on the blocking pool.
-    async fn blocking<T, F>(&self, op: &'static str, f: F) -> Result<T, StorageError<u64>>
+    async fn blocking<T, F>(&self, op: &'static str, f: F) -> Result<T, StorageError<TypeConfig>>
     where
         T: Send + 'static,
-        F: FnOnce(LogStore) -> Result<T, StorageError<u64>> + Send + 'static,
+        F: FnOnce(LogStore) -> Result<T, StorageError<TypeConfig>> + Send + 'static,
     {
         let this = self.clone();
         tokio::task::spawn_blocking(move || f(this))
             .await
             .map_err(|e| {
-                StorageIOError::new(
+                StorageError::new(
                     ErrorSubject::Store,
                     ErrorVerb::Write,
                     AnyError::error(format!(
@@ -254,7 +326,7 @@ impl LogStore {
     fn read_meta_blocking<T: serde::de::DeserializeOwned>(
         &self,
         key: &'static str,
-    ) -> Result<Option<T>, StorageError<u64>> {
+    ) -> Result<Option<T>, StorageError<TypeConfig>> {
         let txn = self.db.begin_read().map_err(|e| {
             self.db_err(
                 ErrorSubject::Store,
@@ -286,7 +358,7 @@ impl LogStore {
         &self,
         key: &'static str,
         sealed: &[u8],
-    ) -> Result<(), StorageError<u64>> {
+    ) -> Result<(), StorageError<TypeConfig>> {
         let subject = if key == META_VOTE {
             ErrorSubject::Vote
         } else {
@@ -324,7 +396,7 @@ impl RaftLogReader<TypeConfig> for LogStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<Entry>, StorageError<u64>> {
+    ) -> Result<Vec<Entry>, io::Error> {
         // Owned bounds so the range can cross into the blocking closure.
         let bounds: (Bound<u64>, Bound<u64>) =
             (range.start_bound().cloned(), range.end_bound().cloned());
@@ -363,15 +435,29 @@ impl RaftLogReader<TypeConfig> for LogStore {
             Ok(entries)
         })
         .await
+        .map_err(io::Error::from)
+    }
+
+    /// The vote lives in the meta table next to the log, not in the state
+    /// machine: openraft 0.10 reads it through the *reader* half of the
+    /// storage pair (it moved off `RaftLogStorage` in that release) so a
+    /// replication task can check the leader without touching the writer.
+    async fn read_vote(&mut self) -> Result<Option<VoteOf<TypeConfig>>, io::Error> {
+        self.blocking("read vote", move |store| {
+            store.read_meta_blocking(META_VOTE)
+        })
+        .await
+        .map_err(io::Error::from)
     }
 }
 
 impl RaftLogStorage<TypeConfig> for LogStore {
     type LogReader = Self;
 
-    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<u64>> {
+    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, io::Error> {
         self.blocking("read log state", move |store| {
-            let last_purged: Option<LogId<u64>> = store.read_meta_blocking(META_LAST_PURGED)?;
+            let last_purged: Option<LogIdOf<TypeConfig>> =
+                store.read_meta_blocking(META_LAST_PURGED)?;
             let txn = store.db.begin_read().map_err(|e| {
                 store.db_err(
                     ErrorSubject::Logs,
@@ -406,52 +492,49 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             })
         })
         .await
+        .map_err(io::Error::from)
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
         self.clone()
     }
 
-    async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
+    async fn save_vote(&mut self, vote: &VoteOf<TypeConfig>) -> Result<(), io::Error> {
         let sealed = self.encode_meta(META_VOTE, vote)?;
         self.blocking("save vote", move |store| {
             store.write_meta_blocking(META_VOTE, &sealed)
         })
         .await
-    }
-
-    async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
-        self.blocking("read vote", move |store| {
-            store.read_meta_blocking(META_VOTE)
-        })
-        .await
+        .map_err(io::Error::from)
     }
 
     async fn save_committed(
         &mut self,
-        committed: Option<LogId<u64>>,
-    ) -> Result<(), StorageError<u64>> {
+        committed: Option<LogIdOf<TypeConfig>>,
+    ) -> Result<(), io::Error> {
         let sealed = self.encode_meta(META_COMMITTED, &committed)?;
         self.blocking("save committed", move |store| {
             store.write_meta_blocking(META_COMMITTED, &sealed)
         })
         .await
+        .map_err(io::Error::from)
     }
 
-    async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
+    async fn read_committed(&mut self) -> Result<Option<LogIdOf<TypeConfig>>, io::Error> {
         self.blocking("read committed", move |store| {
             Ok(store
-                .read_meta_blocking::<Option<LogId<u64>>>(META_COMMITTED)?
+                .read_meta_blocking::<Option<LogIdOf<TypeConfig>>>(META_COMMITTED)?
                 .flatten())
         })
         .await
+        .map_err(io::Error::from)
     }
 
     async fn append<I>(
         &mut self,
         entries: I,
-        callback: LogFlushed<TypeConfig>,
-    ) -> Result<(), StorageError<u64>>
+        callback: IOFlushed<TypeConfig>,
+    ) -> Result<(), io::Error>
     where
         I: IntoIterator<Item = Entry> + OptionalSend,
         I::IntoIter: OptionalSend,
@@ -501,17 +584,25 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             })?;
             // Durably committed: report IO completion. (On error we return
             // the StorageError instead — openraft treats it as fatal.)
-            callback.log_io_completed(Ok(()));
+            callback.io_completed(Ok(()));
             Ok(())
         })
         .await
+        .map_err(io::Error::from)
     }
 
-    async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        tracing::debug!(
-            index = log_id.index,
-            "truncating raft log from index (inclusive)"
-        );
+    /// openraft 0.10 renamed `truncate(log_id)` — "delete from this index,
+    /// inclusive" — to `truncate_after(last_log_id)`, which keeps
+    /// `last_log_id` and deletes everything *after* it. The two differ by one
+    /// index, and `None` means "keep nothing". The `from` computed here is
+    /// the first index to delete, so the redb range stays half-open exactly
+    /// as before.
+    async fn truncate_after(
+        &mut self,
+        last_log_id: Option<LogIdOf<TypeConfig>>,
+    ) -> Result<(), io::Error> {
+        let from = last_log_id.as_ref().map_or(0, |id| id.index + 1);
+        tracing::debug!(from, "truncating raft log from index (inclusive)");
         self.blocking("truncate log", move |store| {
             let txn = store.db.begin_write().map_err(|e| {
                 store.db_err(
@@ -530,7 +621,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
                         &e.into(),
                     )
                 })?;
-                table.retain_in(log_id.index.., |_, _| false).map_err(|e| {
+                table.retain_in(from.., |_, _| false).map_err(|e| {
                     store.db_err(
                         ErrorSubject::Logs,
                         ErrorVerb::Delete,
@@ -549,9 +640,10 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             })
         })
         .await
+        .map_err(io::Error::from)
     }
 
-    async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+    async fn purge(&mut self, log_id: LogIdOf<TypeConfig>) -> Result<(), io::Error> {
         tracing::debug!(
             index = log_id.index,
             "purging raft log up to index (inclusive)"
@@ -613,13 +705,14 @@ impl RaftLogStorage<TypeConfig> for LogStore {
             })
         })
         .await
+        .map_err(io::Error::from)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use openraft::testing::log_id;
-    use openraft::{CommittedLeaderId, EntryPayload};
+    use openraft::{EntryPayload, Vote};
 
     use crate::crypto::DEK_LEN;
     use crate::types::Proposal;
@@ -632,9 +725,42 @@ mod tests {
 
     fn entry(term: u64, index: u64) -> Entry {
         Entry {
-            log_id: LogId::new(CommittedLeaderId::new(term, 1), index),
+            log_id: log_id::<TypeConfig>(term, 1, index),
             payload: EntryPayload::Normal(Proposal { actions: vec![] }),
         }
+    }
+
+    /// The release flag means "redb has let the file go", not "the last
+    /// reference count went away".
+    ///
+    /// `Arc` decrements its counter *before* running the inner `Drop`, so a
+    /// count-based check can report the store released while
+    /// `Database::drop` -- which holds the lock -- is still running. That
+    /// window only opens when the last clone dies on another thread, which is
+    /// what openraft's tasks do; `tests/autolock.rs` is where it was actually
+    /// caught. This test pins the cheap half of the invariant: the flag never
+    /// leads the drop, and a clone still holding the store never reads as
+    /// released.
+    #[test]
+    fn the_file_is_reopenable_as_soon_as_the_watch_says_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LogStore::open(dir.path(), test_dek()).unwrap();
+        let release = store.release_watch();
+        assert!(!release.released(), "a live store is not released");
+
+        // A clone is what openraft's tasks hold; one of them going away must
+        // not be mistaken for the file being free.
+        let clone = store.clone();
+        drop(store);
+        assert!(
+            !release.released(),
+            "a surviving clone still holds the file"
+        );
+
+        drop(clone);
+        assert!(release.released());
+        LogStore::open(dir.path(), test_dek())
+            .expect("the file is openable the moment the watch says it is released");
     }
 
     async fn append_entries(store: &mut LogStore, entries: Vec<Entry>) {
@@ -665,7 +791,7 @@ mod tests {
 
         let state = store.get_log_state().await.unwrap();
         assert_eq!(state.last_purged_log_id, None);
-        assert_eq!(state.last_log_id, Some(log_id(1, 1, 10)));
+        assert_eq!(state.last_log_id, Some(log_id::<TypeConfig>(1, 1, 10)));
     }
 
     #[tokio::test]
@@ -688,22 +814,32 @@ mod tests {
         {
             let mut store = LogStore::open(dir.path(), test_dek()).unwrap();
             assert_eq!(store.read_committed().await.unwrap(), None);
-            store.save_committed(Some(log_id(2, 1, 5))).await.unwrap();
+            store
+                .save_committed(Some(log_id::<TypeConfig>(2, 1, 5)))
+                .await
+                .unwrap();
         }
         let mut reopened = LogStore::open(dir.path(), test_dek()).unwrap();
         assert_eq!(
             reopened.read_committed().await.unwrap(),
-            Some(log_id(2, 1, 5))
+            Some(log_id::<TypeConfig>(2, 1, 5))
         );
     }
 
     #[tokio::test]
-    async fn truncate_deletes_from_index() {
+    async fn truncate_after_deletes_beyond_index() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = LogStore::open(dir.path(), test_dek()).unwrap();
         append_entries(&mut store, (1..=10).map(|i| entry(1, i)).collect()).await;
 
-        store.truncate(log_id(1, 1, 6)).await.unwrap();
+        // openraft 0.10's `truncate_after` KEEPS the log id it is given and
+        // deletes what follows, where 0.9's `truncate` deleted from that id
+        // inclusive. Keeping index 5 is therefore the same outcome the old
+        // `truncate(6)` produced.
+        store
+            .truncate_after(Some(log_id::<TypeConfig>(1, 1, 5)))
+            .await
+            .unwrap();
 
         let remaining = store.try_get_log_entries(..).await.unwrap();
         assert_eq!(
@@ -711,7 +847,21 @@ mod tests {
             vec![1, 2, 3, 4, 5]
         );
         let state = store.get_log_state().await.unwrap();
-        assert_eq!(state.last_log_id, Some(log_id(1, 1, 5)));
+        assert_eq!(state.last_log_id, Some(log_id::<TypeConfig>(1, 1, 5)));
+    }
+
+    /// `None` means "keep nothing", which has no 0.9 equivalent and is the
+    /// easiest half of the rename to get wrong.
+    #[tokio::test]
+    async fn truncate_after_none_empties_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LogStore::open(dir.path(), test_dek()).unwrap();
+        append_entries(&mut store, (1..=4).map(|i| entry(1, i)).collect()).await;
+
+        store.truncate_after(None).await.unwrap();
+
+        assert!(store.try_get_log_entries(..).await.unwrap().is_empty());
+        assert_eq!(store.get_log_state().await.unwrap().last_log_id, None);
     }
 
     #[tokio::test]
@@ -721,7 +871,7 @@ mod tests {
             let mut store = LogStore::open(dir.path(), test_dek()).unwrap();
             append_entries(&mut store, (1..=10).map(|i| entry(1, i)).collect()).await;
 
-            store.purge(log_id(1, 1, 4)).await.unwrap();
+            store.purge(log_id::<TypeConfig>(1, 1, 4)).await.unwrap();
 
             let remaining = store.try_get_log_entries(..).await.unwrap();
             assert_eq!(
@@ -729,22 +879,31 @@ mod tests {
                 vec![5, 6, 7, 8, 9, 10]
             );
             let state = store.get_log_state().await.unwrap();
-            assert_eq!(state.last_purged_log_id, Some(log_id(1, 1, 4)));
-            assert_eq!(state.last_log_id, Some(log_id(1, 1, 10)));
+            assert_eq!(
+                state.last_purged_log_id,
+                Some(log_id::<TypeConfig>(1, 1, 4))
+            );
+            assert_eq!(state.last_log_id, Some(log_id::<TypeConfig>(1, 1, 10)));
         }
         // Purge everything: last_log_id falls back to the purge watermark,
         // including after reopen.
         let mut store = LogStore::open(dir.path(), test_dek()).unwrap();
-        store.purge(log_id(1, 1, 10)).await.unwrap();
+        store.purge(log_id::<TypeConfig>(1, 1, 10)).await.unwrap();
         let state = store.get_log_state().await.unwrap();
-        assert_eq!(state.last_purged_log_id, Some(log_id(1, 1, 10)));
-        assert_eq!(state.last_log_id, Some(log_id(1, 1, 10)));
+        assert_eq!(
+            state.last_purged_log_id,
+            Some(log_id::<TypeConfig>(1, 1, 10))
+        );
+        assert_eq!(state.last_log_id, Some(log_id::<TypeConfig>(1, 1, 10)));
         drop(store);
 
         let mut reopened = LogStore::open(dir.path(), test_dek()).unwrap();
         let state = reopened.get_log_state().await.unwrap();
-        assert_eq!(state.last_purged_log_id, Some(log_id(1, 1, 10)));
-        assert_eq!(state.last_log_id, Some(log_id(1, 1, 10)));
+        assert_eq!(
+            state.last_purged_log_id,
+            Some(log_id::<TypeConfig>(1, 1, 10))
+        );
+        assert_eq!(state.last_log_id, Some(log_id::<TypeConfig>(1, 1, 10)));
     }
 
     #[tokio::test]

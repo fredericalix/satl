@@ -69,7 +69,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::Raft;
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
@@ -81,6 +80,8 @@ use tonic::transport::server::TlsConnectInfo;
 use tonic::transport::server::{Server, TcpConnectInfo};
 use tonic::{Request, Response, Status};
 
+use openraft::async_runtime::watch::WatchReceiver;
+
 use satl_ca::{LiveIdentity, NodeIdentity, PeerIdentity, RoleRequirement};
 use satl_core::Id;
 use satl_proto::MAX_MESSAGE_SIZE;
@@ -89,8 +90,8 @@ use satl_proto::health::health_server::{Health, HealthServer};
 use satl_proto::health::{HealthCheckRequest, HealthCheckResponse};
 
 use crate::store::ClusterStore;
-use crate::transport::{PeerChannels, PeerLiveness};
-use crate::types::TypeConfig;
+use crate::transport::{Eviction, PeerChannels, PeerLiveness};
+use crate::types::Raft;
 
 /// Default port of the internal gRPC listener (architecture §15).
 pub const DEFAULT_PORT: u16 = 2377;
@@ -156,7 +157,7 @@ pub enum ServerError {
 #[derive(Clone)]
 pub struct ManagerContext {
     /// The local Raft instance.
-    pub raft: Raft<TypeConfig>,
+    pub raft: Raft,
     /// The replicated store façade.
     pub store: ClusterStore,
     /// This node's SatL node ID (the CN of its certificate).
@@ -167,6 +168,9 @@ pub struct ManagerContext {
     pub advertise_addr: String,
     /// Shared peer-liveness map, for quorum-safety arithmetic.
     pub liveness: PeerLiveness,
+    /// Set when peers refuse this node's raft ID as blacklisted -- a state
+    /// nothing but a wipe and re-join can leave (see [`Eviction`]).
+    pub eviction: Eviction,
     /// How long a peer counts as reachable after its last answer
     /// ([`crate::node::RaftTiming::liveness_window`]).
     pub liveness_window: Duration,
@@ -186,6 +190,30 @@ impl ManagerContext {
                  (no listen address and no mTLS identity): it is a single-node cluster"
             ))
         })
+    }
+
+    /// Addresses of the other members this node's raft still believes in.
+    ///
+    /// Read from the raft membership rather than from the store or the agent
+    /// session, because this exists for the one case where neither is
+    /// available: an evicted manager's session never establishes (it dials its
+    /// own dispatcher, which is not the leader) and its store is whatever it
+    /// last replicated. The membership config is local, needs no peer, and is
+    /// the very list the node has been failing to talk to -- which is exactly
+    /// who to ask for re-admission.
+    ///
+    /// Excludes this node's own advertise address: re-joining through itself
+    /// is not a join.
+    #[must_use]
+    pub fn peer_addrs(&self) -> Vec<String> {
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        metrics
+            .membership_config
+            .nodes()
+            .filter(|(id, _)| **id != self.raft_id)
+            .map(|(_, node)| node.addr.clone())
+            .filter(|addr| !addr.is_empty() && *addr != self.advertise_addr)
+            .collect()
     }
 }
 
@@ -529,12 +557,12 @@ impl ServerBuilder {
             routes: Routes::default(),
         };
 
-        let raft = satl_proto::v1::raft_server::RaftServer::new(
+        let raft = satl_proto::v2::raft_server::RaftServer::new(
             crate::transport::RaftService::new(manager.clone()),
         )
         .max_decoding_message_size(MAX_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_MESSAGE_SIZE);
-        let control = satl_proto::v1::control_server::ControlServer::new(
+        let control = satl_proto::v2::control_server::ControlServer::new(
             crate::membership::ControlService::new(manager.clone()),
         )
         .max_decoding_message_size(MAX_MESSAGE_SIZE)

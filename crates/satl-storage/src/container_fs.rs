@@ -96,13 +96,66 @@ impl<R: CommandRunner> ContainerFsStore<R> {
             image_top = %image_top,
         );
         async {
-            self.zfs.clone_snapshot(&snapshot, &dataset, &[]).await?;
+            // A clone that finds the dataset already there is only an error if
+            // the dataset is not the one this task would have made.
+            //
+            // The dataset name *is* the task ID, and a task is immutable and
+            // one-shot (invariant #2): it is never moved and never
+            // re-executed, so nothing else on this node can legitimately own
+            // `containers/<task-id>`. An existing dataset cloned from the
+            // right snapshot can therefore only be this same task's own
+            // earlier attempt, and re-using it is what "prepare" already
+            // means. Cloned from anything else, or not a clone at all, it is a
+            // genuine conflict and stays fatal.
+            //
+            // This is the atomic half of the guard. `Controller::ensure_container_fs`
+            // checks `dataset_exists` first, but that is check-then-act: two
+            // prepares racing over one task both see it absent and both clone.
+            // `zfs clone` itself is the only step that serialises, so the
+            // decision has to be made from its result. Measured on the 3-VM
+            // testbed: a rolling update rolled back six slots because the
+            // loser of that race reported a fatal task failure. `LayerStore`
+            // had already learned the same lesson for layer datasets (see its
+            // `applying` map); the container clone had no equivalent
+            // (decision log, 2026-08-25).
+            match self.zfs.clone_snapshot(&snapshot, &dataset, &[]).await {
+                Ok(()) => {}
+                Err(error) if self.is_this_tasks_own_dataset(&dataset, &snapshot).await => {
+                    tracing::info!(
+                        %error,
+                        "the rootfs dataset already exists and was cloned from this task's own \
+                         image snapshot; re-using it rather than failing the task"
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
             let mountpoint = self.zfs.mountpoint_of(&dataset).await?;
             tracing::info!(mountpoint = %mountpoint.display(), "container rootfs created");
             Ok(mountpoint)
         }
         .instrument(span)
         .await
+    }
+
+    /// Whether `dataset` exists **and** is a clone of `snapshot`.
+    ///
+    /// Deliberately conservative: any doubt -- the dataset is gone, `zfs get`
+    /// fails, the origin is empty or different -- answers `false`, so the
+    /// caller reports the original clone failure rather than proceeding over a
+    /// rootfs whose contents it cannot vouch for.
+    async fn is_this_tasks_own_dataset(&self, dataset: &str, snapshot: &str) -> bool {
+        match self.zfs.get_property(dataset, "origin").await {
+            Ok(origin) => origin.trim() == snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    dataset,
+                    "cannot read the origin of an existing rootfs dataset; treating the clone \
+                     failure as fatal"
+                );
+                false
+            }
+        }
     }
 
     /// Destroy the writable rootfs of `task_id` (recursively, so stray
@@ -186,6 +239,81 @@ mod tests {
         );
     }
 
+    /// A clone that already succeeded must not fail the task the second time.
+    ///
+    /// This is the rolling-update failure reproduced: the dataset was there,
+    /// cloned from exactly the right snapshot, and "dataset already exists"
+    /// rejected the task and rolled back six slots.
+    #[tokio::test]
+    async fn a_rootfs_this_task_already_cloned_is_reused_not_rejected() {
+        let top = some_chain_id();
+        let dataset = format!("{CONTAINERS_ROOT}/task-1");
+        let snapshot = format!("{LAYERS_ROOT}/{}@final", top.hex());
+
+        let mock = MockRunner::new();
+        mock.push_output(
+            1,
+            "",
+            "cannot create 'zroot/satl/containers/task-1': dataset already exists",
+        );
+        mock.push_output(0, &format!("{snapshot}\n"), ""); // origin: ours
+        mock.push_output(0, "/var/db/satl/containers/task-1\n", ""); // mountpoint
+
+        let store = ContainerFsStore::new(Zfs::with_runner(&mock), CONTAINERS_ROOT);
+        let mountpoint = store.create("task-1", &top, LAYERS_ROOT).await.unwrap();
+        assert_eq!(mountpoint, PathBuf::from("/var/db/satl/containers/task-1"));
+        assert_eq!(
+            mock.calls()[1],
+            format!("/sbin/zfs get -H -p -o value origin {dataset}"),
+            "the origin is what proves the dataset is this task's own"
+        );
+    }
+
+    /// The same collision over somebody else's dataset stays fatal: the
+    /// reuse is justified only by the origin matching.
+    #[tokio::test]
+    async fn a_rootfs_cloned_from_another_image_is_still_a_fatal_collision() {
+        let top = some_chain_id();
+
+        let mock = MockRunner::new();
+        mock.push_output(
+            1,
+            "",
+            "cannot create 'zroot/satl/containers/task-1': dataset already exists",
+        );
+        mock.push_output(0, "zroot/satl/layers/deadbeef@final\n", ""); // origin: not ours
+
+        let store = ContainerFsStore::new(Zfs::with_runner(&mock), CONTAINERS_ROOT);
+        let error = store.create("task-1", &top, LAYERS_ROOT).await.unwrap_err();
+        assert!(
+            error.to_string().contains("already exists"),
+            "the operator must still see the original clone failure, got: {error}"
+        );
+    }
+
+    /// An unreadable origin is not a licence to proceed.
+    #[tokio::test]
+    async fn an_unreadable_origin_keeps_the_clone_failure_fatal() {
+        let top = some_chain_id();
+
+        let mock = MockRunner::new();
+        mock.push_output(
+            1,
+            "",
+            "cannot create 'zroot/satl/containers/task-1': dataset already exists",
+        );
+        mock.push_output(
+            1,
+            "",
+            "cannot open 'zroot/satl/containers/task-1': dataset does not exist",
+        );
+
+        let store = ContainerFsStore::new(Zfs::with_runner(&mock), CONTAINERS_ROOT);
+        assert!(
+            store.create("task-1", &top, LAYERS_ROOT).await.is_err(),
+            "doubt about the existing dataset must not be resolved in favour of using it"
+        );
+    }
     #[tokio::test]
     async fn destroy_removes_the_dataset_recursively() {
         let mock = MockRunner::new();

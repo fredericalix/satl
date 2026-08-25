@@ -49,7 +49,7 @@ use satl_cluster::{
 use satl_core::{Availability, Id, NodeRole};
 use satl_dispatcher::agent::SessionReporter;
 use satl_dispatcher::{Agent, AgentConfig, Dispatcher, DispatcherConfig};
-use satl_proto::v1;
+use satl_proto::v2;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -283,42 +283,42 @@ impl DeferredDispatcher {
     }
 
     /// The tonic service, with SatL's message-size limits applied.
-    fn server(&self) -> v1::dispatcher_server::DispatcherServer<Self> {
-        v1::dispatcher_server::DispatcherServer::new(self.clone())
+    fn server(&self) -> v2::dispatcher_server::DispatcherServer<Self> {
+        v2::dispatcher_server::DispatcherServer::new(self.clone())
             .max_decoding_message_size(satl_proto::MAX_MESSAGE_SIZE)
             .max_encoding_message_size(satl_proto::MAX_MESSAGE_SIZE)
     }
 }
 
 #[tonic::async_trait]
-impl v1::dispatcher_server::Dispatcher for DeferredDispatcher {
-    type SessionStream = <Dispatcher as v1::dispatcher_server::Dispatcher>::SessionStream;
-    type AssignmentsStream = <Dispatcher as v1::dispatcher_server::Dispatcher>::AssignmentsStream;
+impl v2::dispatcher_server::Dispatcher for DeferredDispatcher {
+    type SessionStream = <Dispatcher as v2::dispatcher_server::Dispatcher>::SessionStream;
+    type AssignmentsStream = <Dispatcher as v2::dispatcher_server::Dispatcher>::AssignmentsStream;
 
     async fn session(
         &self,
-        request: Request<v1::SessionRequest>,
+        request: Request<v2::SessionRequest>,
     ) -> Result<Response<Self::SessionStream>, Status> {
         self.get()?.session(request).await
     }
 
     async fn heartbeat(
         &self,
-        request: Request<v1::HeartbeatRequest>,
-    ) -> Result<Response<v1::HeartbeatResponse>, Status> {
+        request: Request<v2::HeartbeatRequest>,
+    ) -> Result<Response<v2::HeartbeatResponse>, Status> {
         self.get()?.heartbeat(request).await
     }
 
     async fn update_task_status(
         &self,
-        request: Request<v1::UpdateTaskStatusRequest>,
-    ) -> Result<Response<v1::UpdateTaskStatusResponse>, Status> {
+        request: Request<v2::UpdateTaskStatusRequest>,
+    ) -> Result<Response<v2::UpdateTaskStatusResponse>, Status> {
         self.get()?.update_task_status(request).await
     }
 
     async fn assignments(
         &self,
-        request: Request<v1::AssignmentsRequest>,
+        request: Request<v2::AssignmentsRequest>,
     ) -> Result<Response<Self::AssignmentsStream>, Status> {
         self.get()?.assignments(request).await
     }
@@ -1417,6 +1417,95 @@ fn spawn_manager_persist(
     })
 }
 
+/// Who an evicted node should ask for re-admission, in order of freshness.
+///
+/// No certificate renewal is involved anywhere in that path: an eviction does
+/// not change this node's role, so the certificate on disk is already the one
+/// it needs -- and `renew_remote` would have to reach a CA this node cannot
+/// currently reach anyway. All the rebuild needs is somewhere to dial.
+///
+/// The fallbacks are ordered by how current they are, and the *first* one is
+/// the one that is normally empty here: the agent session's manager list is
+/// unavailable on precisely the node that needs this, because an evicted
+/// manager's session dials its own dispatcher and is refused for not being the
+/// leader. The raft membership is the next best thing -- it is local, needs no
+/// peer, and lists exactly the nodes that have been refusing this one, which
+/// is who has to re-admit it.
+fn rejoin_peers(
+    session: &[String],
+    ctx: Option<&satl_cluster::server::ManagerContext>,
+    state_dir: &Path,
+) -> Vec<String> {
+    if !session.is_empty() {
+        return session.to_vec();
+    }
+    let from_raft = ctx
+        .map(satl_cluster::server::ManagerContext::peer_addrs)
+        .unwrap_or_default();
+    if !from_raft.is_empty() {
+        return from_raft;
+    }
+    load_managers(state_dir)
+}
+
+/// What [`rejoin_after_eviction`] managed to do about the eviction.
+enum Rejoin {
+    /// The supervisor accepted the rebuild; this task is about to be replaced.
+    Requested,
+    /// The supervisor is gone, so there is nothing left to drive.
+    SupervisorGone,
+    /// Nobody to dial. Nothing was attempted; the caller retries.
+    NoPeers,
+}
+
+/// Asks the supervisor to wipe this node's raft directory and re-join.
+///
+/// `ApplyRole` with the role this node already holds is the whole fix: its
+/// manager arm wipes the raft state before every join attempt, which is
+/// exactly and only what a blacklisted raft ID needs -- the ID lives in that
+/// directory, and no amount of retrying re-admits the old one.
+async fn rejoin_after_eviction(
+    slot: &Arc<ClusterSlot>,
+    eviction: &satl_cluster::transport::Eviction,
+    held: NodeRole,
+    raft_id: u64,
+    peers: Vec<String>,
+) -> Rejoin {
+    tracing::warn!(
+        raft_id,
+        role = satl_ca::role_ou(held),
+        peers = peers.len(),
+        "this node's raft ID was removed from the cluster and can never be re-admitted; \
+         wiping the raft directory and re-joining with a fresh ID"
+    );
+    if peers.is_empty() {
+        // Loud, because the node cannot recover on its own from here and
+        // will otherwise sit silently outside the cluster.
+        tracing::error!(
+            raft_id,
+            "no peer address to re-join through: the agent session has none, the raft \
+             membership has none, and the persisted manager list is empty. Re-join this \
+             node manually"
+        );
+        return Rejoin::NoPeers;
+    }
+    // Consumed before the request, not after: the rebuild spawns its own
+    // role watcher before the supervisor publishes the new core, and that
+    // watcher reads this very flag off the stale one.
+    eviction.clear();
+    if slot
+        .control(ControlRequest::ApplyRole {
+            role: held,
+            managers: peers,
+        })
+        .await
+        .is_err()
+    {
+        return Rejoin::SupervisorGone;
+    }
+    Rejoin::Requested
+}
+
 /// Applies a role change to this node: when the store's role for this node
 /// (pushed on the session) stops matching the certificate's OU, renew the
 /// certificate against a manager's `NodeCA` — the store's role is what the CA
@@ -1449,6 +1538,50 @@ fn spawn_role_watch(
                     .collect();
                 (wanted, managers)
             };
+            // An eviction is its own trigger, checked before the role change
+            // and handled without one.
+            //
+            // It cannot be folded into `wanted != held`, which is how the
+            // first attempt at this got it wrong: `wanted` comes from the
+            // agent session, and an evicted manager has no working session --
+            // it dials its own dispatcher, which refuses because this node is
+            // not the raft leader and never will be. So `wanted` stays `None`
+            // on precisely the node that needs the rebuild, and the branch was
+            // dead code where it mattered. Measured on fbsd3, where the
+            // instrumented daemon logged the refusal every 15s for six minutes
+            // and rebuilt nothing (decision log, 2026-08-25).
+            let ctx = slot
+                .get()
+                .and_then(|core| core.manager.as_ref().and_then(|m| m.membership.get()));
+            let evicted = ctx.as_ref().and_then(|c| {
+                c.eviction
+                    .evicted_raft_id()
+                    .map(|id| (id, c.eviction.clone()))
+            });
+            // Only when the role-change path below is not going to run. That
+            // path wipes the raft directory too (`apply_role` does, in both
+            // arms), so it already resolves the eviction, and letting this one
+            // win first would re-join raft in the *old* role just to leave it
+            // again a moment later.
+            let evicted = evicted.filter(|_| wanted.is_none_or(|w| w == held));
+            if let Some((raft_id, eviction)) = evicted {
+                let peers = rejoin_peers(&managers, ctx.as_ref(), &state_dir);
+                match rejoin_after_eviction(&slot, &eviction, held, raft_id, peers).await {
+                    // The rebuild replaces this task; wait to be cancelled
+                    // rather than observing our own transition state.
+                    Rejoin::Requested => {
+                        loops.cancelled().await;
+                        return;
+                    }
+                    Rejoin::SupervisorGone => return,
+                    Rejoin::NoPeers => {
+                        tokio::select! {
+                            () = loops.cancelled() => return,
+                            () = tokio::time::sleep(RETRY) => continue,
+                        }
+                    }
+                }
+            }
             // `held` is the *runtime's* role, not the certificate's: a
             // renewal that succeeded before a rebuild that failed must fire
             // again on the next event (renewal is idempotent), or the node
@@ -1499,8 +1632,23 @@ fn spawn_role_watch(
                     () = tokio::time::sleep(RETRY) => continue,
                 }
             }
+            // Waiting on the session watch alone is what left the evicted node
+            // parked for ever: its session never changes. The eviction future
+            // is registered here, *before* the loop re-checks the flag at the
+            // top, so a refusal landing in between wakes this rather than
+            // being missed -- `notify_waiters` only reaches waiters already
+            // registered.
+            let eviction = ctx.map(|c| c.eviction.clone());
             tokio::select! {
                 () = loops.cancelled() => return,
+                () = async {
+                    match eviction {
+                        Some(eviction) => eviction.recorded().await,
+                        // No manager runtime: nothing can evict this node, so
+                        // park and let the other arms decide.
+                        None => std::future::pending().await,
+                    }
+                } => {}
                 changed = state.changed() => {
                     if changed.is_err() {
                         return;
@@ -1570,7 +1718,7 @@ fn local_dispatcher(
     set_socket_mode(socket)?;
 
     let service = tonic::service::interceptor::InterceptedService::new(
-        v1::dispatcher_server::DispatcherServer::new(dispatcher.clone())
+        v2::dispatcher_server::DispatcherServer::new(dispatcher.clone())
             .max_decoding_message_size(satl_proto::MAX_MESSAGE_SIZE)
             .max_encoding_message_size(satl_proto::MAX_MESSAGE_SIZE),
         move |mut request: Request<()>| {

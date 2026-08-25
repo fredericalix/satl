@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause
-//! Wire encoding: `satl-core` objects ↔ `satl.internal.v1` envelopes.
+//! Wire encoding: `satl-core` objects ↔ `satl.internal.v2` envelopes.
 //!
 //! The rule pinned in `proto/common.proto` and `proto/README.md`: every
 //! `bytes payload` is the **authoritative** `ciborium` CBOR encoding of the
@@ -21,7 +21,7 @@ use satl_core::{
     Availability, Config, DesiredState, Id, Meta, Node, NodeDescription, NodeRole, Secret, Task,
     TaskState, TaskStatus, Version,
 };
-use satl_proto::v1;
+use satl_proto::v2;
 
 use crate::assignment::NetworkAssignment;
 
@@ -151,22 +151,22 @@ fn parse_id(kind: &'static str, field: &'static str, value: &str) -> Result<Id, 
 
 /// Mirror of an observed task state on the wire.
 #[must_use]
-pub fn task_state_to_proto(state: TaskState) -> v1::TaskState {
+pub fn task_state_to_proto(state: TaskState) -> v2::TaskState {
     match state {
-        TaskState::New => v1::TaskState::New,
-        TaskState::Pending => v1::TaskState::Pending,
-        TaskState::Assigned => v1::TaskState::Assigned,
-        TaskState::Accepted => v1::TaskState::Accepted,
-        TaskState::Preparing => v1::TaskState::Preparing,
-        TaskState::Ready => v1::TaskState::Ready,
-        TaskState::Starting => v1::TaskState::Starting,
-        TaskState::Running => v1::TaskState::Running,
-        TaskState::Complete => v1::TaskState::Complete,
-        TaskState::Shutdown => v1::TaskState::Shutdown,
-        TaskState::Failed => v1::TaskState::Failed,
-        TaskState::Rejected => v1::TaskState::Rejected,
-        TaskState::Remove => v1::TaskState::Remove,
-        TaskState::Orphaned => v1::TaskState::Orphaned,
+        TaskState::New => v2::TaskState::New,
+        TaskState::Pending => v2::TaskState::Pending,
+        TaskState::Assigned => v2::TaskState::Assigned,
+        TaskState::Accepted => v2::TaskState::Accepted,
+        TaskState::Preparing => v2::TaskState::Preparing,
+        TaskState::Ready => v2::TaskState::Ready,
+        TaskState::Starting => v2::TaskState::Starting,
+        TaskState::Running => v2::TaskState::Running,
+        TaskState::Complete => v2::TaskState::Complete,
+        TaskState::Shutdown => v2::TaskState::Shutdown,
+        TaskState::Failed => v2::TaskState::Failed,
+        TaskState::Rejected => v2::TaskState::Rejected,
+        TaskState::Remove => v2::TaskState::Remove,
+        TaskState::Orphaned => v2::TaskState::Orphaned,
     }
 }
 
@@ -176,83 +176,83 @@ pub fn task_state_to_proto(state: TaskState) -> v1::TaskState {
 /// numbering has no `UNSPECIFIED` for observed state), so only genuinely
 /// unknown values are rejected.
 pub fn task_state_from_proto(value: i32) -> Result<TaskState, CodecError> {
-    let state = v1::TaskState::try_from(value).map_err(|_| CodecError::Enum {
+    let state = v2::TaskState::try_from(value).map_err(|_| CodecError::Enum {
         enum_name: "TaskState",
         value,
     })?;
     Ok(match state {
-        v1::TaskState::New => TaskState::New,
-        v1::TaskState::Pending => TaskState::Pending,
-        v1::TaskState::Assigned => TaskState::Assigned,
-        v1::TaskState::Accepted => TaskState::Accepted,
-        v1::TaskState::Preparing => TaskState::Preparing,
-        v1::TaskState::Ready => TaskState::Ready,
-        v1::TaskState::Starting => TaskState::Starting,
-        v1::TaskState::Running => TaskState::Running,
-        v1::TaskState::Complete => TaskState::Complete,
-        v1::TaskState::Shutdown => TaskState::Shutdown,
-        v1::TaskState::Failed => TaskState::Failed,
-        v1::TaskState::Rejected => TaskState::Rejected,
-        v1::TaskState::Remove => TaskState::Remove,
-        v1::TaskState::Orphaned => TaskState::Orphaned,
+        v2::TaskState::New => TaskState::New,
+        v2::TaskState::Pending => TaskState::Pending,
+        v2::TaskState::Assigned => TaskState::Assigned,
+        v2::TaskState::Accepted => TaskState::Accepted,
+        v2::TaskState::Preparing => TaskState::Preparing,
+        v2::TaskState::Ready => TaskState::Ready,
+        v2::TaskState::Starting => TaskState::Starting,
+        v2::TaskState::Running => TaskState::Running,
+        v2::TaskState::Complete => TaskState::Complete,
+        v2::TaskState::Shutdown => TaskState::Shutdown,
+        v2::TaskState::Failed => TaskState::Failed,
+        v2::TaskState::Rejected => TaskState::Rejected,
+        v2::TaskState::Remove => TaskState::Remove,
+        v2::TaskState::Orphaned => TaskState::Orphaned,
     })
 }
 
 /// Mirror of a desired state on the wire.
 #[must_use]
-pub fn desired_state_to_proto(state: DesiredState) -> v1::DesiredState {
+pub fn desired_state_to_proto(state: DesiredState) -> v2::DesiredState {
     match state {
-        DesiredState::Ready => v1::DesiredState::Ready,
-        DesiredState::Running => v1::DesiredState::Running,
-        DesiredState::Complete => v1::DesiredState::Complete,
-        DesiredState::Shutdown => v1::DesiredState::Shutdown,
-        DesiredState::Remove => v1::DesiredState::Remove,
+        DesiredState::Ready => v2::DesiredState::Ready,
+        DesiredState::Running => v2::DesiredState::Running,
+        DesiredState::Complete => v2::DesiredState::Complete,
+        DesiredState::Shutdown => v2::DesiredState::Shutdown,
+        DesiredState::Remove => v2::DesiredState::Remove,
     }
 }
 
 /// The desired state a wire value denotes; `UNSPECIFIED` is a protocol error.
 pub fn desired_state_from_proto(value: i32) -> Result<DesiredState, CodecError> {
-    let state = v1::DesiredState::try_from(value).map_err(|_| CodecError::Enum {
+    let state = v2::DesiredState::try_from(value).map_err(|_| CodecError::Enum {
         enum_name: "DesiredState",
         value,
     })?;
     match state {
-        v1::DesiredState::Unspecified => Err(CodecError::Enum {
+        v2::DesiredState::Unspecified => Err(CodecError::Enum {
             enum_name: "DesiredState",
             value,
         }),
-        v1::DesiredState::Ready => Ok(DesiredState::Ready),
-        v1::DesiredState::Running => Ok(DesiredState::Running),
-        v1::DesiredState::Complete => Ok(DesiredState::Complete),
-        v1::DesiredState::Shutdown => Ok(DesiredState::Shutdown),
-        v1::DesiredState::Remove => Ok(DesiredState::Remove),
+        v2::DesiredState::Ready => Ok(DesiredState::Ready),
+        v2::DesiredState::Running => Ok(DesiredState::Running),
+        v2::DesiredState::Complete => Ok(DesiredState::Complete),
+        v2::DesiredState::Shutdown => Ok(DesiredState::Shutdown),
+        v2::DesiredState::Remove => Ok(DesiredState::Remove),
     }
 }
 
 /// Mirror of a node role on the wire.
 #[must_use]
-pub fn role_to_proto(role: NodeRole) -> v1::NodeRole {
+pub fn role_to_proto(role: NodeRole) -> v2::NodeRole {
     match role {
-        NodeRole::Worker => v1::NodeRole::Worker,
-        NodeRole::Manager => v1::NodeRole::Manager,
+        NodeRole::Worker => v2::NodeRole::Worker,
+        NodeRole::Manager => v2::NodeRole::Manager,
     }
 }
 
 /// Mirror of an availability on the wire.
 #[must_use]
-pub fn availability_to_proto(availability: Availability) -> v1::Availability {
+pub fn availability_to_proto(availability: Availability) -> v2::Availability {
     match availability {
-        Availability::Active => v1::Availability::Active,
-        Availability::Pause => v1::Availability::Pause,
-        Availability::Drain => v1::Availability::Drain,
+        Availability::Active => v2::Availability::Active,
+        Availability::Pause => v2::Availability::Pause,
+        Availability::Drain => v2::Availability::Drain,
     }
 }
 
 /// Metadata mirror.
 #[must_use]
-pub fn meta_to_proto(meta: &Meta) -> v1::Meta {
-    v1::Meta {
-        version: Some(v1::Version {
+pub fn meta_to_proto(meta: &Meta) -> v2::Meta {
+    v2::Meta {
+        version: Some(v2::Version {
             index: meta.version.0,
         }),
         created_at: Some(prost_types::Timestamp::from(meta.created_at)),
@@ -262,7 +262,7 @@ pub fn meta_to_proto(meta: &Meta) -> v1::Meta {
 
 /// The object version a metadata mirror carries, if any.
 #[must_use]
-pub fn meta_version(meta: Option<&v1::Meta>) -> Option<Version> {
+pub fn meta_version(meta: Option<&v2::Meta>) -> Option<Version> {
     meta.and_then(|meta| meta.version.as_ref())
         .map(|version| Version(version.index))
 }
@@ -304,8 +304,8 @@ pub fn duration_from_proto(
 // ---------------------------------------------------------------------------
 
 /// A task, as the assignment stream ships it (payload + routing mirrors).
-pub fn encode_task(task: &Task) -> Result<v1::Task, CodecError> {
-    Ok(v1::Task {
+pub fn encode_task(task: &Task) -> Result<v2::Task, CodecError> {
+    Ok(v2::Task {
         id: task.id.to_string(),
         meta: Some(meta_to_proto(&task.meta)),
         state: task_state_to_proto(task.status.state) as i32,
@@ -317,12 +317,12 @@ pub fn encode_task(task: &Task) -> Result<v1::Task, CodecError> {
 /// A task ID only, for an `ACTION_REMOVE` change (the proto allows an empty
 /// payload there: removal only needs the ID).
 #[must_use]
-pub fn task_removal(task_id: &Id) -> v1::Task {
-    v1::Task {
+pub fn task_removal(task_id: &Id) -> v2::Task {
+    v2::Task {
         id: task_id.to_string(),
         meta: None,
-        state: v1::TaskState::New as i32,
-        desired_state: v1::DesiredState::Remove as i32,
+        state: v2::TaskState::New as i32,
+        desired_state: v2::DesiredState::Remove as i32,
         payload: Vec::new(),
     }
 }
@@ -331,7 +331,7 @@ pub fn task_removal(task_id: &Id) -> v1::Task {
 ///
 /// The payload wins over the mirrors; a disagreement is logged, not fatal
 /// (`proto/common.proto`: "trust `payload` and log the discrepancy").
-pub fn decode_task(envelope: &v1::Task) -> Result<Task, CodecError> {
+pub fn decode_task(envelope: &v2::Task) -> Result<Task, CodecError> {
     let task: Task = from_cbor("Task", &envelope.id, &envelope.payload)?;
     if let Ok(mirror) = task_state_from_proto(envelope.state)
         && mirror != task.status.state
@@ -361,8 +361,8 @@ pub fn decode_task(envelope: &v1::Task) -> Result<Task, CodecError> {
 /// The payload is sensitive: it travels only over mTLS, is held in agent
 /// memory and is materialized exclusively into a per-task tmpfs
 /// (invariant #7). Never log this value.
-pub fn encode_secret(secret: &Secret) -> Result<v1::Secret, CodecError> {
-    Ok(v1::Secret {
+pub fn encode_secret(secret: &Secret) -> Result<v2::Secret, CodecError> {
+    Ok(v2::Secret {
         id: secret.id.to_string(),
         meta: Some(meta_to_proto(&secret.meta)),
         payload: to_cbor("Secret", secret.id.as_str(), secret)?,
@@ -371,8 +371,8 @@ pub fn encode_secret(secret: &Secret) -> Result<v1::Secret, CodecError> {
 
 /// A secret ID only, for an `ACTION_REMOVE` change.
 #[must_use]
-pub fn secret_removal(id: &Id) -> v1::Secret {
-    v1::Secret {
+pub fn secret_removal(id: &Id) -> v2::Secret {
+    v2::Secret {
         id: id.to_string(),
         meta: None,
         payload: Vec::new(),
@@ -380,13 +380,13 @@ pub fn secret_removal(id: &Id) -> v1::Secret {
 }
 
 /// The secret an envelope carries.
-pub fn decode_secret(envelope: &v1::Secret) -> Result<Secret, CodecError> {
+pub fn decode_secret(envelope: &v2::Secret) -> Result<Secret, CodecError> {
     from_cbor("Secret", &envelope.id, &envelope.payload)
 }
 
 /// A config, as the assignment stream ships it.
-pub fn encode_config(config: &Config) -> Result<v1::Config, CodecError> {
-    Ok(v1::Config {
+pub fn encode_config(config: &Config) -> Result<v2::Config, CodecError> {
+    Ok(v2::Config {
         id: config.id.to_string(),
         meta: Some(meta_to_proto(&config.meta)),
         payload: to_cbor("Config", config.id.as_str(), config)?,
@@ -395,8 +395,8 @@ pub fn encode_config(config: &Config) -> Result<v1::Config, CodecError> {
 
 /// A config ID only, for an `ACTION_REMOVE` change.
 #[must_use]
-pub fn config_removal(id: &Id) -> v1::Config {
-    v1::Config {
+pub fn config_removal(id: &Id) -> v2::Config {
+    v2::Config {
         id: id.to_string(),
         meta: None,
         payload: Vec::new(),
@@ -404,7 +404,7 @@ pub fn config_removal(id: &Id) -> v1::Config {
 }
 
 /// The config an envelope carries.
-pub fn decode_config(envelope: &v1::Config) -> Result<Config, CodecError> {
+pub fn decode_config(envelope: &v2::Config) -> Result<Config, CodecError> {
     from_cbor("Config", &envelope.id, &envelope.payload)
 }
 
@@ -415,9 +415,9 @@ pub fn decode_config(envelope: &v1::Config) -> Result<Config, CodecError> {
 /// object being written (`proto/dispatcher.proto`), so the version can repeat
 /// across two envelopes that differ. It is sent because it is what an operator
 /// reading a log needs to correlate with `satl network inspect`.
-pub fn encode_network(assignment: &NetworkAssignment) -> Result<v1::NetworkAssignment, CodecError> {
+pub fn encode_network(assignment: &NetworkAssignment) -> Result<v2::NetworkAssignment, CodecError> {
     let id = assignment.id();
-    Ok(v1::NetworkAssignment {
+    Ok(v2::NetworkAssignment {
         id: id.to_string(),
         meta: Some(meta_to_proto(&assignment.network.meta)),
         payload: to_cbor("NetworkAssignment", id.as_str(), assignment)?,
@@ -426,8 +426,8 @@ pub fn encode_network(assignment: &NetworkAssignment) -> Result<v1::NetworkAssig
 
 /// A network ID only, for an `ACTION_REMOVE` change.
 #[must_use]
-pub fn network_removal(id: &Id) -> v1::NetworkAssignment {
-    v1::NetworkAssignment {
+pub fn network_removal(id: &Id) -> v2::NetworkAssignment {
+    v2::NetworkAssignment {
         id: id.to_string(),
         meta: None,
         payload: Vec::new(),
@@ -435,7 +435,7 @@ pub fn network_removal(id: &Id) -> v1::NetworkAssignment {
 }
 
 /// The network assignment an envelope carries.
-pub fn decode_network(envelope: &v1::NetworkAssignment) -> Result<NetworkAssignment, CodecError> {
+pub fn decode_network(envelope: &v2::NetworkAssignment) -> Result<NetworkAssignment, CodecError> {
     let assignment: NetworkAssignment =
         from_cbor("NetworkAssignment", &envelope.id, &envelope.payload)?;
     let id = parse_id("NetworkAssignment", "id", &envelope.id)?;
@@ -450,8 +450,8 @@ pub fn decode_network(envelope: &v1::NetworkAssignment) -> Result<NetworkAssignm
 }
 
 /// A node object, as the session stream ships it to its own agent.
-pub fn encode_node(node: &Node) -> Result<v1::Node, CodecError> {
-    Ok(v1::Node {
+pub fn encode_node(node: &Node) -> Result<v2::Node, CodecError> {
+    Ok(v2::Node {
         id: node.id.to_string(),
         meta: Some(meta_to_proto(&node.meta)),
         role: role_to_proto(node.spec.role) as i32,
@@ -461,7 +461,7 @@ pub fn encode_node(node: &Node) -> Result<v1::Node, CodecError> {
 }
 
 /// The node an envelope carries.
-pub fn decode_node(envelope: &v1::Node) -> Result<Node, CodecError> {
+pub fn decode_node(envelope: &v2::Node) -> Result<Node, CodecError> {
     from_cbor("Node", &envelope.id, &envelope.payload)
 }
 
@@ -483,8 +483,8 @@ pub fn decode_description(bytes: &[u8]) -> Result<Option<NodeDescription>, Codec
 pub fn encode_status(
     task_id: &Id,
     status: &TaskStatus,
-) -> Result<v1::TaskStatusUpdate, CodecError> {
-    Ok(v1::TaskStatusUpdate {
+) -> Result<v2::TaskStatusUpdate, CodecError> {
+    Ok(v2::TaskStatusUpdate {
         task_id: task_id.to_string(),
         state: task_state_to_proto(status.state) as i32,
         status: to_cbor("TaskStatus", task_id.as_str(), status)?,
@@ -496,7 +496,7 @@ pub fn encode_status(
 /// Rejects `TASK_STATE_REMOVE` on either the mirror or the payload: it is a
 /// desired-state marker and is never a legal observed state
 /// (`proto/dispatcher.proto`, architecture §4 rule 5).
-pub fn decode_status(update: &v1::TaskStatusUpdate) -> Result<(Id, TaskStatus), CodecError> {
+pub fn decode_status(update: &v2::TaskStatusUpdate) -> Result<(Id, TaskStatus), CodecError> {
     let id = parse_id("TaskStatusUpdate", "task_id", &update.task_id)?;
     let mirror = task_state_from_proto(update.state)?;
     if mirror == TaskState::Remove {
@@ -539,8 +539,8 @@ mod tests {
         let task = testing::task_at(TaskState::Running, DesiredState::Running);
         let envelope = encode_task(&task).expect("encode");
         assert_eq!(envelope.id, task.id.to_string());
-        assert_eq!(envelope.state(), v1::TaskState::Running);
-        assert_eq!(envelope.desired_state(), v1::DesiredState::Running);
+        assert_eq!(envelope.state(), v2::TaskState::Running);
+        assert_eq!(envelope.desired_state(), v2::DesiredState::Running);
         assert_eq!(
             meta_version(envelope.meta.as_ref()),
             Some(task.meta.version)
@@ -552,8 +552,8 @@ mod tests {
     fn the_payload_wins_over_a_lying_mirror() {
         let task = testing::task_at(TaskState::Running, DesiredState::Running);
         let mut envelope = encode_task(&task).expect("encode");
-        envelope.state = v1::TaskState::New as i32;
-        envelope.desired_state = v1::DesiredState::Shutdown as i32;
+        envelope.state = v2::TaskState::New as i32;
+        envelope.desired_state = v2::DesiredState::Shutdown as i32;
         let decoded = decode_task(&envelope).expect("decode");
         assert_eq!(decoded.status.state, TaskState::Running);
         assert_eq!(decoded.desired_state, DesiredState::Running);
@@ -574,8 +574,8 @@ mod tests {
     fn node_and_description_roundtrip() {
         let node = testing::node(NodeRole::Worker);
         let envelope = encode_node(&node).expect("encode");
-        assert_eq!(envelope.role(), v1::NodeRole::Worker);
-        assert_eq!(envelope.availability(), v1::Availability::Active);
+        assert_eq!(envelope.role(), v2::NodeRole::Worker);
+        assert_eq!(envelope.availability(), v2::Availability::Active);
         assert_eq!(decode_node(&envelope).expect("decode"), node);
 
         let description = testing::description("worker-1");
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn an_empty_network_payload_is_refused() {
-        let envelope = v1::NetworkAssignment {
+        let envelope = v2::NetworkAssignment {
             id: Id::generate().to_string(),
             meta: None,
             payload: Vec::new(),
@@ -847,7 +847,7 @@ mod tests {
 
         // The mirror alone is enough to reject it...
         let mut poisoned = update.clone();
-        poisoned.state = v1::TaskState::Remove as i32;
+        poisoned.state = v2::TaskState::Remove as i32;
         assert!(matches!(
             decode_status(&poisoned),
             Err(CodecError::DesiredOnlyState { .. })
@@ -856,7 +856,7 @@ mod tests {
         // ...and so is the payload, which is the authoritative copy.
         let removal = TaskStatus::new(TaskState::Remove, "should never be reported");
         let mut sneaky = encode_status(&id, &removal).expect("encode");
-        sneaky.state = v1::TaskState::Shutdown as i32;
+        sneaky.state = v2::TaskState::Shutdown as i32;
         assert!(matches!(
             decode_status(&sneaky),
             Err(CodecError::DesiredOnlyState { .. })
@@ -865,11 +865,11 @@ mod tests {
 
     #[test]
     fn an_empty_payload_is_a_missing_payload_not_a_default_object() {
-        let envelope = v1::Task {
+        let envelope = v2::Task {
             id: Id::generate().to_string(),
             meta: None,
-            state: v1::TaskState::Assigned as i32,
-            desired_state: v1::DesiredState::Running as i32,
+            state: v2::TaskState::Assigned as i32,
+            desired_state: v2::DesiredState::Running as i32,
             payload: Vec::new(),
         };
         assert!(matches!(
@@ -899,9 +899,9 @@ mod tests {
 
     #[test]
     fn a_bad_task_id_names_the_field_and_the_value() {
-        let update = v1::TaskStatusUpdate {
+        let update = v2::TaskStatusUpdate {
             task_id: "not-an-id".to_owned(),
-            state: v1::TaskState::Running as i32,
+            state: v2::TaskState::Running as i32,
             status: vec![0xa0],
         };
         let error = decode_status(&update).expect_err("rejected");

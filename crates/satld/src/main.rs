@@ -282,7 +282,30 @@ async fn default_route_address() -> Option<std::net::IpAddr> {
     }
 }
 
+/// How long [`stop`] gets before the daemon exits regardless.
+///
+/// A stop that never returns is worse than an untidy one. `service satld
+/// stop` runs `kill -TERM` and then `pwait`, so a shutdown that blocks blocks
+/// the operator's terminal for ever -- and by then the signal handler has
+/// already fired, so **further SIGTERMs are swallowed** (see
+/// [`shutdown_signal`]) and only `kill -9` gets out of it.
+///
+/// Measured on fbsd3: `satld` sat like this for over an hour with its REST
+/// socket already removed, ignoring three `service satld stop` invocations and
+/// a hand-delivered SIGTERM, while openraft went on retrying replication to
+/// two unreachable peers at ~6 lines/second (decision log, 2026-08-25).
+///
+/// 30s is well past every clean stop measured here and well short of an
+/// operator's patience. Running containers are left in place either way, so
+/// the cost of giving up is a noisy log line, not lost work.
+const STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The future the API server stops on: SIGTERM or SIGINT.
+///
+/// The returned future resolves on the **first** signal. Registering these
+/// handlers also disarms the default action, so from that moment on the
+/// process no longer dies of SIGTERM on its own -- which is why the second
+/// signal is wired to a hard exit below rather than left to be swallowed.
 fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = ()>> {
     let mut sigterm =
         signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
@@ -293,6 +316,22 @@ fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = ()>> {
             _ = sigterm.recv() => tracing::info!(signal = "SIGTERM", "shutdown signal received"),
             _ = sigint.recv() => tracing::info!(signal = "SIGINT", "shutdown signal received"),
         }
+        // From here the daemon is shutting down, and a second signal means the
+        // operator has waited long enough. Without this arm there is nothing
+        // to escalate to: the default action is disarmed for the life of the
+        // process, so repeated `service satld stop` calls do nothing at all
+        // and `kill -9` is the only way out.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
+            tracing::warn!(
+                "second shutdown signal during shutdown; exiting immediately. Running \
+                 containers are left in place, as they are on a clean stop"
+            );
+            std::process::exit(1);
+        });
     })
 }
 
@@ -698,6 +737,10 @@ async fn cluster_supervisor(
             return None;
         };
         daemon.slot.publish(fresh.core());
+        // The published-port anchor is derived from whatever the core just
+        // became -- a manager reads the store, a worker its own task db -- so
+        // the sweep has to re-derive now rather than up to a minute from now.
+        daemon.node_runtime.port_sweep_kick.notify_one();
         runtime = fresh;
     }
 }
@@ -1041,8 +1084,41 @@ async fn run(cli: &Cli, cfg: &Config, source: ConfigSource) -> anyhow::Result<()
             )
         });
 
-    stop(&shutdown, supervisor, sweeps, &node_runtime, cfg).await;
+    stop_within_budget(&shutdown, supervisor, sweeps, &node_runtime, cfg).await;
     serve_result
+}
+
+/// [`stop`], bounded by [`STOP_BUDGET`].
+///
+/// A stop that never returns leaves no way out but `kill -9`, because by then
+/// the signal handler has fired and further SIGTERMs are swallowed. Whatever
+/// has not finished by the deadline is named in the log and abandoned:
+/// running containers survive either way (architecture §7.2), so an untidy
+/// stop costs nothing an operator has to repair.
+async fn stop_within_budget(
+    shutdown: &CancellationToken,
+    supervisor: tokio::task::JoinHandle<Option<ClusterRuntime>>,
+    sweeps: Vec<tokio::task::JoinHandle<()>>,
+    node_runtime: &node::NodeRuntime,
+    cfg: &Config,
+) {
+    let stopped = tokio::time::timeout(
+        STOP_BUDGET,
+        stop(shutdown, supervisor, sweeps, node_runtime, cfg),
+    )
+    .await;
+    if stopped.is_err() {
+        tracing::error!(
+            budget_s = STOP_BUDGET.as_secs(),
+            socket = %cfg.socket_path.display(),
+            "shutdown did not finish within its budget; exiting anyway. Running containers were \
+             left in place. If this recurs, the last component to log before this line is the \
+             one that did not stop"
+        );
+        // The socket is the one piece of state a half-finished stop can leave
+        // behind that breaks the *next* start, so remove it even here.
+        let _ = std::fs::remove_file(&cfg.socket_path);
+    }
 }
 
 /// Shutdown, in the only order that is safe: the API has already stopped

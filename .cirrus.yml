@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: BSD-2-Clause
+#
+# Cirrus CI: run `make check` on FreeBSD for every pull request.
+#
+# WHY CIRRUS AND NOT GITHUB ACTIONS
+#
+# SatL is FreeBSD-only. GitHub's hosted runners offer no FreeBSD image, so the
+# workspace would not even compile there. Cirrus runs FreeBSD VMs natively,
+# which is the only reason this file can exist at all.
+#
+# WHAT THIS GATE IS, AND WHAT IT IS NOT
+#
+# It runs `make check` -- SPDX headers, `cargo fmt --check`, clippy with
+# `-D warnings`, the OpenAPI contract and the workspace test suite. That is the
+# project's own gate, and it is genuinely the whole of it for a change that
+# touches no privileged surface.
+#
+# It CANNOT run the other two suites, and nothing here should be read as
+# covering them:
+#
+#   * `sudo make integration` needs real jails, ZFS datasets, pf anchors and
+#     `ocijail` on the machine, and mutates global host state;
+#   * `make cluster-test` needs three networked FreeBSD hosts with a private
+#     underlay.
+#
+# Both stay the maintainer's job, on the hardware in `tests/cluster/inventory.toml`.
+# A green tick here therefore means "this compiles, lints and passes the unit
+# tests on FreeBSD", not "this works". `CONTRIBUTING.md` says which suite a
+# change is expected to have run, and asks for its output in the pull request.
+#
+# UNVERIFIED UNTIL ITS FIRST RUN. This file has never executed: it is written
+# from the documented Cirrus configuration format, and the image below is the
+# newest FreeBSD Cirrus publishes, which is not necessarily the 15.1 the project
+# targets. If the first run fails, the image and the toolchain install are the
+# two things to look at before anything in the tree.
+
+freebsd_instance:
+  image_family: freebsd-14-2
+  cpu: 4
+  memory: 8G
+
+check_task:
+  name: make check (FreeBSD)
+
+  # Pull requests and the default branch, not every branch push. The PR case is
+  # the point -- nothing ran on a pull request before this file existed -- and
+  # the `main` case is what catches a direct push that skipped one, which on a
+  # single-maintainer project is the likelier way `main` breaks.
+  only_if: $CIRRUS_PR != '' || $CIRRUS_BRANCH == 'main'
+
+  # `make` here is FreeBSD make(1) -- bmake, which the Makefile is written for and
+  # says so on its second line. There is no gmake to install.
+  #
+  # rust from pkg rather than rustup: pkg is what an operator installing SatL
+  # uses, and a toolchain mismatch with the packaged one is worth finding here.
+  #
+  # THE LIKELIEST WAY THIS FILE FAILS ON ITS FIRST RUN. `rust-version` in
+  # Cargo.toml is **1.96**, and whether FreeBSD's package set carries at least
+  # that on the image above is unknown until this runs. Cargo's failure is at
+  # least legible -- it names the required and the found version -- but a CI
+  # that is red on every change for a reason unrelated to the change is worse
+  # than no CI, because people stop reading it. If that is what the first run
+  # says, the fix is to install rustup here instead:
+  #
+  #     pkg install -y curl git
+  #     curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.96
+  #     . "$HOME/.cargo/env"
+  #
+  # and to say in this comment that CI's toolchain no longer matches what an
+  # operator gets from pkg, which is the thing the pkg choice was buying.
+  install_script:
+    - pkg install -y rust git
+
+  registry_cache:
+    folder: $HOME/.cargo/registry
+    fingerprint_script: cat Cargo.lock
+
+  target_cache:
+    folder: target
+    fingerprint_script: echo $CIRRUS_OS; cat Cargo.lock
+
+  version_script:
+    - rustc --version
+    - cargo --version
+    - freebsd-version
+
+  check_script:
+    - make check
+
+  # Kept small on purpose: the interesting artefact of a failure is the log,
+  # and `make check` prints what it refused.
+  before_cache_script: rm -rf $HOME/.cargo/registry/index

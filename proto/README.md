@@ -1,17 +1,17 @@
 # `proto/`, SatL's internal node-to-node protocol
 
-These `.proto` files define **package `satl.internal.v1`** (plus the standard
+These `.proto` files define **package `satl.internal.v2`** (plus the standard
 `grpc.health.v1`), the gRPC protocol SatL nodes speak to each other over mTLS.
 They are compiled by `crates/satl-proto`; see `docs/architecture.md` §7 for
 where each service sits in the system.
 
 | File | Package | Service | Role required | Reference |
 |---|---|---|---|---|
-| `common.proto` | `satl.internal.v1` | - (shared types) | - | architecture §3, §4 |
-| `dispatcher.proto` | `satl.internal.v1` | `Dispatcher` | worker or manager | architecture §7.1, SWK §13 |
-| `ca.proto` | `satl.internal.v1` | `NodeCA` | none (bootstrap) / any | architecture §12.2–§12.3, SWK §16.2–§16.3 |
-| `raft.proto` | `satl.internal.v1` | `Raft` | manager | architecture §6, SWK §11.7 |
-| `control.proto` | `satl.internal.v1` | `Control` | manager | architecture §6.5–§6.6, SWK §11.3, §11.5 |
+| `common.proto` | `satl.internal.v2` | - (shared types) | - | architecture §3, §4 |
+| `dispatcher.proto` | `satl.internal.v2` | `Dispatcher` | worker or manager | architecture §7.1, SWK §13 |
+| `ca.proto` | `satl.internal.v2` | `NodeCA` | none (bootstrap) / any | architecture §12.2–§12.3, SWK §16.2–§16.3 |
+| `raft.proto` | `satl.internal.v2` | `Raft` | manager | architecture §6, SWK §11.7 |
+| `control.proto` | `satl.internal.v2` | `Control` | manager | architecture §6.5–§6.6, SWK §11.3, §11.5 |
 | `health.proto` | `grpc.health.v1` | `Health` | any | architecture §7 |
 
 ## Internal only
@@ -30,14 +30,17 @@ package version.
 
 ## Versioning convention
 
-- The package is `satl.internal.v1`. The version is in the **package name**, not
+- The package is `satl.internal.v2`. The version is in the **package name**, not
   in file paths or service names.
 - **Within a version, changes are additive only.** Add fields with new numbers;
   add RPCs; add enum values. Never renumber, never change a field's type, never
   repurpose a name, never remove a field, use `reserved` for anything retired
   (there are examples in `dispatcher.proto` and `ca.proto`).
-- Anything that is not additive means a new package, `satl.internal.v2`, served
-  alongside v1 for as long as a rolling upgrade needs both.
+- Anything that is not additive means a new package, `satl.internal.v3`, served
+  alongside v2 for as long as a rolling upgrade needs both. v2 exists because of
+  the openraft 0.10 upgrade (M12): the chunked `InstallSnapshot` became a
+  streamed `FullSnapshot` and `TransferLeader` is new. The bump moved every
+  service, not only `Raft` -- see the note at the top of `common.proto` for why.
 - Enum values are open in proto3: an unknown value decodes to a bare `i32`.
   Servers and clients must reject unknown values **and** the `*_UNSPECIFIED`
   zero values explicitly. Do not `unwrap` a `try_from` on the wire path.

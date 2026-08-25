@@ -151,14 +151,21 @@ pub enum OverlayError {
     #[error(transparent)]
     Ftable(#[from] satl_overlay::FtableError),
 
-    /// This node has no cluster identity yet, so it does not know its own node
-    /// id (needed to find its gateway) or its VTEP address.
-    #[error(
-        "overlay: this node has no cluster identity yet, so it cannot program \
-         an overlay: it does not know its own node id or its underlay address. \
-         This is a start-up ordering bug in satld, not a configuration problem"
-    )]
-    NoIdentity,
+    /// This node cannot program an overlay, and the message says which of the
+    /// two very different reasons it is.
+    ///
+    /// Collapsing them was a real cost: a node with a public **/32** address
+    /// can derive no VXLAN blackhole (docs/vxlan.md §2), so `satld` degrades
+    /// deliberately and says so at boot -- and then every task that attached
+    /// to an overlay failed in a loop with "this is a start-up ordering bug in
+    /// satld", sending the reader after a race that does not exist. A /32 VPS
+    /// is the ordinary shape for a single public server, so this is the first
+    /// thing a new user meets.
+    #[error("overlay: {reason}")]
+    NoIdentity {
+        /// What actually stopped this node from having an overlay identity.
+        reason: NoIdentityReason,
+    },
 
     /// The network is not (yet) programmable on this node.
     #[error("overlay network '{network}' is not programmable on this node: {reason}")]
@@ -270,10 +277,51 @@ struct NetworkState {
     ensured: bool,
 }
 
+/// Why this node has no overlay identity.
+///
+/// Kept as data rather than collapsed into `Option::None`, because the three
+/// cases want three different sentences and only one of them is a bug.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Default)]
+pub enum NoIdentityReason {
+    /// No `advertise_addr`: a configuration choice, fixable by the operator.
+    #[error(
+        "this node publishes no underlay address, so it can host no overlay network. \
+         Set advertise_addr in satld.toml and restart satld; bridge networks work \
+         without it"
+    )]
+    NoUnderlayAddress,
+
+    /// The underlay could not be measured -- typically a public /32, where no
+    /// VXLAN blackhole can be derived. A deliberate degradation.
+    #[error(
+        "this node's underlay could not be measured, so it can host no overlay network: \
+         {detail}. This is a deliberate degradation, not a start-up race -- satld said \
+         so at boot ('cannot measure this node's underlay'). A single public address \
+         with a /32 netmask is the usual cause; bridge networks, and therefore \
+         satl compose, work unaffected. satl stack and any multi-node setup need a \
+         real underlay"
+    )]
+    UnmeasurableUnderlay {
+        /// What the measurement complained about.
+        detail: String,
+    },
+
+    /// Adoption has genuinely not happened yet. This one *is* an ordering bug.
+    #[default]
+    #[error(
+        "this node has no cluster identity yet, so it does not know its own node id \
+         or its underlay address. This is a start-up ordering bug in satld, not a \
+         configuration problem"
+    )]
+    NotAdoptedYet,
+}
 /// The mutable half, behind one lock.
 #[derive(Debug, Default)]
 struct Inner {
     identity: Option<Identity>,
+    /// Why `identity` is `None`, so the attach path can say which of the
+    /// three cases it is instead of guessing the worst one.
+    no_identity: NoIdentityReason,
     networks: BTreeMap<Id, NetworkState>,
     /// Networks this node was shipped that are **not** overlays.
     ///
@@ -595,6 +643,7 @@ impl OverlayManager {
     /// `apply_network` then fails with it, which is where an operator will look.
     pub async fn adopt_identity(&self, node_id: &Id, advertise_addr: Option<&str>) {
         let vtep = advertise_addr.and_then(underlay_address);
+        let mut reason = NoIdentityReason::NotAdoptedYet;
         let identity = match vtep {
             None => {
                 tracing::warn!(
@@ -602,6 +651,7 @@ impl OverlayManager {
                     "this node publishes no underlay address, so it can host no \
                      overlay network: set advertise_addr in satld.toml"
                 );
+                reason = NoIdentityReason::NoUnderlayAddress;
                 None
             }
             Some(vtep) => match self.measure(node_id, vtep).await {
@@ -622,6 +672,9 @@ impl OverlayManager {
                         "cannot measure this node's underlay, so it can host no \
                          overlay network; bridge networks are unaffected"
                     );
+                    reason = NoIdentityReason::UnmeasurableUnderlay {
+                        detail: error.to_string(),
+                    };
                     None
                 }
             },
@@ -633,7 +686,13 @@ impl OverlayManager {
                 .identity
                 .as_ref()
                 .is_some_and(|current| current.node_id != *node_id);
+            // Written as a pair, and this is the only place either is
+            // assigned, so the reason can never describe a different identity
+            // than the one beside it. `reason` is meaningless when `identity`
+            // is `Some` and is never read then -- the attach path consults it
+            // only on the `None` branch.
             inner.identity = identity;
+            inner.no_identity = reason;
             if changed {
                 tracing::warn!(
                     node_id = %node_id,
@@ -1199,7 +1258,12 @@ impl OverlayManager {
         }
         let (network_id, identity) = {
             let mut inner = self.inner.lock().await;
-            let identity = inner.identity.clone().ok_or(OverlayError::NoIdentity)?;
+            let identity = inner
+                .identity
+                .clone()
+                .ok_or_else(|| OverlayError::NoIdentity {
+                    reason: inner.no_identity.clone(),
+                })?;
             let network_id = assignment.network.id.clone();
             let state = inner
                 .networks
@@ -1482,7 +1546,12 @@ impl OverlayManager {
         ip: Ipv4Addr,
     ) -> Result<(), OverlayError> {
         let mut inner = self.inner.lock().await;
-        let identity = inner.identity.clone().ok_or(OverlayError::NoIdentity)?;
+        let identity = inner
+            .identity
+            .clone()
+            .ok_or_else(|| OverlayError::NoIdentity {
+                reason: inner.no_identity.clone(),
+            })?;
         let state =
             inner
                 .networks
@@ -2396,15 +2465,20 @@ impl TaskOverlay for OverlayManager {
                     // derived from it, docs/vxlan.md section 2) is the case
                     // that proves it; that is a legitimate configuration and it
                     // must still run node-local containers.
-                    let node_id = {
+                    let (node_id, reason) = {
                         let inner = self.inner.lock().await;
-                        inner
-                            .identity
-                            .as_ref()
-                            .map(|identity| identity.node_id.clone())
+                        (
+                            inner
+                                .identity
+                                .as_ref()
+                                .map(|identity| identity.node_id.clone()),
+                            inner.no_identity.clone(),
+                        )
                     };
                     let Some(node_id) = node_id else {
-                        return Err(satl_agent::OverlayError::new(OverlayError::NoIdentity));
+                        return Err(satl_agent::OverlayError::new(OverlayError::NoIdentity {
+                            reason,
+                        }));
                     };
                     self.wait_programmable(&network_id, &node_id).await;
                     self.attach_one(&network_id, &task.id, jail, ip)
