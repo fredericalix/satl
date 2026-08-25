@@ -1285,10 +1285,13 @@ consensus engine -- the reason it is not optional.
       proves nothing about what ships; and it was **single-node**, so two of
       the three things this phase is looking for -- a raft node that stops
       contributing, and anything that only shows up under real cluster uptime
-      -- were outside what it could ever see. All four hosts are now on
-      **`c4fc9c8`**, the commit the published package is built from (alpha's
-      `web` container re-adopted across the upgrade, same jail id 6), and the
-      3-node testbed runs the Node.js + MariaDB stack from
+      -- were outside what it could ever see. All four hosts run **the commit
+      the published package is built from**, and that is the form this line is
+      written in on purpose: naming a hash here made it wrong again the moment
+      the next docs-only package shipped, twice. The check is two commands, not
+      a memory: `satl version` on any host against the digest on `/download/`.
+      Alpha's `web` container is re-adopted across every one of these upgrades,
+      same jail id 6. The 3-node testbed runs the Node.js + MariaDB stack from
       the getting-started page: 3 web replicas spread one per node behind a
       published port, one database pinned by constraint with a node-local
       volume, a secret, healthchecks, and both the `tuto_default` and `ingress`
@@ -1349,11 +1352,19 @@ consensus engine -- the reason it is not optional.
       deliberately differ. The tag is annotated and local only -- nothing is
       pushed. Note that `roadmap.md` had claimed a local `v0.1.0-beta` tag that
       never existed; `git tag -l` was empty until this one.
-- [ ] Push. Nothing is pushed yet. `main` now carries M12 and the
-      `v0.2.0-alpha` tag and is **two commits ahead of `origin/main`**, which is
-      still at `a264fa3`; the tag exists only locally. Pushing is the one step
-      that makes any of this visible outside this host, so it stays a deliberate
-      act rather than a side effect of finishing the work.
+- [x] **Pushed, 2026-08-25.** This item said "nothing is pushed yet ... two
+      commits ahead of `origin/main`, which is still at `a264fa3`", and it had
+      been wrong for a while: a `git fetch` put `origin/main` at `cea0cd5`, so
+      M12 and everything through the cluster-suite fixes were already there.
+      Worth recording as a habit rather than a detail: a roadmap line asserting
+      the state of a *remote* goes stale without anything local changing, and
+      the only honest way to write one is to check it first. The remaining
+      commits (the proposal-retry fix, the soak work and this correction) were
+      pushed as a fast-forward, nothing to pull.
+- [ ] **The `v0.2.0-alpha` tag is still local**, deliberately: pushing a
+      release tag is a louder act than pushing a branch, and it is the kind of
+      thing to do on purpose rather than as a side effect. `git push origin
+      v0.2.0-alpha` when the release is meant to be visible as one.
 - [x] No signed releases and no FreeBSD port. `README.md` now says so where the
       package is built, rather than leaving it to be discovered: unsigned, no
       pkg repository, not in the ports tree, verify against
